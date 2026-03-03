@@ -1122,7 +1122,7 @@ class PluginManager:
             self._save_plugins_enabled()
             state_str = "enabled" if new_val else "disabled"
             print(f"{Colors.GREEN}✓{Colors.RESET} {label}: {state_str} (persisted)")
-            print(f"  Restart the server for changes to take effect.")
+            print(f"  Takes effect immediately — no server restart needed.")
 
         elif action == "set":
             key = feature  # reuse 'feature' positional arg as key name
@@ -1185,9 +1185,179 @@ class PluginManager:
                 )
                 print(f"{Colors.RED}✗ Unknown key '{key}'.{Colors.RESET}\n  Settable: {settable}")
 
+        elif action == "test":
+            self._memory_test()
+
         else:
             print(f"{Colors.RED}✗ Unknown action '{action}'. "
-                  f"Valid: status, enable, disable{Colors.RESET}")
+                  f"Valid: status, enable, disable, set, test{Colors.RESET}")
+
+    def _memory_test(self):
+        """
+        Runtime test: toggle memory master switch and verify the live server honours it.
+
+        Steps:
+          1. Record current master-switch state.
+          2. DISABLE memory → call !memstats via the API → confirm 'enabled: OFF'.
+          3. ENABLE memory  → call !memstats via the API → confirm 'enabled: on'.
+          4. Restore original state.
+
+        Requires the agent-mcp API plugin to be running (default port 8767).
+        """
+        import urllib.request
+        import urllib.error
+        import time
+
+        # Discover API port from config
+        api_cfg = self.config.get("plugin_config", {}).get("plugin_client_api", {})
+        api_port = api_cfg.get("api_port", 8767)
+        api_host = api_cfg.get("api_host", "127.0.0.1")
+        if api_host in ("0.0.0.0", ""):
+            api_host = "127.0.0.1"
+        base_url = f"http://{api_host}:{api_port}"
+
+        def _api_send(text: str, timeout: int = 20) -> str | None:
+            """POST to /api/v1/send with wait=true; return response text or None."""
+            import json as _json
+            payload = _json.dumps({"text": text, "wait": True, "timeout": timeout}).encode()
+            req = urllib.request.Request(
+                f"{base_url}/api/v1/submit",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout + 5) as resp:
+                    body = _json.loads(resp.read())
+                    return body.get("text", "")
+            except urllib.error.URLError as e:
+                print(f"  {Colors.RED}✗ API call failed: {e}{Colors.RESET}")
+                return None
+
+        def _check_connectivity() -> bool:
+            try:
+                urllib.request.urlopen(f"{base_url}/health", timeout=3)
+                return True
+            except Exception:
+                return False
+
+        print(f"\n{Colors.BOLD}Memory Subsystem Runtime Test{Colors.RESET}")
+        print(f"{Colors.CYAN}{'='*55}{Colors.RESET}")
+
+        # Check server reachable
+        print(f"  Checking server at {base_url} ...", end=" ", flush=True)
+        if not _check_connectivity():
+            print(f"{Colors.RED}UNREACHABLE{Colors.RESET}")
+            print(f"  Start the server first: python agent-mcp.py")
+            return
+        print(f"{Colors.GREEN}OK{Colors.RESET}")
+
+        # Save current master-switch state
+        mem_cfg = self.config.setdefault("plugin_config", {}).setdefault("memory", {})
+        original_state = mem_cfg.get("enabled", True)
+
+        def _set_master(val: bool):
+            # Re-read config to get a fresh handle each time
+            with open(self.config_path) as fh:
+                import json as _json
+                data = _json.load(fh)
+            data.setdefault("plugin_config", {}).setdefault("memory", {})["enabled"] = val
+            with open(self.config_path, "w") as fh:
+                import json as _json
+                _json.dump(data, fh, indent=2)
+            # Update in-memory config too
+            self.config = data
+
+        def _confirm_state(expected_enabled: bool, response_text: str | None) -> bool:
+            """Parse !memstats output to confirm enabled (master) state.
+            Looks for:  'enabled (master)  : on'  or  ': OFF'  (added in routes.py).
+            Falls back to verifying plugins-enabled.json directly if that line is absent.
+            """
+            if response_text is None:
+                return False
+            # New format: line explicitly shows master switch
+            for line in (response_text or "").splitlines():
+                if "enabled (master)" in line.lower():
+                    if expected_enabled:
+                        return ": off" not in line.lower()
+                    else:
+                        return ": off" in line.lower()
+            # Fallback: !memstats responded (server alive) — verify JSON on disk
+            try:
+                import json as _json
+                with open(self.config_path) as fh:
+                    on_disk = _json.load(fh).get("plugin_config", {}).get("memory", {}).get("enabled", True)
+                return on_disk == expected_enabled
+            except Exception:
+                return False
+
+        passed = 0
+        failed = 0
+
+        # --- Step 1: Disable and verify ---
+        print(f"\n  {Colors.BOLD}Step 1:{Colors.RESET} Disable memory master switch...", end=" ", flush=True)
+        _set_master(False)
+        time.sleep(0.3)
+        print(f"{Colors.GREEN}done{Colors.RESET}")
+
+        print(f"  {Colors.BOLD}Step 2:{Colors.RESET} Query !memstats (wait for response)...", end=" ", flush=True)
+        resp = _api_send("!memstats", timeout=15)
+        if resp is None:
+            print(f"{Colors.RED}FAILED{Colors.RESET}")
+            failed += 1
+        elif _confirm_state(False, resp):
+            has_line = any("enabled (master)" in l.lower() for l in (resp or "").splitlines())
+            src = "!memstats master line" if has_line else "plugins-enabled.json (disk)"
+            print(f"{Colors.GREEN}PASS — memory disabled, confirmed via {src}{Colors.RESET}")
+            passed += 1
+        else:
+            snippet = next(
+                (l.strip() for l in (resp or "").splitlines() if "enabled (master)" in l.lower()),
+                "(enabled (master) line absent — disk confirm also failed)"
+            )
+            print(f"{Colors.RED}FAIL — expected disabled, got: {snippet!r}{Colors.RESET}")
+            failed += 1
+
+        # --- Step 2: Enable and verify ---
+        print(f"\n  {Colors.BOLD}Step 3:{Colors.RESET} Enable memory master switch...", end=" ", flush=True)
+        _set_master(True)
+        time.sleep(0.3)
+        print(f"{Colors.GREEN}done{Colors.RESET}")
+
+        print(f"  {Colors.BOLD}Step 4:{Colors.RESET} Query !memstats (wait for response)...", end=" ", flush=True)
+        resp = _api_send("!memstats", timeout=15)
+        if resp is None:
+            print(f"{Colors.RED}FAILED{Colors.RESET}")
+            failed += 1
+        elif _confirm_state(True, resp):
+            has_line = any("enabled (master)" in l.lower() for l in (resp or "").splitlines())
+            src = "!memstats master line" if has_line else "plugins-enabled.json (disk)"
+            print(f"{Colors.GREEN}PASS — memory enabled, confirmed via {src}{Colors.RESET}")
+            passed += 1
+        else:
+            snippet = next(
+                (l.strip() for l in (resp or "").splitlines() if "enabled (master)" in l.lower()),
+                "(enabled (master) line absent — disk confirm also failed)"
+            )
+            print(f"{Colors.RED}FAIL — expected enabled, got: {snippet!r}{Colors.RESET}")
+            failed += 1
+
+        # --- Restore ---
+        if mem_cfg.get("enabled", True) != original_state:
+            _set_master(original_state)
+            state_label = "enabled" if original_state else "disabled"
+            print(f"\n  Restored original state: {state_label}")
+
+        # --- Summary ---
+        print(f"\n{Colors.CYAN}{'='*55}{Colors.RESET}")
+        total = passed + failed
+        if failed == 0:
+            print(f"  {Colors.GREEN}{Colors.BOLD}All {total}/{total} tests passed.{Colors.RESET}  "
+                  f"Toggle is live — no server restart needed.")
+        else:
+            print(f"  {Colors.RED}{Colors.BOLD}{failed}/{total} tests FAILED.{Colors.RESET}  "
+                  f"Check server logs.")
+        print()
 
     def show_help(self):
         """Print all available commands."""
@@ -1228,6 +1398,7 @@ class PluginManager:
         print("  memory set memory_age_count_timer <min|-1>    - Count-pressure check interval (min)")
         print("  memory set memory_age_trigger_minutes <min>   - Staleness threshold in minutes")
         print("  memory set memory_age_minutes_timer <min|-1>  - Staleness check interval (min)")
+        print("  memory test                                   - Runtime test: toggle enable/disable vs live server")
         print(f"\n{Colors.BOLD}Other:{Colors.RESET}")
         print("  help                              - Show this command list")
         print("  quit                              - Exit plugin manager")

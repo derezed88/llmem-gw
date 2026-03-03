@@ -515,10 +515,13 @@ async def cmd_memstats(client_id: str):
     mem_cfg = _mem_plugin_cfg()
     age_cfg = _age_cfg()
     lines.append("**Config (plugins-enabled.json)**")
+    master_on = mem_cfg.get("enabled", True)
+    lines.append(f"  {'enabled (master)':<28}: {'on' if master_on else 'OFF'}")
     features = ("context_injection", "reset_summarize", "post_response_scan", "fuzzy_dedup")
     for f in features:
         val = mem_cfg.get(f, True)
-        lines.append(f"  {f:<28}: {'on' if val else 'OFF'}")
+        active = master_on and val
+        lines.append(f"  {f:<28}: {'on' if val else 'OFF'}{' (inactive—master off)' if not master_on else ''}")
     lines.append(f"  {'fuzzy_dedup_threshold':<28}: {mem_cfg.get('fuzzy_dedup_threshold', 0.78):.2f}")
     lines.append(f"  {'summarizer_model':<28}: {mem_cfg.get('summarizer_model', 'summarizer-anthropic')}")
     lines.append(f"  {'auto_memory_age':<28}: {'on' if age_cfg['auto_memory_age'] else 'OFF'}")

@@ -298,11 +298,12 @@ The memory system depends on three models working together. Here is the relevant
 "memory": [
   "memory_save",
   "memory_recall",
-  "memory_age"
+  "memory_age",
+  "memory_update"
 ]
 ```
 
-This toolset is assigned to both `samaritan-execution` and `samaritan-reasoning`. `samaritan-execution` reliably calls these tools. `samaritan-reasoning` (Grok) has them bound so a direct call succeeds if Grok chooses to issue one; in practice Grok often narrates rather than calls, so delegation via `llm_call` remains the reliable path.
+This toolset is assigned to `samaritan-execution`. `samaritan-reasoning` (Grok) does **not** have the `memory` toolset — it uses the intercept path exclusively (`memory_scan: true`). `samaritan-execution` at temp=0.1 reliably calls these tools; delegation via `llm_call` from Grok is the reliable path for explicit saves.
 
 ---
 
@@ -488,22 +489,27 @@ Removing a topic: delete all rows with that topic from both memory tables.
 
 ### Aging Flow
 
-Rows older than 48 hours with low importance are moved to `samaritan_memory_longterm`.
-
-Aging fires automatically as a background task whenever a session is created or rehydrated from
-disk (including after an idle reap/reconnect). No manual trigger or cron job is needed.
+Rows age from short-term to long-term via two independent continuous background tasks
+started at server startup inside `agent-mcp.py`. No manual trigger or cron job is needed.
 
 ```
-Client connects (new session or rehydrated after idle reap)
-        │
-        ▼
-routes.py session init block
-  └── asyncio.create_task(age_to_longterm())   ← non-blocking background task
-            │
-            ▼
-      memory_age(older_than_hours=48, max_rows=100)
-        ├── SELECT from shortterm WHERE created_at < NOW() - INTERVAL 48 HOUR
-        │   ORDER BY importance ASC (lowest first)
+Server starts → asyncio.gather() launches two background loops:
+
+_age_count_task()   (count-pressure, interval: memory_age_count_timer minutes)
+  ├── reads _age_cfg() fresh each cycle
+  ├── skips if auto_memory_age=false or timer=-1
+  └── age_by_count(max_rows=200)
+        ├── reads entry_limit from config (memory_age_entrycount)
+        ├── if shortterm_count > entry_limit:
+        │     move overflow rows (lowest importance, oldest last_accessed) to longterm
+        └── asyncio.create_task(vec.update_tier(row_id, "long"))  ← Qdrant sync
+
+_age_minutes_task()   (staleness, interval: memory_age_minutes_timer minutes)
+  ├── reads _age_cfg() fresh each cycle
+  ├── skips if auto_memory_age=false or timer=-1
+  └── age_by_minutes(trigger_minutes=memory_age_trigger_minutes, max_rows=200)
+        ├── SELECT rows WHERE last_accessed < NOW() - INTERVAL N MINUTE
+        │   ORDER BY importance ASC, last_accessed ASC  LIMIT max_rows
         ├── for each row:
         │     ├── INSERT INTO longterm (copying all fields + shortterm_id)
         │     ├── DELETE FROM shortterm WHERE id = row.id
@@ -518,7 +524,8 @@ Manual override: ask Grok to delegate `memory_age(older_than_hours=24)` to age m
 ## Enabling / Disabling
 
 The memory system is an optional feature. Configuration lives in `plugins-enabled.json`
-under `plugin_config.memory`. Changes take effect after a server restart.
+under `plugin_config.memory`. **All changes take effect immediately — no server restart required.**
+The server re-reads this config on every request and every aging cycle.
 
 ### Via agentctl
 
@@ -550,7 +557,9 @@ python3 agentctl.py memory enable reset_summarize
   "enabled": true,
   "context_injection": true,
   "reset_summarize": true,
-  "post_response_scan": true
+  "post_response_scan": true,
+  "fuzzy_dedup": true,
+  "vector_search_qdrant": true
 }
 ```
 
@@ -562,6 +571,8 @@ python3 agentctl.py memory enable reset_summarize
 | `context_injection` | `true` | `## Active Memory` + Known topics injected into every request |
 | `reset_summarize` | `true` | Session summarized to memory on `!reset` |
 | `post_response_scan` | `true` | Regex scan of final response text for `memory_save(...)` narration |
+| `fuzzy_dedup` | `true` | Block near-duplicate saves via SequenceMatcher similarity |
+| `vector_search_qdrant` | `true` | Semantic retrieval via Qdrant; disable to fall back to load-all by importance |
 
 The `memory_scan` flag in `llm-models.json` is a **per-model** gate for post-response scanning.
 Both `post_response_scan` (global) and `memory_scan` (per-model) must be `true` for scanning to fire.
@@ -721,6 +732,19 @@ Move old short-term rows to long-term.
 memory_age(
   older_than_hours = 48,    # move rows older than this
   max_rows         = 100    # cap per invocation
+)
+```
+
+### `memory_update`
+Update fields on an existing memory row by id.
+
+```
+memory_update(
+  id         = 42,           # row id from memory_recall or !memory list
+  tier       = "short",      # "short" (default) or "long"
+  importance = 9,            # 1–10; omit or 0 to leave unchanged
+  content    = "New text.",  # omit or "" to leave unchanged
+  topic      = "new-topic"   # omit or "" to leave unchanged
 )
 ```
 
@@ -901,11 +925,11 @@ When the loop guard fired (same tool+args repeated `_TOOL_LOOP_THRESHOLD` times)
 
 **Fix:** Execute all pending tool calls (add ToolMessages to ctx) before injecting the HumanMessage break. Threshold also raised from 2→3 to allow one retry after a legitimate dedup/no-op result.
 
-### Hallucination guard: system prompt CRITICAL warning
+### Hallucination guard: system prompt CRITICAL warning → intercept path
 
 **File:** `system_prompt/004_reasoning/.system_prompt_memory`
 
-Grok was narrating saves without calling the tool. Added an explicit CRITICAL instruction:
+Grok was narrating saves without calling the tool. Initially added a CRITICAL instruction:
 
 ```
 **CRITICAL**: You MUST actually invoke the `memory_save` tool. Never claim memory was saved
@@ -913,7 +937,9 @@ without having called the tool. If the tool call does not appear in your respons
 was NOT saved.
 ```
 
-This is an instruction, not a technical fix — Grok may still narrate. The reliable path remains delegation to `samaritan-execution`.
+**This instruction is no longer in the current prompt.** The system evolved: Grok's `memory` toolset was removed entirely and replaced with the intercept path (`memory_scan: true`). The current CRITICAL says the opposite — Grok does NOT have `memory_save` as a registered tool; instead it writes `memory_save(...)` literally in response text and `_scan_and_save_memories()` in `agents.py` intercepts and executes it silently.
+
+The reliable path for guaranteed saves remains delegation to `samaritan-execution` via `llm_call`.
 
 ---
 

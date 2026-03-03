@@ -580,7 +580,7 @@ Both `post_response_scan` (global) and `memory_scan` (per-model) must be `true` 
 ### What is NOT gated
 
 - The `memory_save` / `memory_recall` / `memory_age` **tools** remain registered regardless of these flags — they can still be called via direct tool use or delegation. The flags only suppress the *automatic* behaviors (injection, reset summarize, scan).
-- Memory aging (`age_to_longterm`) is a background maintenance task; it always runs when sessions are created.
+- Memory aging (`_age_count_task` / `_age_minutes_task`) runs as continuous background loops started at server startup; it is not gated by these flags.
 - The behavior rule 8 mandatory-save instruction lives in the system prompt. To suppress it, edit `system_prompt/004_reasoning/.system_prompt_behavior` and remove rule 8, or set the model's `system_prompt_folder` to a folder without that rule.
 
 ---

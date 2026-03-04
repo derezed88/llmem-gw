@@ -14,7 +14,7 @@ mcp_server = FastMCP("AIOps-DB-Tools")
 
 @mcp_server.tool()
 async def db_query(sql: str) -> str:
-    """Execute SQL against the configured MySQL database."""
+    """Execute SQL against mymcp MySQL database."""
     return await execute_sql(sql)
 
 
@@ -33,16 +33,10 @@ async def get_system_info() -> dict:
         sess = sessions[cid]
         history = sess.get("history", [])
         size = estimate_history_size(history)
-        in_total = sess.get("tokens_in_total", 0)
-        out_total = sess.get("tokens_out_total", 0)
         result["session_context"] = {
             "history_messages": len(history),
             "history_chars": size["char_count"],
             "history_token_est": size["token_est"],
-            "llm_tokens_in_total": in_total,
-            "llm_tokens_out_total": out_total,
-            "llm_tokens_in_last": sess.get("tokens_in_last"),
-            "llm_tokens_out_last": sess.get("tokens_out_last"),
         }
     return result
 
@@ -286,6 +280,10 @@ def get_tool_executor(tool_name: str):
         'sysprompt_cfg':         _sysprompt_cfg_exec,
         'config_cfg':            _config_cfg_exec,
         'limits_cfg':            _limits_cfg_exec,
+        'memory_save':           _memory_save_exec,
+        'memory_recall':         _memory_recall_exec,
+        'memory_update':         _memory_update_exec,
+        'memory_age':            _memory_age_exec,
     }
 
     if tool_name in core_executors:
@@ -543,9 +541,16 @@ class _MemorySaveArgs(BaseModel):
     source: str = Field(default="user", description="Source: 'user', 'session', or 'directive'.")
 
 class _MemoryRecallArgs(BaseModel):
-    topic: str = Field(default="", description="Topic to search for. Leave empty for all short-term memories.")
-    tier: str = Field(default="short", description="'short' (default) or 'long' for long-term memory.")
+    topic: str = Field(default="", description="Keyword to search — matches topic label OR content text. Use words from the 'Known topics' list in Active Memory when possible.")
+    tier: str = Field(default="short", description="'short' (default, searches topic+content): active memories. 'long': aged-out facts (also searches content).")
     limit: int = Field(default=20, description="Max rows to return.")
+
+class _MemoryUpdateArgs(BaseModel):
+    id: int = Field(description="Row id to update (from memory_recall or !memory list).")
+    tier: str = Field(default="short", description="'short' (default) or 'long'.")
+    importance: int = Field(default=0, description="New importance 1-10. 0 = leave unchanged.")
+    content: str = Field(default="", description="New content text. Empty = leave unchanged.")
+    topic: str = Field(default="", description="New topic label. Empty = leave unchanged.")
 
 class _MemoryAgeArgs(BaseModel):
     older_than_hours: int = Field(default=48, description="Move rows older than this many hours to long-term.")
@@ -561,6 +566,8 @@ async def _memory_save_exec(topic: str, content: str, importance: int = 5, sourc
         importance=importance, source=source,
         session_id=session_id,
     )
+    if row_id == 0:
+        return f"Memory duplicate skipped (already in memory): [{topic}] {content}"
     return f"Memory saved (id={row_id}): [{topic}] {content} (importance={importance})"
 
 
@@ -584,6 +591,18 @@ async def _memory_age_exec(older_than_hours: int = 48, max_rows: int = 100) -> s
     from memory import age_to_longterm
     moved = await age_to_longterm(older_than_hours=older_than_hours, max_rows=max_rows)
     return f"Aged {moved} memories from short-term to long-term (threshold: {older_than_hours}h)."
+
+
+async def _memory_update_exec(id: int, tier: str = "short", importance: int = 0,
+                               content: str = "", topic: str = "") -> str:
+    from memory import update_memory
+    return await update_memory(
+        row_id=id,
+        tier=tier,
+        importance=importance if importance > 0 else None,
+        content=content if content else None,
+        topic=topic if topic else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1260,11 +1279,23 @@ def _make_core_lc_tools() -> list:
             coroutine=_memory_recall_exec,
             name="memory_recall",
             description=(
-                "Recall memories from short-term or long-term storage. "
-                "tier='short' (default): recent hot memories. tier='long': aged-out facts. "
-                "topic: filter by topic keyword. limit: max rows returned."
+                "Recall memories from storage. "
+                "ALWAYS check Active Memory context block first — it is pre-injected every request. "
+                "Only call this if the answer isn't already in the injected ## Active Memory block. "
+                "tier='short' (default): searches topic AND content. tier='long': aged-out facts, also searches content. "
+                "topic: keyword matched against both topic label and content text."
             ),
             args_schema=_MemoryRecallArgs,
+        ),
+        StructuredTool.from_function(
+            coroutine=_memory_update_exec,
+            name="memory_update",
+            description=(
+                "Update an existing memory row. Use to correct importance, fix content, or retopic a fact. "
+                "id: row id (from memory_recall output). tier: 'short' or 'long'. "
+                "importance: new value 1-10 (0 = unchanged). content/topic: new text (empty = unchanged)."
+            ),
+            args_schema=_MemoryUpdateArgs,
         ),
         StructuredTool.from_function(
             coroutine=_memory_age_exec,

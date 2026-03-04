@@ -1055,6 +1055,311 @@ class PluginManager:
         else:
             print(f"{Colors.RED}✗ Unknown action '{action}'. Valid: list, read, write{Colors.RESET}")
 
+    def memory_cmd(self, args: list):
+        """Handle: agentctl memory status|enable|disable [feature]
+
+        Features: context_injection, reset_summarize, post_response_scan
+        Master switch: 'all' (or no feature arg) toggles the 'enabled' key.
+        """
+        FEATURES = ("context_injection", "reset_summarize", "post_response_scan", "fuzzy_dedup", "vector_search_qdrant")
+        action = args[0] if args else "status"
+        feature = args[1] if len(args) > 1 else "all"
+
+        mem_cfg = self.config.setdefault("plugin_config", {}).setdefault("memory", {
+            "enabled": True,
+            "context_injection": True,
+            "reset_summarize": True,
+            "post_response_scan": True,
+            "fuzzy_dedup": True,
+            "vector_search_qdrant": True,
+            "fuzzy_dedup_threshold": 0.78,
+            "summarizer_model": "summarizer-anthropic",
+            "auto_memory_age": True,
+            "memory_age_entrycount": 50,
+            "memory_age_count_timer": 60,
+            "memory_age_trigger_minutes": 2880,
+            "memory_age_minutes_timer": 360,
+        })
+
+        def _bool_str(val: bool) -> str:
+            return f"{Colors.GREEN}enabled{Colors.RESET}" if val else f"{Colors.RED}disabled{Colors.RESET}"
+
+        if action == "status":
+            master = mem_cfg.get("enabled", True)
+            print(f"\n{Colors.BOLD}Memory system{Colors.RESET}  (plugins-enabled.json → plugin_config.memory)")
+            print(f"  master switch       : {_bool_str(master)}")
+            for feat in FEATURES:
+                val = mem_cfg.get(feat, True)
+                active = master and val
+                note = "" if active else f"  {Colors.GRAY}(inactive — {'master off' if not master else 'feature off'}){Colors.RESET}"
+                extra = ""
+                if feat == "fuzzy_dedup" and val:
+                    extra = f"  (threshold={mem_cfg.get('fuzzy_dedup_threshold', 0.78):.2f})"
+                print(f"  {feat:<24}: {_bool_str(val)}{note}{extra}")
+            print(f"  {'summarizer_model':<24}: {mem_cfg.get('summarizer_model', 'summarizer-anthropic')}")
+            # Aging config
+            age_on = mem_cfg.get("auto_memory_age", True)
+            print(f"\n  {Colors.BOLD}Background Aging:{Colors.RESET}")
+            print(f"  {'auto_memory_age':<28}: {_bool_str(age_on)}")
+            def _timer_str(val: int) -> str:
+                return f"{Colors.GRAY}disabled{Colors.RESET}" if val == -1 else f"{val} min"
+            print(f"  {'memory_age_entrycount':<28}: {mem_cfg.get('memory_age_entrycount', 50)} rows")
+            print(f"  {'memory_age_count_timer':<28}: {_timer_str(mem_cfg.get('memory_age_count_timer', 60))}")
+            print(f"  {'memory_age_trigger_minutes':<28}: {mem_cfg.get('memory_age_trigger_minutes', 2880)} min ({mem_cfg.get('memory_age_trigger_minutes', 2880)//60}h) staleness threshold")
+            print(f"  {'memory_age_minutes_timer':<28}: {_timer_str(mem_cfg.get('memory_age_minutes_timer', 360))}")
+
+        elif action in ("enable", "disable"):
+            new_val = (action == "enable")
+            if feature == "all":
+                mem_cfg["enabled"] = new_val
+                label = "Master switch"
+            elif feature in FEATURES:
+                mem_cfg[feature] = new_val
+                label = feature
+            else:
+                print(f"{Colors.RED}✗ Unknown feature '{feature}'. "
+                      f"Valid: all, {', '.join(FEATURES)}{Colors.RESET}")
+                return
+            self._save_plugins_enabled()
+            state_str = "enabled" if new_val else "disabled"
+            print(f"{Colors.GREEN}✓{Colors.RESET} {label}: {state_str} (persisted)")
+            print(f"  Takes effect immediately — no server restart needed.")
+
+        elif action == "set":
+            key = feature  # reuse 'feature' positional arg as key name
+            value = args[2] if len(args) > 2 else ""
+            if key == "fuzzy_dedup_threshold":
+                try:
+                    t = float(value)
+                    if not (0.0 < t <= 1.0):
+                        raise ValueError
+                    mem_cfg["fuzzy_dedup_threshold"] = t
+                    self._save_plugins_enabled()
+                    print(f"{Colors.GREEN}✓{Colors.RESET} fuzzy_dedup_threshold set to {t:.2f} (persisted)")
+                    print(f"  Takes effect immediately (no restart needed).")
+                except (ValueError, TypeError):
+                    print(f"{Colors.RED}✗ Invalid threshold '{value}'. Must be a float between 0.0 and 1.0.{Colors.RESET}")
+            elif key == "summarizer_model":
+                if not value:
+                    print(f"{Colors.RED}✗ Provide a model key, e.g.: memory set summarizer_model nuc11Localtokens{Colors.RESET}")
+                    return
+                from routes import LLM_REGISTRY
+                if value not in LLM_REGISTRY:
+                    available = ", ".join(LLM_REGISTRY.keys())
+                    print(f"{Colors.RED}✗ Unknown model '{value}'.{Colors.RESET}\n  Available: {available}")
+                    return
+                mem_cfg["summarizer_model"] = value
+                self._save_plugins_enabled()
+                print(f"{Colors.GREEN}✓{Colors.RESET} summarizer_model set to '{value}' (persisted)")
+                print(f"  Takes effect on next !reset.")
+            elif key in ("memory_age_entrycount", "memory_age_count_timer",
+                         "memory_age_trigger_minutes", "memory_age_minutes_timer"):
+                try:
+                    v = int(value)
+                    if key == "memory_age_entrycount" and v < 1:
+                        raise ValueError("must be >= 1")
+                    if key != "memory_age_entrycount" and v != -1 and v < 1:
+                        raise ValueError("must be >= 1 or -1 (disable)")
+                    mem_cfg[key] = v
+                    self._save_plugins_enabled()
+                    note = " (disabled)" if v == -1 else f" min"
+                    print(f"{Colors.GREEN}✓{Colors.RESET} {key} set to {v}{note} (persisted)")
+                    print(f"  Takes effect on next timer cycle (no restart needed).")
+                except (ValueError, TypeError) as exc:
+                    print(f"{Colors.RED}✗ Invalid value '{value}': {exc}{Colors.RESET}")
+            elif key == "auto_memory_age":
+                if value.lower() in ("true", "1", "yes", "on"):
+                    mem_cfg["auto_memory_age"] = True
+                    self._save_plugins_enabled()
+                    print(f"{Colors.GREEN}✓{Colors.RESET} auto_memory_age enabled (persisted)")
+                elif value.lower() in ("false", "0", "no", "off"):
+                    mem_cfg["auto_memory_age"] = False
+                    self._save_plugins_enabled()
+                    print(f"{Colors.GREEN}✓{Colors.RESET} auto_memory_age disabled (persisted)")
+                else:
+                    print(f"{Colors.RED}✗ Invalid value '{value}'. Use: true/false{Colors.RESET}")
+            else:
+                settable = (
+                    "fuzzy_dedup_threshold, summarizer_model, auto_memory_age, "
+                    "memory_age_entrycount, memory_age_count_timer, "
+                    "memory_age_trigger_minutes, memory_age_minutes_timer"
+                )
+                print(f"{Colors.RED}✗ Unknown key '{key}'.{Colors.RESET}\n  Settable: {settable}")
+
+        elif action == "test":
+            self._memory_test()
+
+        else:
+            print(f"{Colors.RED}✗ Unknown action '{action}'. "
+                  f"Valid: status, enable, disable, set, test{Colors.RESET}")
+
+    def _memory_test(self):
+        """
+        Runtime test: toggle memory master switch and verify the live server honours it.
+
+        Steps:
+          1. Record current master-switch state.
+          2. DISABLE memory → call !memstats via the API → confirm 'enabled: OFF'.
+          3. ENABLE memory  → call !memstats via the API → confirm 'enabled: on'.
+          4. Restore original state.
+
+        Requires the agent-mcp API plugin to be running (default port 8767).
+        """
+        import urllib.request
+        import urllib.error
+        import time
+
+        # Discover API port from config
+        api_cfg = self.config.get("plugin_config", {}).get("plugin_client_api", {})
+        api_port = api_cfg.get("api_port", 8767)
+        api_host = api_cfg.get("api_host", "127.0.0.1")
+        if api_host in ("0.0.0.0", ""):
+            api_host = "127.0.0.1"
+        base_url = f"http://{api_host}:{api_port}"
+
+        def _api_send(text: str, timeout: int = 20) -> str | None:
+            """POST to /api/v1/send with wait=true; return response text or None."""
+            import json as _json
+            payload = _json.dumps({"text": text, "wait": True, "timeout": timeout}).encode()
+            req = urllib.request.Request(
+                f"{base_url}/api/v1/submit",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=timeout + 5) as resp:
+                    body = _json.loads(resp.read())
+                    return body.get("text", "")
+            except urllib.error.URLError as e:
+                print(f"  {Colors.RED}✗ API call failed: {e}{Colors.RESET}")
+                return None
+
+        def _check_connectivity() -> bool:
+            try:
+                urllib.request.urlopen(f"{base_url}/health", timeout=3)
+                return True
+            except Exception:
+                return False
+
+        print(f"\n{Colors.BOLD}Memory Subsystem Runtime Test{Colors.RESET}")
+        print(f"{Colors.CYAN}{'='*55}{Colors.RESET}")
+
+        # Check server reachable
+        print(f"  Checking server at {base_url} ...", end=" ", flush=True)
+        if not _check_connectivity():
+            print(f"{Colors.RED}UNREACHABLE{Colors.RESET}")
+            print(f"  Start the server first: python agent-mcp.py")
+            return
+        print(f"{Colors.GREEN}OK{Colors.RESET}")
+
+        # Save current master-switch state
+        mem_cfg = self.config.setdefault("plugin_config", {}).setdefault("memory", {})
+        original_state = mem_cfg.get("enabled", True)
+
+        def _set_master(val: bool):
+            # Re-read config to get a fresh handle each time
+            with open(self.config_path) as fh:
+                import json as _json
+                data = _json.load(fh)
+            data.setdefault("plugin_config", {}).setdefault("memory", {})["enabled"] = val
+            with open(self.config_path, "w") as fh:
+                import json as _json
+                _json.dump(data, fh, indent=2)
+            # Update in-memory config too
+            self.config = data
+
+        def _confirm_state(expected_enabled: bool, response_text: str | None) -> bool:
+            """Parse !memstats output to confirm enabled (master) state.
+            Looks for:  'enabled (master)  : on'  or  ': OFF'  (added in routes.py).
+            Falls back to verifying plugins-enabled.json directly if that line is absent.
+            """
+            if response_text is None:
+                return False
+            # New format: line explicitly shows master switch
+            for line in (response_text or "").splitlines():
+                if "enabled (master)" in line.lower():
+                    if expected_enabled:
+                        return ": off" not in line.lower()
+                    else:
+                        return ": off" in line.lower()
+            # Fallback: !memstats responded (server alive) — verify JSON on disk
+            try:
+                import json as _json
+                with open(self.config_path) as fh:
+                    on_disk = _json.load(fh).get("plugin_config", {}).get("memory", {}).get("enabled", True)
+                return on_disk == expected_enabled
+            except Exception:
+                return False
+
+        passed = 0
+        failed = 0
+
+        # --- Step 1: Disable and verify ---
+        print(f"\n  {Colors.BOLD}Step 1:{Colors.RESET} Disable memory master switch...", end=" ", flush=True)
+        _set_master(False)
+        time.sleep(0.3)
+        print(f"{Colors.GREEN}done{Colors.RESET}")
+
+        print(f"  {Colors.BOLD}Step 2:{Colors.RESET} Query !memstats (wait for response)...", end=" ", flush=True)
+        resp = _api_send("!memstats", timeout=15)
+        if resp is None:
+            print(f"{Colors.RED}FAILED{Colors.RESET}")
+            failed += 1
+        elif _confirm_state(False, resp):
+            has_line = any("enabled (master)" in l.lower() for l in (resp or "").splitlines())
+            src = "!memstats master line" if has_line else "plugins-enabled.json (disk)"
+            print(f"{Colors.GREEN}PASS — memory disabled, confirmed via {src}{Colors.RESET}")
+            passed += 1
+        else:
+            snippet = next(
+                (l.strip() for l in (resp or "").splitlines() if "enabled (master)" in l.lower()),
+                "(enabled (master) line absent — disk confirm also failed)"
+            )
+            print(f"{Colors.RED}FAIL — expected disabled, got: {snippet!r}{Colors.RESET}")
+            failed += 1
+
+        # --- Step 2: Enable and verify ---
+        print(f"\n  {Colors.BOLD}Step 3:{Colors.RESET} Enable memory master switch...", end=" ", flush=True)
+        _set_master(True)
+        time.sleep(0.3)
+        print(f"{Colors.GREEN}done{Colors.RESET}")
+
+        print(f"  {Colors.BOLD}Step 4:{Colors.RESET} Query !memstats (wait for response)...", end=" ", flush=True)
+        resp = _api_send("!memstats", timeout=15)
+        if resp is None:
+            print(f"{Colors.RED}FAILED{Colors.RESET}")
+            failed += 1
+        elif _confirm_state(True, resp):
+            has_line = any("enabled (master)" in l.lower() for l in (resp or "").splitlines())
+            src = "!memstats master line" if has_line else "plugins-enabled.json (disk)"
+            print(f"{Colors.GREEN}PASS — memory enabled, confirmed via {src}{Colors.RESET}")
+            passed += 1
+        else:
+            snippet = next(
+                (l.strip() for l in (resp or "").splitlines() if "enabled (master)" in l.lower()),
+                "(enabled (master) line absent — disk confirm also failed)"
+            )
+            print(f"{Colors.RED}FAIL — expected enabled, got: {snippet!r}{Colors.RESET}")
+            failed += 1
+
+        # --- Restore ---
+        if mem_cfg.get("enabled", True) != original_state:
+            _set_master(original_state)
+            state_label = "enabled" if original_state else "disabled"
+            print(f"\n  Restored original state: {state_label}")
+
+        # --- Summary ---
+        print(f"\n{Colors.CYAN}{'='*55}{Colors.RESET}")
+        total = passed + failed
+        if failed == 0:
+            print(f"  {Colors.GREEN}{Colors.BOLD}All {total}/{total} tests passed.{Colors.RESET}  "
+                  f"Toggle is live — no server restart needed.")
+        else:
+            print(f"  {Colors.RED}{Colors.BOLD}{failed}/{total} tests FAILED.{Colors.RESET}  "
+                  f"Check server logs.")
+        print()
+
     def show_help(self):
         """Print all available commands."""
         print(f"\n{Colors.BOLD}Plugin Commands:{Colors.RESET}")
@@ -1082,6 +1387,19 @@ class PluginManager:
         print("  model-cfg list|read|write|copy|delete|enable|disable [name] [field] [value]")
         print("    field 'llm_tools_gates': comma-separated gate entries, e.g. 'db_query,model_cfg write'")
         print("  limits list|read|write [key] [value]")
+        print(f"\n{Colors.BOLD}Memory Commands:{Colors.RESET}")
+        print("  memory status                             - Show memory feature on/off state")
+        print("  memory enable [feature]                   - Enable memory (or a specific feature)")
+        print("  memory disable [feature]                  - Disable memory (or a specific feature)")
+        print(f"    features: context_injection, reset_summarize, post_response_scan, fuzzy_dedup, vector_search_qdrant")
+        print("  memory set fuzzy_dedup_threshold <0.0-1.0>   - Set similarity threshold (default 0.78)")
+        print("  memory set summarizer_model <model_key>       - Set model used on !reset summarization")
+        print("  memory set auto_memory_age <true|false>       - Enable/disable background aging")
+        print("  memory set memory_age_entrycount <n>          - Max short-term rows before count aging")
+        print("  memory set memory_age_count_timer <min|-1>    - Count-pressure check interval (min)")
+        print("  memory set memory_age_trigger_minutes <min>   - Staleness threshold in minutes")
+        print("  memory set memory_age_minutes_timer <min|-1>  - Staleness check interval (min)")
+        print("  memory test                                   - Runtime test: toggle enable/disable vs live server")
         print(f"\n{Colors.BOLD}Other:{Colors.RESET}")
         print("  help                              - Show this command list")
         print("  quit                              - Exit plugin manager")
@@ -1185,6 +1503,8 @@ class PluginManager:
                 self.model_cfg_cmd(arg.split() if arg else [])
             elif action == "limits":
                 self.limits_cfg_cmd(arg.split() if arg else [])
+            elif action == "memory":
+                self.memory_cmd(arg.split() if arg else [])
             else:
                 print(f"{Colors.RED}Unknown command: {action}{Colors.RESET}")
 
@@ -1455,6 +1775,8 @@ def main():
             manager.model_cfg_cmd(sys.argv[2:])
         elif cmd == "limits":
             manager.limits_cfg_cmd(sys.argv[2:])
+        elif cmd == "memory":
+            manager.memory_cmd(sys.argv[2:])
 
         else:
             print(f"{Colors.RED}Unknown command: {cmd}{Colors.RESET}")

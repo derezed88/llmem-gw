@@ -55,6 +55,19 @@
       "port_config_key": "slack_port",
       "default_port": 8766
     },
+    "plugin_memory_vector_qdrant": {
+      "type": "data_tool",
+      "file": "plugin_memory_vector_qdrant.py",
+      "description": "Qdrant vector search + nomic-embed-text for semantic memory retrieval",
+      "dependencies": [
+        "qdrant-client>=1.7",
+        "httpx>=0.24"
+      ],
+      "env_vars": [],
+      "config_files": [],
+      "priority": 50,
+      "tools": []
+    },
     "plugin_database_mysql": {
       "type": "data_tool",
       "file": "plugin_database_mysql.py",

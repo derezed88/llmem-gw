@@ -133,6 +133,7 @@ def _build_lc_llm(model_key: str):
             base_url=cfg.get("host"),
             api_key=cfg.get("key") or "no-key-required",
             streaming=True,
+            stream_usage=True,
             timeout=cfg.get("llm_call_timeout", 60),
         )
         if use_custom:
@@ -143,6 +144,9 @@ def _build_lc_llm(model_key: str):
                 # extra_body forwards top_k as a top-level JSON field in the request.
                 # llama.cpp accepts it; real OpenAI API ignores unknown extra_body fields.
                 kwargs["extra_body"] = {"top_k": int(top_k)}
+        max_tokens = cfg.get("max_tokens")
+        if max_tokens is not None:
+            kwargs["max_tokens"] = int(max_tokens)
         return ChatOpenAI(**kwargs)
 
     if cfg["type"] == "GEMINI":
@@ -157,6 +161,9 @@ def _build_lc_llm(model_key: str):
             top_k = cfg.get("top_k")
             if top_k is not None:
                 kwargs["top_k"] = int(top_k)
+        max_tokens = cfg.get("max_tokens")
+        if max_tokens is not None:
+            kwargs["max_output_tokens"] = int(max_tokens)
         return ChatGoogleGenerativeAI(**kwargs)
 
     raise ValueError(f"Unsupported model type '{cfg['type']}' for model '{model_key}'")
@@ -490,6 +497,8 @@ async def execute_tool(client_id: str, tool_name: str, tool_args: dict) -> str:
             elif tool_name == "google_drive":
                 op = tool_args.get("operation", "?")
                 await push_tok(client_id, f"\n[drive ▶] {op}\n")
+            elif tool_name in ("llm_call", "llm_call_clean", "llm_clean_text"):
+                pass  # llm_call prints its own [llm_call ▶] tag internally
             else:
                 await push_tok(client_id, f"\n[{tool_name} ▶] executing…\n")
 
@@ -535,6 +544,8 @@ async def execute_tool(client_id: str, tool_name: str, tool_args: dict) -> str:
                     await push_tok(client_id, f"[drive ◀]\n{preview}\n")
                 else:
                     await push_tok(client_id, "[drive ◀]\n")
+            elif tool_name in ("llm_call", "llm_call_clean", "llm_clean_text"):
+                pass  # llm_call prints its own [llm_call ◀] tag internally
             else:
                 if preview:
                     await push_tok(client_id, f"[{tool_name} ◀]\n{preview}\n")
@@ -627,6 +638,129 @@ def try_force_tool_calls(text: str, valid_tool_names: set[str] | None = None) ->
 
     return []
 
+# --- Post-response memory scan ---
+#
+# For models that narrate tool calls instead of issuing them (e.g. grok-4-1-fast-non-reasoning),
+# scan the final text response for memory_save() call syntax and execute any found saves silently
+# after the response is already streamed to the user (zero added latency).
+#
+# Activated per-model via "memory_scan": true in llm-models.json.
+# Handles the exact syntax the system prompt teaches:
+#   memory_save(topic="...", content="...", importance=N)
+#   memory_save(topic='...', content='...', importance=N, source='user')
+#
+# Also catches JSON-blob form in case the model outputs structured JSON inline.
+
+_MEMORY_SAVE_RE = re.compile(
+    r'memory_save\s*\(\s*'
+    r'topic\s*=\s*(?P<tq>["\'])(?P<topic>(?:(?!(?P=tq)).)+)(?P=tq)'
+    r'\s*,\s*content\s*=\s*(?P<cq>["\'])(?P<content>(?:(?!(?P=cq)).)+)(?P=cq)'
+    r'(?:\s*,\s*importance\s*=\s*(?P<importance>\d+))?'
+    r'(?:\s*,\s*source\s*=\s*(?P<sq>["\'])(?P<source>(?:(?!(?P=sq)).)+)(?P=sq))?'
+    r'[^)]*\)',
+    re.DOTALL | re.IGNORECASE,
+)
+
+# xAI XML tool-call format: <xai:function_call name="memory_save"><parameter name="topic">...</parameter>...
+_XML_TOOL_CALL_RE = re.compile(
+    r'<(?:\w+:)?function_call\s+name=["\'](?P<fn>\w+)["\'][^>]*>'
+    r'(?P<body>.*?)'
+    r'</(?:\w+:)?function_call>',
+    re.DOTALL | re.IGNORECASE,
+)
+_XML_PARAM_RE = re.compile(
+    r'<(?:\w+:)?parameter\s+name=["\'](?P<name>\w+)["\'][^>]*>(?P<value>.*?)</(?:\w+:)?parameter>',
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+async def _scan_and_save_memories(text: str, client_id: str, model_key: str) -> int:
+    """Scan a final text response for memory_save() calls and execute any found.
+
+    Returns the number of memories actually saved (0 if none found or all duplicates).
+    Runs silently — no output to the user stream.
+    """
+    from tools import _memory_save_exec
+    saved = 0
+
+    # Pass 1: function-call syntax  memory_save(topic="...", content="...", importance=N)
+    for m in _MEMORY_SAVE_RE.finditer(text):
+        topic = m.group("topic").strip()
+        content = m.group("content").strip()
+        importance = int(m.group("importance")) if m.group("importance") else 5
+        source = m.group("source") or "session"
+        if not topic or not content:
+            continue
+        try:
+            result = await _memory_save_exec(
+                topic=topic, content=content, importance=importance, source=source
+            )
+            if "already persisted" not in result:
+                saved += 1
+                log.info(
+                    f"memory_scan: auto-saved from {model_key} response — "
+                    f"topic={topic!r} importance={importance}"
+                )
+        except Exception as exc:
+            log.warning(f"memory_scan: save failed for topic={topic!r}: {exc}")
+
+    # Pass 2: JSON-blob form  {"name": "memory_save", "arguments": {...}}
+    if not saved:
+        for m in _JSON_BLOB_RE.finditer(text):
+            parsed = _try_parse_json_tool(m.group(0))
+            if parsed is None:
+                continue
+            name, args = parsed
+            if name != "memory_save":
+                continue
+            topic = str(args.get("topic", "")).strip()
+            content = str(args.get("content", "")).strip()
+            importance = int(args.get("importance", 5))
+            source = str(args.get("source", "session"))
+            if not topic or not content:
+                continue
+            try:
+                result = await _memory_save_exec(
+                    topic=topic, content=content, importance=importance, source=source
+                )
+                if "already persisted" not in result:
+                    saved += 1
+                    log.info(
+                        f"memory_scan: auto-saved (JSON form) from {model_key} — "
+                        f"topic={topic!r} importance={importance}"
+                    )
+            except Exception as exc:
+                log.warning(f"memory_scan: JSON-form save failed for topic={topic!r}: {exc}")
+
+    # Pass 3: xAI XML format  <xai:function_call name="memory_save"><parameter name="topic">...</parameter>...
+    if not saved:
+        for m in _XML_TOOL_CALL_RE.finditer(text):
+            if m.group("fn") != "memory_save":
+                continue
+            params = {pm.group("name"): pm.group("value").strip()
+                      for pm in _XML_PARAM_RE.finditer(m.group("body"))}
+            topic = params.get("topic", "").strip()
+            content = params.get("content", "").strip()
+            importance = int(params.get("importance", 5))
+            source = params.get("source", "session")
+            if not topic or not content:
+                continue
+            try:
+                result = await _memory_save_exec(
+                    topic=topic, content=content, importance=importance, source=source
+                )
+                if "already persisted" not in result:
+                    saved += 1
+                    log.info(
+                        f"memory_scan: auto-saved (XML form) from {model_key} — "
+                        f"topic={topic!r} importance={importance}"
+                    )
+            except Exception as exc:
+                log.warning(f"memory_scan: XML-form save failed for topic={topic!r}: {exc}")
+
+    return saved
+
+
 # --- Enrichment ---
 
 def _load_enrich_rules() -> list[dict]:
@@ -642,6 +776,33 @@ def _load_enrich_rules() -> list[dict]:
     except Exception as e:
         log.warning(f"auto-enrich.json load failed: {e}")
         return []
+
+
+def _memory_cfg() -> dict:
+    """Return the memory config block from plugins-enabled.json.
+    Defaults to all-enabled if the key is absent (backward-compatible)."""
+    import json as _json
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins-enabled.json")
+    try:
+        with open(path) as f:
+            data = _json.load(f)
+        return data.get("plugin_config", {}).get("memory", {})
+    except Exception:
+        return {}
+
+
+def _memory_feature(feature: str) -> bool:
+    """Return True if a specific memory feature is enabled.
+    Master switch: 'enabled' (default True).
+    Feature switches: 'context_injection', 'reset_summarize', 'post_response_scan',
+                      'fuzzy_dedup' (all default True).
+    fuzzy_dedup is read directly by memory.py (_fuzzy_dedup_threshold), not via this function.
+    A feature is only active when both the master switch and the feature switch are True.
+    """
+    cfg = _memory_cfg()
+    if not cfg.get("enabled", True):
+        return False
+    return cfg.get(feature, True)
 
 async def auto_enrich_context(messages: list[dict], client_id: str) -> list[dict]:
     if not messages: return messages
@@ -667,13 +828,22 @@ async def auto_enrich_context(messages: list[dict], client_id: str) -> list[dict
             pass
 
     # Inject short-term memory context block
-    try:
-        from memory import load_context_block
-        mem_block = await load_context_block(limit=15, min_importance=3)
-        if mem_block:
-            enrichments.append(mem_block)
-    except Exception as _mem_err:
-        log.debug(f"auto_enrich_context: memory load skipped: {_mem_err}")
+    # Build a query string from the last few turns for semantic retrieval
+    if _memory_feature("context_injection"):
+        try:
+            from memory import load_context_block
+            # Use last 3 messages (last user + up to 2 prior turns) as semantic query
+            recent = messages[-6:] if len(messages) >= 6 else messages
+            query_text = " ".join(
+                m.get("content", "")[:300]
+                for m in recent
+                if m.get("role") in ("user", "assistant") and m.get("content")
+            ).strip()
+            mem_block = await load_context_block(min_importance=3, query=query_text)
+            if mem_block:
+                enrichments.append(mem_block)
+        except Exception as _mem_err:
+            log.warning(f"auto_enrich_context: memory load failed: {_mem_err}")
 
     if not enrichments: return messages
 
@@ -725,10 +895,18 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
         # length so we can detect first-turn failures and retry with tool_choice='any'.
         _initial_ctx_len = len(ctx)
         _is_gemini = (LLM_REGISTRY.get(model_key, {}).get("type") == "GEMINI")
+        # Post-response memory scan: for models that narrate tool calls instead of
+        # issuing them, scan the final text for memory_save() syntax and execute saves.
+        # Gated by both the model-level "memory_scan" flag and the global feature switch.
+        _memory_scan = (
+            bool(LLM_REGISTRY.get(model_key, {}).get("memory_scan", False))
+            and _memory_feature("post_response_scan")
+        )
         # Tool-call loop detection: track the last N consecutive tool-call fingerprints.
         # If the same set of tool+args repeats >= _TOOL_LOOP_THRESHOLD times in a row,
         # the model is stuck in a deterministic loop (Qwen3, Hermes, etc.).
-        _TOOL_LOOP_THRESHOLD = 2
+        # Threshold of 3: allows one retry after a dedup/no-op result before aborting.
+        _TOOL_LOOP_THRESHOLD = 3
         _last_tc_fingerprint: str = ""
         _tc_repeat_count: int = 0
         for _ in range(LIVE_LIMITS.get("max_tool_iterations", MAX_TOOL_ITERATIONS)):
@@ -803,6 +981,8 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
                                     f"metadata={getattr(ai_msg, 'response_metadata', {})}"
                                 )
                                 await push_tok(client_id, "[empty string]")
+                            if _memory_scan and final:
+                                await _scan_and_save_memories(final, client_id, model_key)
                             await push_done(client_id)
                             return final
                     else:
@@ -839,6 +1019,8 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
                                     f"tool_calls={getattr(ai_msg, 'tool_calls', 'n/a')}"
                                 )
                                 await push_tok(client_id, "[empty string]")
+                            if _memory_scan and final:
+                                await _scan_and_save_memories(final, client_id, model_key)
                             await push_done(client_id)
                             return final
                         log.warning(
@@ -848,9 +1030,13 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
                             f"metadata={getattr(ai_msg, 'response_metadata', {})}"
                         )
                         await push_tok(client_id, "[empty string]")
+                        if _memory_scan and final:
+                            await _scan_and_save_memories(final, client_id, model_key)
                         await push_done(client_id)
                         return final
                 if not ai_msg.tool_calls:
+                    if _memory_scan and final:
+                        await _scan_and_save_memories(final, client_id, model_key)
                     await push_done(client_id)
                     return final
 
@@ -870,6 +1056,12 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
                     f"agentic_lc: tool-call loop detected for model={model_key} "
                     f"(repeated {_tc_repeat_count}x): {_tc_fp[:120]}"
                 )
+                # Execute pending tools first so tool_call_ids are resolved in ctx
+                # before injecting the break message. Skipping this causes a 400 from
+                # OpenAI ("tool_calls must be followed by tool messages").
+                for tc in ai_msg.tool_calls:
+                    result = await execute_tool(client_id, tc["name"], tc["args"])
+                    ctx.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
                 await push_tok(client_id, "\n[tool-loop detected — asking model to respond in text]\n")
                 ctx.append(HumanMessage(
                     content="You have already called the same tool(s) with the same arguments multiple times "
@@ -1117,15 +1309,16 @@ async def llm_call(
                     if not ai_msg.tool_calls:
                         return _content_to_str(ai_msg.content)
 
-                    tc = ai_msg.tool_calls[0]
-                    tool_result = await execute_tool(client_id, tc["name"], tc["args"])
+                    # Execute ALL parallel tool calls — orphaning any yields a 400
+                    tool_msgs = []
+                    last_result = ""
+                    for tc in ai_msg.tool_calls:
+                        last_result = str(await execute_tool(client_id, tc["name"], tc["args"]))
+                        tool_msgs.append(ToolMessage(content=last_result, tool_call_id=tc["id"]))
 
-                    turn2_msgs = messages + [
-                        ai_msg,
-                        ToolMessage(content=str(tool_result), tool_call_id=tc["id"]),
-                    ]
+                    turn2_msgs = messages + [ai_msg] + tool_msgs
                     final_msg: AIMessage = await llm.ainvoke(turn2_msgs)
-                    return _content_to_str(final_msg.content) or str(tool_result)
+                    return _content_to_str(final_msg.content) or last_result
 
                 result = await asyncio.wait_for(_run_tool(), timeout=timeout)
 

@@ -1,7 +1,6 @@
 {
   "version": "1.0.0",
   "enabled_plugins": [
-    "plugin_memory_vector_qdrant",
     "plugin_client_shellpy",
     "plugin_client_api",
     "plugin_database_mysql",
@@ -17,18 +16,6 @@
     "plugin_claude_vscode_sessions"
   ],
   "plugin_config": {
-    "plugin_memory_vector_qdrant": {
-      "enabled": true,
-      "qdrant_host": "localhost",
-      "qdrant_port": 6333,
-      "embed_url": "http://localhost:8000/v1/embeddings",
-      "embed_model": "nomic-embed-text",
-      "collection": "samaritan_memory",
-      "vector_dims": 768,
-      "top_k": 20,
-      "min_score": 0.45,
-      "min_importance_always": 8
-    },
     "plugin_history_default": {
       "agent_max_ctx": 200,
       "chain": [
@@ -84,7 +71,6 @@
       "reset_summarize": true,
       "post_response_scan": true,
       "fuzzy_dedup": true,
-      "vector_search_qdrant": true,
       "fuzzy_dedup_threshold": 0.78,
       "summarizer_model": "summarizer-anthropic",
       "auto_memory_age": true,

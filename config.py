@@ -89,6 +89,9 @@ def load_llm_registry():
                 "token_selection_setting": config.get('token_selection_setting', 'default'),
                 "llm_tools": config.get('llm_tools', []),
                 "llm_tools_gates": config.get('llm_tools_gates', []),
+                "memory_scan": config.get('memory_scan', False),
+                "max_tokens": config.get('max_tokens'),
+                "tool_suppress": config.get('tool_suppress', False),
             }
 
         return registry

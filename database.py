@@ -67,6 +67,31 @@ def _run_sql(sql: str) -> str:
 async def execute_sql(sql: str) -> str:
     return await asyncio.to_thread(_run_sql, sql)
 
+def _run_insert(sql: str) -> int:
+    """Run an INSERT and return lastrowid within the same connection."""
+    conn = _connect()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(sql)
+        conn.commit()
+        return cursor.lastrowid or 0
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise exc
+    finally:
+        cursor.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+async def execute_insert(sql: str) -> int:
+    """Execute an INSERT and return the new row id (same-connection, avoids LAST_INSERT_ID race)."""
+    return await asyncio.to_thread(_run_insert, sql)
+
 def extract_table_names(sql: str) -> list[str]:
     u = sql.upper()
     patterns = [

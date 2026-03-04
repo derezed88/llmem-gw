@@ -131,24 +131,227 @@ The JSON value takes precedence over `.env` if both are set.
 python agentctl.py models                              # list all models
 python agentctl.py model-info <model_name>            # detailed model info
 python agentctl.py model-add                          # interactive wizard
-python agentctl.py model-remove <model_name>          # remove a model
-python agentctl.py model-enable <model_name>          # enable a model
-python agentctl.py model-disable <model_name>         # disable a model
 python agentctl.py model <model_name>                 # set as default model
-python agentctl.py model-timeout <model_name> <secs> # set llm_call_timeout
+python agentctl.py model-cfg list                     # list all models (compact)
+python agentctl.py model-cfg read <name>              # show full model config
+python agentctl.py model-cfg write <name> <field> <value>  # update a field
+python agentctl.py model-cfg copy <source> <new_name>      # clone a model
+python agentctl.py model-cfg enable <name>            # enable a model
+python agentctl.py model-cfg disable <name>           # disable a model
+python agentctl.py model-cfg delete <name>            # remove a model
 ```
 
 **Safety rules:** The default model cannot be disabled or removed. Change the default first with `model <name>`.
 
-### Rate Limit Commands
+### Rate and Depth Limit Commands
 
 ```bash
-python agentctl.py ratelimit-list                     # show current limits
-python agentctl.py ratelimit-set <type> <n> <secs>   # set limit
-python agentctl.py ratelimit-autodisable <type> <t|f> # set auto-disable
+python agentctl.py limits list                        # show all limits
+python agentctl.py limits read <key>                  # read a specific limit
+python agentctl.py limits write <key> <value>         # update a limit
 ```
 
-Tool types: `llm_call`, `search`, `extract`, `drive`, `db`, `system`, `tmux`
+Limit keys: `max_at_llm_depth`, `max_agent_call_depth`, `max_tool_iterations`,
+`session_idle_timeout_minutes`, `max_users`, `rate_<type>_calls`, `rate_<type>_window`
+
+Tool rate types: `llm_call`, `search`, `extract`, `drive`, `db`, `system`, `tmux`
+
+### Memory System
+
+The tiered memory system persists facts across sessions using MySQL. It is optional and
+every feature is independently togglable.
+
+#### Prerequisites
+
+- `plugin_database_mysql` must be enabled and connected.
+- Three tables must exist in the database. Create them once:
+
+```sql
+CREATE TABLE IF NOT EXISTS <prefix>memory_shortterm (
+    id            INT AUTO_INCREMENT PRIMARY KEY,
+    topic         VARCHAR(255) NOT NULL,
+    content       TEXT NOT NULL,
+    importance    TINYINT DEFAULT 5,
+    source        VARCHAR(50) DEFAULT 'session',
+    session_id    VARCHAR(255) DEFAULT '',
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS <prefix>memory_longterm (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    topic      VARCHAR(255) NOT NULL,
+    content    TEXT NOT NULL,
+    importance TINYINT DEFAULT 5,
+    source     VARCHAR(50) DEFAULT 'session',
+    session_id VARCHAR(255) DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS <prefix>chat_summaries (
+    id         INT AUTO_INCREMENT PRIMARY KEY,
+    session_id VARCHAR(255),
+    summary    TEXT,
+    msg_count  INT DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+Replace `<prefix>` with your instance prefix (set in `db-config.json`).
+
+#### `db-config.json` (gitignored, instance-specific)
+
+Stores the table name prefix and fully-qualified table names for this deployment.
+If absent, bare names `memory_shortterm`, `memory_longterm`, `chat_summaries` are used.
+
+```json
+{
+  "managed_table_prefix": "myinstance_",
+  "tables": {
+    "memory_shortterm": "myinstance_memory_shortterm",
+    "memory_longterm":  "myinstance_memory_longterm",
+    "chat_summaries":   "myinstance_chat_summaries"
+  }
+}
+```
+
+#### `agentctl.py` memory commands
+
+```bash
+python agentctl.py memory status                                  # show all feature states + settings
+python agentctl.py memory enable                                  # enable master switch
+python agentctl.py memory disable                                 # disable everything
+python agentctl.py memory enable <feature>                        # enable one feature
+python agentctl.py memory disable <feature>                       # disable one feature
+python agentctl.py memory set fuzzy_dedup_threshold <0-1>        # adjust similarity threshold
+python agentctl.py memory set summarizer_model <model_key>       # change summarizer model
+python agentctl.py memory set auto_memory_age <true|false>       # enable/disable background aging
+python agentctl.py memory set memory_age_entrycount <n>          # max short-term rows
+python agentctl.py memory set memory_age_count_timer <min|-1>    # count-pressure interval (-1=off)
+python agentctl.py memory set memory_age_trigger_minutes <min>   # staleness threshold in minutes
+python agentctl.py memory set memory_age_minutes_timer <min|-1>  # staleness check interval (-1=off)
+python agentctl.py memory test                                    # live toggle test: disable, verify off, re-enable, verify on
+```
+
+All changes take effect immediately — no server restart required. The server re-reads `plugins-enabled.json` on every request.
+
+#### Feature flags
+
+All feature flags are live — changes to `plugins-enabled.json` take effect on the next request with no server restart. Configuration lives under `plugin_config.memory`:
+
+```json
+"memory": {
+  "enabled": true,
+  "context_injection": true,
+  "reset_summarize": true,
+  "post_response_scan": true,
+  "fuzzy_dedup": true,
+  "vector_search_qdrant": true,
+  "fuzzy_dedup_threshold": 0.78,
+  "summarizer_model": "summarizer-anthropic",
+  "auto_memory_age": true,
+  "memory_age_entrycount": 50,
+  "memory_age_count_timer": 60,
+  "memory_age_trigger_minutes": 2880,
+  "memory_age_minutes_timer": 360
+}
+```
+
+| Feature | What it controls |
+|---|---|
+| `enabled` | Master switch — when off, all memory features are suppressed regardless of individual flags |
+| `context_injection` | Short-term memories injected into every request as `## Active Memory` block |
+| `reset_summarize` | Conversation summarized to memory automatically on `!reset` |
+| `post_response_scan` | Regex scan of final response text for `memory_save()` calls the LLM narrated instead of calling as a tool |
+| `fuzzy_dedup` | Block near-duplicate saves using string similarity (SequenceMatcher) |
+| `vector_search_qdrant` | Semantic retrieval via Qdrant + nomic-embed-text. Disable to fall back to keyword-only recall. Named `_qdrant` to leave namespace open for other vector backends. |
+
+#### Settings
+
+| Key | Default | Restart required? | Description |
+|---|---|---|---|
+| `fuzzy_dedup_threshold` | `0.78` | No | Similarity ratio (0.0–1.0) above which a new save is treated as a duplicate. Read fresh each call. |
+| `summarizer_model` | `"summarizer-anthropic"` | No | Model key used by `summarize_and_save()` on `!reset`. Must be a valid key in `llm-models.json`. |
+| `auto_memory_age` | `true` | No | Master switch for background aging tasks. When false, both timers are suppressed. |
+| `memory_age_entrycount` | `50` | No | Max short-term rows before count-pressure aging removes the overflow. |
+| `memory_age_count_timer` | `60` | No | How often (minutes) the count-pressure task runs. Set to `-1` to disable. |
+| `memory_age_trigger_minutes` | `2880` | No | Staleness threshold in minutes (2880 = 48h). Rows not accessed in this time are candidates for staleness aging. |
+| `memory_age_minutes_timer` | `360` | No | How often (minutes) the staleness task runs. Set to `-1` to disable. |
+
+**Choosing a threshold:** SequenceMatcher ratio on real paraphrased duplicates typically
+lands at 0.78–0.88. Genuinely distinct facts on the same topic land below 0.65. The
+default of 0.78 catches paraphrase duplicates while allowing distinct new facts. Lower
+the threshold (e.g. 0.72) for more aggressive dedup; raise it (e.g. 0.90) to only
+block near-identical strings.
+
+#### How deduplication works
+
+`save_memory()` runs two passes before inserting:
+
+1. **Exact match** — blocks if identical `topic + content` exists in either tier (zero DB cost after index scan).
+2. **Fuzzy match** — if `fuzzy_dedup` is enabled, loads all existing `content` values for the same topic from both tiers (single `UNION ALL` query) and checks SequenceMatcher ratio against each. Skips insert if any match ≥ threshold.
+
+On any DB or config error in pass 2, the save proceeds rather than blocking.
+
+#### Memory tiers
+
+| Tier | Table | Purpose | Loaded how |
+|---|---|---|---|
+| Short-term | `*_memory_shortterm` | Hot facts, injected every request | Automatically |
+| Long-term | `*_memory_longterm` | Aged-out facts | On-demand via `memory_recall(tier="long")` |
+| Archive | Google Drive | Bulk summaries | Future / manual |
+
+Facts age from short-term to long-term via two independent background tasks (see below).
+
+#### Background Aging
+
+Two async tasks run continuously inside the server process. Both re-read config fresh on each cycle — no restart needed for config changes.
+
+**Count-pressure task** (`memory_age_count_timer`, default: every 60 min)
+
+Triggers when the short-term table exceeds `memory_age_entrycount` rows. Moves exactly the overflow rows — those with the lowest importance and oldest `last_accessed` time — to long-term. Has no age threshold; even recently saved rows can be moved if the table is over the cap.
+
+**Staleness task** (`memory_age_minutes_timer`, default: every 360 min)
+
+Moves all rows whose `last_accessed` is older than `memory_age_trigger_minutes` minutes (default: 2880 min = 48h). Safety ceiling: max 200 rows per pass. Also ordered by importance ASC, last_accessed ASC.
+
+**`last_accessed` semantics:** Updated automatically whenever `load_context_block()` injects memories into a request. This means memories that are actively recalled stay in short-term longer. MySQL's `ON UPDATE CURRENT_TIMESTAMP` alone is insufficient — the code issues an explicit `UPDATE` after each injection batch.
+
+**Disabling a timer:** Set the timer to `-1`. The task loop continues running (no restart needed) but skips the aging pass. The other timer remains active independently.
+
+#### Runtime memory commands
+
+```
+!memstats                                 show memory system health: DB counts, vector index, feature flag states
+!memory                                   list all short-term memories
+!memory list [short|long]                 list by tier
+!memory show <id> [short|long]            show one row in full
+!memory update <id> [tier=short] [importance=N] [content=text] [topic=label]
+```
+
+`!memstats` includes a **Config snapshot** section showing the master switch (`enabled (master)`) and each feature flag. Any flag showing `OFF (inactive—master off)` means the master switch is suppressing it.
+
+#### LLM memory tools
+
+Models with the `memory` toolset have access to:
+
+| Tool | Description |
+|---|---|
+| `memory_save` | Save a fact to short-term memory |
+| `memory_recall` | Search short-term or long-term by topic keyword (also matches content) |
+| `memory_update` | Update importance, content, or topic on an existing row by id |
+| `memory_age` | Manually trigger aging of stale short-term rows to long-term |
+
+Add the `memory` toolset to a model via:
+```
+!llm_tools add <model> memory
+```
+Or in `llm-models.json`:
+```json
+"llm_tools": ["core", "memory"]
+```
+
+> For the full memory system design, save paths, topic lifecycle, and change history, see [MEMORY_PROJECT1.md](MEMORY_PROJECT1.md).
 
 ---
 
@@ -738,6 +941,7 @@ to `llm-models.json` for any models served via that tunnel.
 | `.system_prompt_*` | Individual section files | Admin manually or LLM via tool |
 | `.aiops_session_id` | shell.py session persistence | shell.py automatically |
 | `auto-enrich.json` | Instance-specific context auto-enrichment rules (gitignored) | Admin manually — see below |
+| `db-config.json` | Instance-specific DB name and table name overrides for memory system (gitignored) | Admin manually |
 
 ### `plugin-manifest.json` vs `plugins-enabled.json`
 

@@ -10,7 +10,8 @@ Input model:
 Key bindings — input:
   Enter / F5 / Ctrl+G  — submit immediately
   Backspace / Delete   — delete char before cursor
-  Left / Right         — move cursor
+  Left / Right         — move cursor one character
+  Option+Left / Right  — move cursor one word (bash-style)
   Up / Down            — move cursor one visual row up/down
   Home / Ctrl+A        — jump to start
   End  / Ctrl+E        — jump to end
@@ -249,6 +250,15 @@ async def resolve_session_id(token: str) -> str | None:
     except ValueError:
         return token
 
+def _fmt_k(n: int) -> str:
+    """Format an integer compactly: 1234 -> '1.2k', 123456 -> '123k', 999 -> '999'."""
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if n >= 1000:
+        return f"{n/1000:.1f}k"
+    return str(n)
+
+
 async def list_sessions():
     """Fetch and display all sessions from server."""
     try:
@@ -263,11 +273,25 @@ async def list_sessions():
             cid = s["client_id"]
             model = s["model"]
             history = s["history_length"]
+            char_k = s.get("history_chars", 0)
+            tok_est = s.get("history_token_est", 0)
             peer_ip = s.get("peer_ip")
             ip_str = f", ip={peer_ip}" if peer_ip else ""
+            size_str = f" (~{char_k:,} chars, ~{tok_est:,} tok est)"
             await state.append_output(
-                f"  ID [{shorthand}] {cid}: model={model}, history={history} messages{ip_str}{current}"
+                f"  ID [{shorthand}] {cid}: model={model}, history={history} msgs{size_str}{ip_str}{current}"
             )
+            in_total = s.get("tokens_in_total", 0)
+            out_total = s.get("tokens_out_total", 0)
+            in_last = s.get("tokens_in_last")
+            out_last = s.get("tokens_out_last")
+            if in_total == 0 and out_total == 0:
+                await state.append_output("  tokens: no LLM calls yet (or provider doesn't report usage)")
+            else:
+                last_str = f"last: in={_fmt_k(in_last)} out={_fmt_k(out_last or 0)} | " if in_last is not None else ""
+                await state.append_output(
+                    f"  tokens: {last_str}total: in={_fmt_k(in_total)} out={_fmt_k(out_total)}"
+                )
         await state.append_output("")
     except Exception as exc:
         await state.append_output(f"[ERROR] Failed to list sessions: {exc}")
@@ -526,6 +550,9 @@ async def user_input_handler(text: str) -> bool:
             return True
 
         if cmd == "session":
+            ts = datetime.now().strftime("%H:%M:%S")
+            await state.append_output(f"\n[{ts}] You: {stripped}")
+            await state.append_output("")
             if not arg:
                 # List all sessions
                 await list_sessions()
@@ -711,6 +738,31 @@ def _snapshot(st: AppState) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Word-movement helpers (bash-style: stop at word boundary)
+# ---------------------------------------------------------------------------
+
+def _word_left(text: str, pos: int) -> int:
+    """Return position after moving one word left (Option+Left / Alt+b)."""
+    p = pos
+    while p > 0 and not text[p - 1].isalnum() and text[p - 1] != '_':
+        p -= 1
+    while p > 0 and (text[p - 1].isalnum() or text[p - 1] == '_'):
+        p -= 1
+    return p
+
+
+def _word_right(text: str, pos: int) -> int:
+    """Return position after moving one word right (Option+Right / Alt+f)."""
+    n = len(text)
+    p = pos
+    while p < n and not text[p].isalnum() and text[p] != '_':
+        p += 1
+    while p < n and (text[p].isalnum() or text[p] == '_'):
+        p += 1
+    return p
+
+
+# ---------------------------------------------------------------------------
 # Input loop
 # ---------------------------------------------------------------------------
 
@@ -819,6 +871,41 @@ async def input_loop(stdscr):
 
         if ch == -1:
             await asyncio.sleep(0.02)
+            continue
+
+        # ---- Escape sequence handling (Option/Alt + arrow = word movement) -
+        # ESC (27) starts multi-byte sequences.  Read the rest with a brief
+        # halfdelay so we don't block but still capture what follows quickly.
+        if ch == 27:
+            curses.halfdelay(1)   # 0.1 s timeout for subsequent bytes
+            seq = [27]
+            try:
+                while True:
+                    nc = stdscr.getch()
+                    if nc == -1:
+                        break
+                    seq.append(nc)
+                    if len(seq) >= 6:
+                        break
+            except Exception:
+                pass
+            curses.cbreak()       # restore non-blocking mode
+            stdscr.nodelay(True)
+
+            seq_bytes = bytes(seq)
+            # Option+Left:  \x1b[1;3D  or  \x1bb  (macOS Terminal / iTerm2)
+            # Option+Right: \x1b[1;3C  or  \x1bf
+            if seq_bytes in (b'\x1b[1;3D', b'\x1bb', b'\x1b\x1b[D'):
+                async with state.lock:
+                    state.input_cursor_pos = _word_left(state.input_text, state.input_cursor_pos)
+                state.redraw_event.set()
+                continue
+            elif seq_bytes in (b'\x1b[1;3C', b'\x1bf', b'\x1b\x1b[C'):
+                async with state.lock:
+                    state.input_cursor_pos = _word_right(state.input_text, state.input_cursor_pos)
+                state.redraw_event.set()
+                continue
+            # Unrecognised escape sequence — discard silently
             continue
 
         # ---- Detect paste: collect multiple rapid characters --------------

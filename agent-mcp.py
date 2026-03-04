@@ -37,6 +37,7 @@ from tools import get_core_tools
 import tools as tools_module
 import agents as agents_module
 from tools import register_plugin_commands
+import plugin_sec_airs_cmd  # registers !airs command at import time
 
 
 def _check_port_available(host: str, port: int) -> bool:
@@ -223,8 +224,61 @@ async def run_agent(host: str = "0.0.0.0"):
             except Exception as e:
                 log.warning(f"Session reaper error: {e}")
 
-    # Run all servers and reaper concurrently
-    await asyncio.gather(*servers_to_run, _session_reaper())
+    # Background memory aging tasks
+    async def _age_count_task():
+        """Count-pressure aging: runs every memory_age_count_timer minutes."""
+        from memory import age_by_count, _age_cfg
+        while True:
+            try:
+                cfg = _age_cfg()
+                if not cfg["auto_memory_age"]:
+                    await asyncio.sleep(300)
+                    continue
+                timer_min = cfg["memory_age_count_timer"]
+                if timer_min == -1:
+                    # Disabled — sleep a long time and re-check config periodically
+                    await asyncio.sleep(3600)
+                    continue
+                await age_by_count()
+            except Exception as e:
+                log.warning(f"_age_count_task error: {e}")
+            try:
+                cfg = _age_cfg()
+                sleep_sec = max(60, cfg["memory_age_count_timer"]) * 60
+            except Exception:
+                sleep_sec = 3600
+            await asyncio.sleep(sleep_sec)
+
+    async def _age_minutes_task():
+        """Staleness aging: runs every memory_age_minutes_timer minutes."""
+        from memory import age_by_minutes, _age_cfg
+        while True:
+            try:
+                cfg = _age_cfg()
+                if not cfg["auto_memory_age"]:
+                    await asyncio.sleep(300)
+                    continue
+                timer_min = cfg["memory_age_minutes_timer"]
+                if timer_min == -1:
+                    await asyncio.sleep(3600)
+                    continue
+                await age_by_minutes(trigger_minutes=cfg["memory_age_trigger_minutes"])
+            except Exception as e:
+                log.warning(f"_age_minutes_task error: {e}")
+            try:
+                cfg = _age_cfg()
+                sleep_sec = max(60, cfg["memory_age_minutes_timer"]) * 60
+            except Exception:
+                sleep_sec = 3600
+            await asyncio.sleep(sleep_sec)
+
+    # Run all servers, reaper, and memory aging tasks concurrently
+    await asyncio.gather(
+        *servers_to_run,
+        _session_reaper(),
+        _age_count_task(),
+        _age_minutes_task(),
+    )
 
 
 def main():

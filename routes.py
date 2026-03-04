@@ -121,6 +121,13 @@ async def cmd_help(client_id: str):
         "Database:\n"
         "  !db_query <sql>                           - run SQL directly (no LLM)\n"
         "\n"
+        "Memory:\n"
+        "  !memory                                   - list all short-term memories\n"
+        "  !memory list [short|long]                 - list by tier\n"
+        "  !memory show <id> [short|long]            - show one row in full\n"
+        "  !memory update <id> [tier=short] [importance=N] [content=text] [topic=label]\n"
+        "  !memstats                                 - memory system health dashboard\n"
+        "\n"
         "Search & Extract:\n"
         "  !search_ddgs <query>                      - search via DuckDuckGo\n"
         "  !search_google <query>                    - search via Google (Gemini grounding)\n"
@@ -211,6 +218,329 @@ async def cmd_db_query(client_id: str, sql: str):
         await push_tok(client_id, result)
     except Exception as exc:
         await push_tok(client_id, f"ERROR: Database query failed\n{exc}")
+    await conditional_push_done(client_id)
+
+
+async def cmd_memory(client_id: str, arg: str):
+    """
+    !memory                         - list all short-term memories
+    !memory list [short|long]       - list short or long-term memories
+    !memory show <id> [short|long]  - show one row in full
+    !memory update <id> [tier=short] [importance=N] [content=...] [topic=...]
+    """
+    from memory import load_short_term, load_long_term, update_memory
+    parts = arg.split(maxsplit=1)
+    subcmd = parts[0].lower() if parts else "list"
+    rest = parts[1].strip() if len(parts) > 1 else ""
+
+    if subcmd in ("list", "short", "long", ""):
+        tier = "long" if subcmd == "long" else "short"
+        if subcmd == "list" and rest in ("long", "short"):
+            tier = rest
+        rows = await (load_long_term(limit=100) if tier == "long" else load_short_term(limit=100, min_importance=1))
+        if not rows:
+            await push_tok(client_id, f"No {tier}-term memories.")
+        else:
+            lines = [f"{tier}-term memory ({len(rows)} rows):\n"]
+            for r in rows:
+                imp = r.get("importance", "?")
+                lines.append(f"  [{r['id']:>3}] imp={imp} [{r.get('topic','')}] {r.get('content','')}")
+            await push_tok(client_id, "\n".join(lines))
+
+    elif subcmd == "show":
+        tparts = rest.split()
+        if not tparts:
+            await push_tok(client_id, "Usage: !memory show <id> [short|long]")
+            await conditional_push_done(client_id)
+            return
+        try:
+            row_id = int(tparts[0])
+        except ValueError:
+            await push_tok(client_id, f"Invalid id: {tparts[0]}")
+            await conditional_push_done(client_id)
+            return
+        tier = tparts[1] if len(tparts) > 1 and tparts[1] in ("short", "long") else "short"
+        rows = await (load_long_term(limit=1000) if tier == "long" else load_short_term(limit=1000, min_importance=1))
+        row = next((r for r in rows if str(r.get("id")) == str(row_id)), None)
+        if not row:
+            await push_tok(client_id, f"No {tier}-term row with id={row_id}.")
+        else:
+            await push_tok(client_id, "\n".join(f"  {k}: {v}" for k, v in row.items()))
+
+    elif subcmd == "update":
+        tparts = rest.split(maxsplit=1)
+        if not tparts:
+            await push_tok(client_id, "Usage: !memory update <id> [tier=short] [importance=N] [content=...] [topic=...]")
+            await conditional_push_done(client_id)
+            return
+        try:
+            row_id = int(tparts[0])
+        except ValueError:
+            await push_tok(client_id, f"Invalid id: {tparts[0]}")
+            await conditional_push_done(client_id)
+            return
+        kwargs_str = tparts[1] if len(tparts) > 1 else ""
+        # Parse key=value pairs; content/topic may contain spaces so grab them last
+        import re as _re
+        tier = "short"
+        importance = None
+        content = None
+        topic = None
+        m = _re.search(r'\btier=(short|long)\b', kwargs_str)
+        if m:
+            tier = m.group(1)
+            kwargs_str = kwargs_str[:m.start()] + kwargs_str[m.end():]
+        m = _re.search(r'\bimportance=(\d+)\b', kwargs_str)
+        if m:
+            importance = int(m.group(1))
+            kwargs_str = kwargs_str[:m.start()] + kwargs_str[m.end():]
+        m = _re.search(r'\btopic=(\S+)', kwargs_str)
+        if m:
+            topic = m.group(1)
+            kwargs_str = kwargs_str[:m.start()] + kwargs_str[m.end():]
+        m = _re.search(r'\bcontent=(.+)', kwargs_str, _re.DOTALL)
+        if m:
+            content = m.group(1).strip()
+        result = await update_memory(row_id=row_id, tier=tier,
+                                     importance=importance, content=content, topic=topic)
+        await push_tok(client_id, result)
+
+    else:
+        await push_tok(client_id,
+            "Usage:\n"
+            "  !memory                              - list short-term memories\n"
+            "  !memory list [short|long]            - list by tier\n"
+            "  !memory show <id> [short|long]       - show one row\n"
+            "  !memory update <id> [tier=short] [importance=N] [content=text] [topic=label]")
+
+    await conditional_push_done(client_id)
+
+
+async def cmd_memstats(client_id: str):
+    """
+    !memstats — memory system health dashboard.
+    Shows row counts, topic distribution, importance spread, aging history,
+    summarizer runs, dedup config, and last activity timestamps.
+    """
+    from database import execute_sql
+    from memory import _ST, _LT, _SUM, _age_cfg, _mem_plugin_cfg
+
+    lines = ["## Memory System Stats\n"]
+
+    async def q(sql: str) -> str:
+        try:
+            return await execute_sql(sql)
+        except Exception as e:
+            return f"(error: {e})"
+
+    def _int_from(raw: str) -> int:
+        for line in raw.strip().splitlines():
+            line = line.strip()
+            if line.isdigit():
+                return int(line)
+            parts = line.split()
+            if parts and parts[-1].isdigit():
+                return int(parts[-1])
+        return 0
+
+    def _rows_from(raw: str) -> list[list[str]]:
+        """Parse pipe-separated output into rows of stripped strings."""
+        result = []
+        for line in raw.strip().splitlines()[1:]:  # skip header
+            if not line.strip() or set(line.strip()) <= set("-+|"):
+                continue
+            result.append([c.strip() for c in line.split("|")])
+        return result
+
+    # ── Tier counts ──────────────────────────────────────────────────────────
+    st_count = _int_from(await q(f"SELECT COUNT(*) FROM {_ST}"))
+    lt_count = _int_from(await q(f"SELECT COUNT(*) FROM {_LT}"))
+    sum_count = _int_from(await q(f"SELECT COUNT(*) FROM {_SUM}"))
+    lines.append(f"**Tier counts**")
+    lines.append(f"  short-term : {st_count} rows")
+    lines.append(f"  long-term  : {lt_count} rows")
+    lines.append(f"  summaries  : {sum_count} rows\n")
+
+    # ── Short-term: topic breakdown ───────────────────────────────────────────
+    st_topics_raw = await q(
+        f"SELECT topic, COUNT(*) as n, ROUND(AVG(importance),1) as avg_imp "
+        f"FROM {_ST} GROUP BY topic ORDER BY n DESC LIMIT 20"
+    )
+    st_topic_rows = _rows_from(st_topics_raw)
+    if st_topic_rows:
+        lines.append(f"**Short-term by topic** (top {len(st_topic_rows)})")
+        for row in st_topic_rows:
+            if len(row) >= 3:
+                lines.append(f"  {row[0]:<30} {row[1]:>4} rows  avg_imp={row[2]}")
+        lines.append("")
+
+    # ── Long-term: topic breakdown ────────────────────────────────────────────
+    lt_topics_raw = await q(
+        f"SELECT topic, COUNT(*) as n, ROUND(AVG(importance),1) as avg_imp "
+        f"FROM {_LT} GROUP BY topic ORDER BY n DESC LIMIT 20"
+    )
+    lt_topic_rows = _rows_from(lt_topics_raw)
+    if lt_topic_rows:
+        lines.append(f"**Long-term by topic** (top {len(lt_topic_rows)})")
+        for row in lt_topic_rows:
+            if len(row) >= 3:
+                lines.append(f"  {row[0]:<30} {row[1]:>4} rows  avg_imp={row[2]}")
+        lines.append("")
+
+    # ── Importance distribution (short-term) ─────────────────────────────────
+    imp_raw = await q(
+        f"SELECT importance, COUNT(*) as n FROM {_ST} GROUP BY importance ORDER BY importance"
+    )
+    imp_rows = _rows_from(imp_raw)
+    if imp_rows:
+        lines.append("**Short-term importance distribution**")
+        dist = "  " + "  ".join(f"[{r[0]}]={r[1]}" for r in imp_rows if len(r) >= 2)
+        lines.append(dist)
+        lines.append("")
+
+    # ── Source breakdown (short-term) ─────────────────────────────────────────
+    src_raw = await q(
+        f"SELECT source, COUNT(*) as n FROM {_ST} GROUP BY source ORDER BY n DESC"
+    )
+    src_rows = _rows_from(src_raw)
+    if src_rows:
+        lines.append("**Short-term by source**")
+        for row in src_rows:
+            if len(row) >= 2:
+                lines.append(f"  {row[0]:<20} {row[1]:>4} rows")
+        lines.append("")
+
+    # ── Aging: long-term source of truth ─────────────────────────────────────
+    lt_from_st_raw = await q(
+        f"SELECT COUNT(*) FROM {_LT} WHERE shortterm_id IS NOT NULL AND shortterm_id > 0"
+    )
+    lt_aged = _int_from(lt_from_st_raw)
+    lt_direct_raw = await q(
+        f"SELECT COUNT(*) FROM {_LT} WHERE shortterm_id IS NULL OR shortterm_id = 0"
+    )
+    lt_direct = _int_from(lt_direct_raw)
+    lines.append("**Long-term origin**")
+    lines.append(f"  aged from short-term : {lt_aged} rows")
+    lines.append(f"  direct saves         : {lt_direct} rows\n")
+
+    # ── Last activity timestamps ──────────────────────────────────────────────
+    st_newest_raw = await q(f"SELECT MAX(created_at) FROM {_ST}")
+    st_oldest_raw = await q(f"SELECT MIN(created_at) FROM {_ST}")
+    st_lru_raw    = await q(f"SELECT MIN(last_accessed) FROM {_ST}")
+    lt_newest_raw = await q(f"SELECT MAX(created_at) FROM {_LT}")
+    sum_newest_raw = await q(f"SELECT MAX(created_at) FROM {_SUM}")
+
+    def _scalar(raw: str) -> str:
+        for line in raw.strip().splitlines():
+            line = line.strip()
+            if line and not line.startswith("MAX") and not line.startswith("MIN") and set(line) > set("-+|"):
+                return line
+        return "(none)"
+
+    lines.append("**Timestamps**")
+    lines.append(f"  ST newest created    : {_scalar(st_newest_raw)}")
+    lines.append(f"  ST oldest created    : {_scalar(st_oldest_raw)}")
+    lines.append(f"  ST least recently    : {_scalar(st_lru_raw)}")
+    lines.append(f"  LT newest created    : {_scalar(lt_newest_raw)}")
+    lines.append(f"  Summaries newest     : {_scalar(sum_newest_raw)}\n")
+
+    # ── Summarizer runs ───────────────────────────────────────────────────────
+    if sum_count > 0:
+        sum_model_raw = await q(
+            f"SELECT model_used, COUNT(*) as n FROM {_SUM} GROUP BY model_used ORDER BY n DESC"
+        )
+        sum_model_rows = _rows_from(sum_model_raw)
+        if sum_model_rows:
+            lines.append("**Summarizer runs by model**")
+            for row in sum_model_rows:
+                if len(row) >= 2:
+                    lines.append(f"  {row[0]:<30} {row[1]:>3} runs")
+            lines.append("")
+
+    # ── Vector index stats ────────────────────────────────────────────────────
+    try:
+        from plugin_memory_vector_qdrant import get_vector_api
+        vec = get_vector_api()
+        if vec:
+            vstats = await vec.get_stats()
+            vcfg   = vec.cfg()
+            qd = vstats.get("qdrant", {})
+            em = vstats.get("embed", {})
+
+            lines.append("**Vector Index (Qdrant)**")
+            if "error" in qd:
+                lines.append(f"  status               : ERROR — {qd['error']}")
+            else:
+                mysql_total = st_count + lt_count
+                qdrant_pts  = qd.get("points_count", "?")
+                drift = ""
+                if isinstance(qdrant_pts, int) and mysql_total > 0:
+                    diff = mysql_total - qdrant_pts
+                    if diff != 0:
+                        drift = f"  !! drift: MySQL={mysql_total} Qdrant={qdrant_pts} (diff={diff:+d})"
+                lines.append(f"  status               : {qd.get('status', '?')}")
+                lines.append(f"  points_count         : {qdrant_pts}  (MySQL ST+LT={mysql_total})")
+                if drift:
+                    lines.append(drift)
+                lines.append(f"  indexed_vectors      : {qd.get('indexed_vectors_count', '?')}")
+                lines.append(f"  segments             : {qd.get('segments_count', '?')}")
+                lines.append(f"  optimizer            : {qd.get('optimizer_status', '?')}")
+                lines.append(f"  collection           : {vcfg.get('collection')}  @{vcfg.get('qdrant_host')}:{vcfg.get('qdrant_port')}")
+                lines.append(f"  top_k / min_score    : {vcfg.get('top_k')} / {vcfg.get('min_score')}")
+                lines.append(f"  always_inject_imp>=  : {vcfg.get('min_importance_always')}")
+            lines.append("")
+
+            lines.append("**Embedding Server (nomic-embed-text)**")
+            lines.append(f"  health               : {em.get('health', '?')}")
+            if "kv_cache_pct" in em:
+                lines.append(f"  kv_cache_usage       : {em['kv_cache_pct']}")
+            if "kv_cache_tokens" in em:
+                lines.append(f"  kv_cache_tokens      : {em['kv_cache_tokens']}")
+            if "embed_tps" in em:
+                lines.append(f"  embed_throughput     : {em['embed_tps']}")
+            if "requests_processing" in em:
+                lines.append(f"  requests_processing  : {em['requests_processing']}")
+            if "requests_deferred" in em:
+                lines.append(f"  requests_deferred    : {em['requests_deferred']}")
+            if "metrics" in em:
+                lines.append(f"  metrics endpoint     : {em['metrics']}")
+            lines.append(f"  url                  : {vcfg.get('embed_url')}")
+            lines.append("")
+        else:
+            lines.append("**Vector Index**: not loaded\n")
+    except Exception as _vec_err:
+        lines.append(f"**Vector Index**: error — {_vec_err}\n")
+
+    # ── Config snapshot ───────────────────────────────────────────────────────
+    mem_cfg = _mem_plugin_cfg()
+    age_cfg = _age_cfg()
+    lines.append("**Config (plugins-enabled.json)**")
+    master_on = mem_cfg.get("enabled", True)
+    lines.append(f"  {'enabled (master)':<28}: {'on' if master_on else 'OFF'}")
+    features = ("context_injection", "reset_summarize", "post_response_scan", "fuzzy_dedup", "vector_search_qdrant")
+    for f in features:
+        val = mem_cfg.get(f, True)
+        lines.append(f"  {f:<28}: {'on' if val else 'OFF'}{' (inactive—master off)' if not master_on else ''}")
+    lines.append(f"  {'fuzzy_dedup_threshold':<28}: {mem_cfg.get('fuzzy_dedup_threshold', 0.78):.2f}")
+    lines.append(f"  {'summarizer_model':<28}: {mem_cfg.get('summarizer_model', 'summarizer-anthropic')}")
+    lines.append(f"  {'auto_memory_age':<28}: {'on' if age_cfg['auto_memory_age'] else 'OFF'}")
+    lines.append(f"  {'memory_age_entrycount':<28}: {age_cfg['memory_age_entrycount']}")
+
+    def _timer(v: int) -> str:
+        return "disabled" if v == -1 else f"{v} min"
+
+    lines.append(f"  {'memory_age_count_timer':<28}: {_timer(age_cfg['memory_age_count_timer'])}")
+    lines.append(f"  {'memory_age_trigger_minutes':<28}: {age_cfg['memory_age_trigger_minutes']} min ({age_cfg['memory_age_trigger_minutes']//60}h)")
+    lines.append(f"  {'memory_age_minutes_timer':<28}: {_timer(age_cfg['memory_age_minutes_timer'])}")
+
+    # Pressure indicator
+    if st_count > 0:
+        limit = age_cfg["memory_age_entrycount"]
+        pct = int(st_count / limit * 100) if limit > 0 else 0
+        bar = "#" * min(20, pct // 5) + "." * max(0, 20 - pct // 5)
+        lines.append(f"\n  ST pressure: [{bar}] {pct}% of {limit} row limit")
+
+    await push_tok(client_id, "\n".join(lines))
     await conditional_push_done(client_id)
 
 
@@ -307,7 +637,12 @@ async def cmd_plugin_command(client_id: str, cmd: str, args: str):
 async def cmd_get_system_info(client_id: str):
     """Show current date/time and system status."""
     from tools import get_system_info
-    result = await get_system_info()
+    from state import current_client_id
+    token = current_client_id.set(client_id)
+    try:
+        result = await get_system_info()
+    finally:
+        current_client_id.reset(token)
     await push_tok(client_id, str(result))
     await conditional_push_done(client_id)
 
@@ -464,14 +799,16 @@ async def cmd_reset(client_id: str, session: dict):
     history_len = len(history)
 
     # Summarize departing history into short-term memory before clearing
-    if history_len >= 4:
+    from agents import _memory_feature, _memory_cfg
+    if history_len >= 4 and _memory_feature("reset_summarize"):
         try:
             from memory import summarize_and_save
+            summarizer_model = _memory_cfg().get("summarizer_model", "summarizer-anthropic")
             await push_tok(client_id, "[memory] Summarizing session to memory...\n")
             status = await summarize_and_save(
                 session_id=client_id,
                 history=history,
-                model_key="summarizer-anthropic",
+                model_key=summarizer_model,
             )
             await push_tok(client_id, f"[memory] {status}\n")
         except Exception as _mem_err:
@@ -702,12 +1039,13 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
         import time as _time_init
         prior_history = load_history(client_id)
         prior_cfg = load_session_config(client_id)
+        _model_tool_suppress = model_cfg.get("tool_suppress", get_default_tool_suppress())
         sessions[client_id] = {
             "model": model_key,
             "history": prior_history,
             "history_max_ctx": effective_ctx,
             "tool_preview_length": prior_cfg.get("tool_preview_length", get_default_tool_preview_length()),
-            "tool_suppress": prior_cfg.get("tool_suppress", get_default_tool_suppress()),
+            "tool_suppress": prior_cfg.get("tool_suppress", _model_tool_suppress),
             "_client_id": client_id,
             "created_at": _time_init.time(),
         }
@@ -804,6 +1142,10 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
                     await cmd_limits_cfg(client_id, arg)
                 elif cmd == "vscode":
                     await cmd_vscode(client_id, arg)
+                elif cmd == "memory":
+                    await cmd_memory(client_id, arg)
+                elif cmd == "memstats":
+                    await cmd_memstats(client_id)
                 elif get_plugin_command(cmd) is not None:
                     await cmd_plugin_command(client_id, cmd, arg)
                 else:
@@ -888,6 +1230,12 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
             return
         if cmd == "vscode":
             await cmd_vscode(client_id, arg)
+            return
+        if cmd == "memory":
+            await cmd_memory(client_id, arg)
+            return
+        if cmd == "memstats":
+            await cmd_memstats(client_id)
             return
         if cmd == "stop":
             await cmd_stop(client_id)
@@ -988,12 +1336,13 @@ async def endpoint_stream(request: Request):
         _mcfg = LLM_REGISTRY.get(DEFAULT_MODEL, {})
         prior_history = load_history(client_id)
         prior_cfg = load_session_config(client_id)
+        _model_tool_suppress = _mcfg.get("tool_suppress", get_default_tool_suppress())
         sessions[client_id] = {
             "model": DEFAULT_MODEL,
             "history": prior_history,
             "history_max_ctx": _phd.compute_effective_max_ctx(_mcfg),
             "tool_preview_length": prior_cfg.get("tool_preview_length", get_default_tool_preview_length()),
-            "tool_suppress": prior_cfg.get("tool_suppress", get_default_tool_suppress()),
+            "tool_suppress": prior_cfg.get("tool_suppress", _model_tool_suppress),
             "_client_id": client_id,
         }
         if "agent_call_stream" in prior_cfg:
@@ -1083,7 +1432,7 @@ async def endpoint_health(request: Request) -> JSONResponse:
 
 async def endpoint_list_sessions(request: Request) -> JSONResponse:
     """List all active sessions with metadata."""
-    from state import sessions, sse_queues, get_or_create_shorthand_id
+    from state import sessions, sse_queues, get_or_create_shorthand_id, estimate_history_size
 
     client_id_filter = request.query_params.get("client_id")
 
@@ -1091,11 +1440,19 @@ async def endpoint_list_sessions(request: Request) -> JSONResponse:
     for cid, data in sessions.items():
         if client_id_filter and cid != client_id_filter:
             continue
+        history = data.get("history", [])
+        size = estimate_history_size(history)
         session_list.append({
             "client_id": cid,
             "shorthand_id": get_or_create_shorthand_id(cid),
             "model": data.get("model", "unknown"),
-            "history_length": len(data.get("history", [])),
+            "history_length": len(history),
+            "history_chars": size["char_count"],
+            "history_token_est": size["token_est"],
+            "tokens_in_total": data.get("tokens_in_total", 0),
+            "tokens_out_total": data.get("tokens_out_total", 0),
+            "tokens_in_last": data.get("tokens_in_last"),
+            "tokens_out_last": data.get("tokens_out_last"),
             "peer_ip": data.get("peer_ip"),
         })
 

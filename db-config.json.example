@@ -1,5 +1,6 @@
 {
   "database": "your_database_name",
+  "managed_table_prefix": "your_instance_prefix_",
   "tables": {
     "memory_shortterm": "your_memory_shortterm_table",
     "memory_longterm": "your_memory_longterm_table",

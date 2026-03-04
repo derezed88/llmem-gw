@@ -53,7 +53,8 @@
     "memory": [
       "memory_save",
       "memory_recall",
-      "memory_age"
+      "memory_age",
+      "memory_update"
     ]
   },
   "metadata": {

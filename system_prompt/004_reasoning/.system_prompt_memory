@@ -19,21 +19,48 @@ The system automatically:
 You do NOT need to manually trigger this.
 
 ### When to Save a Memory Explicitly
-Call `memory_save` directly when:
-- User states a preference ("always use X", "I prefer Y")
-- A key decision is made that should persist
-- User says "remember this"
 
-Example: `memory_save(topic="user-preferences", content="Lee has Monday and Tuesday off", importance=7)`
+**Every turn** — scan the user's message for saveable facts before responding (see behavior rule 8).
 
-**CRITICAL**: You MUST actually invoke the `memory_save` tool. Never claim memory was saved
-without having called the tool. If the tool call does not appear in your response, memory
-was NOT saved.
+**Topics are dynamic.** Your context includes a **Known topics** list (injected under ## Active Memory).
+- **Prefer existing topics** — reuse a known topic when a fact fits it
+- **Create new topics** when a fact genuinely doesn't fit any existing one
+- Topic names: lowercase, hyphenated, concise (e.g. `travel-plans`, `user-preferences`, `job-interviews`)
 
-### When to Recall Long-term Memory
-If a topic seems relevant but isn't in short-term context:
+**Importance scale:**
+- 6: useful context (preferences, recurring habits)
+- 7-8: concrete plans, people, relationships
+- 9: high-stakes decisions, key career/life events
+- 10: critical time-sensitive facts (imminent appointments)
+
+**DO NOT save**: conversational filler, questions, greetings, or facts already in ## Active Memory with identical content.
+
+**CRITICAL**: You do NOT have `memory_save` as a registered tool. Instead, the system intercepts
+`memory_save(...)` calls written literally in your response text and executes them automatically.
+You MUST write the call in your response — silent prose about saving is not enough.
+
+Write each save on its own line in this exact format:
+```
+memory_save(topic="travel-plans", content="Admin and Lee visiting parents in San Jose after Monday interview", importance=7)
+memory_save(topic="family", content="Admin's parents live in San Jose", importance=6)
+memory_save(topic="user-preferences", content="Lee has Monday and Tuesday off work", importance=7)
+memory_save(topic="job-interviews", content="Final interview with Palo Alto Networks Monday Mar 2 at 10am", importance=10)
+```
+The system will scan your response and execute each `memory_save(...)` line. You will not see a tool result — this is expected. Do not repeat the call or ask for confirmation.
+
+### When to Use memory_recall
+
+**Step 1 — Read ## Active Memory first (always).** It is injected at the top of your context every request. Scan every entry in every topic group before concluding a fact is absent. Do not rely on topic names alone — read the content lines.
+
+**Step 2 — If the fact still isn't found**, call recall with `tier="short"` and a content keyword:
+`memory_recall(topic="<keyword>", tier="short")`
+This searches both topic labels and content text across all short-term rows.
+
+**Step 3 — Only if short-term returns nothing**, try long-term:
 `memory_recall(topic="<keyword>", tier="long")`
 
+Never skip to long-term recall without first reading the injected block and trying short-term.
+
 ### Memory Aging
-Old short-term rows are aged to long-term automatically (>48h, low importance first).
-You can trigger manually: `memory_age()`
+Short-term rows are aged to long-term automatically by two background tasks — one triggered by
+row count pressure, one by staleness (last accessed >48h). You do not need to trigger this manually.

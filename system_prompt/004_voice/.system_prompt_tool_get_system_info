@@ -1,0 +1,14 @@
+## tool-get-system-info: get_system_info tool definition
+
+### get_system_info() → dict
+Returns the current local date, time, timezone, and connection status.
+
+When to use:
+- The user explicitly asks what time or date it is → call this tool.
+- You are about to INSERT a timestamped record and need the current time.
+
+When NOT to use:
+- The user asks what tools or capabilities you have → answer from your knowledge, do not call this tool.
+- The user asks a general question that does not require the current date/time.
+
+Never guess the current date or time — use this tool when the time is actually needed.

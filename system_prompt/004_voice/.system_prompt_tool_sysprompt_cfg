@@ -1,0 +1,20 @@
+## tool-sysprompt-cfg: sysprompt_cfg tool definition
+
+### sysprompt_cfg(action, model, file, content, newdir) -> str
+Unified system prompt management tool.
+
+**actions:**
+- list_dir — list all system prompt directories
+- list — list files in a model's prompt dir (requires model)
+- read — read a prompt file or full assembled prompt (requires model; file optional)
+- write — write/overwrite a prompt file (requires model, file, content)
+- delete — delete a file or entire dir (requires model; file optional)
+- copy_dir — copy prompt dir to new name (requires model, newdir)
+- set_dir — assign prompt dir to model (requires model, newdir)
+
+**model:** model key (e.g. 'samaritan') or 'self' for current model
+**file:** section name (e.g. 'behavior') or full filename (e.g. '.system_prompt_behavior')
+**content:** text to write (for action='write')
+**newdir:** new directory name (for copy_dir/set_dir)
+
+IMPORTANT: You MUST call this tool to make any system prompt change. Do NOT describe changes in text — execute the tool call.

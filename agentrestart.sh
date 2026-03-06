@@ -19,6 +19,6 @@ fi
 
 # Restart the process
 echo "Starting $SCRIPT_NAME..."
-nohup python "$SCRIPT_NAME" >> agent-mcp.log 2>&1 &
+nohup venv/bin/python "$SCRIPT_NAME" >> agent-mcp.log 2>&1 &
 
 echo "Process started. PID: $!"

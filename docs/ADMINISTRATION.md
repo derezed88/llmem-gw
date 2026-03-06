@@ -225,11 +225,15 @@ python agentctl.py memory enable <feature>                        # enable one f
 python agentctl.py memory disable <feature>                       # disable one feature
 python agentctl.py memory set fuzzy_dedup_threshold <0-1>        # adjust similarity threshold
 python agentctl.py memory set summarizer_model <model_key>       # change summarizer model
-python agentctl.py memory set auto_memory_age <true|false>       # enable/disable background aging
-python agentctl.py memory set memory_age_entrycount <n>          # max short-term rows
-python agentctl.py memory set memory_age_count_timer <min|-1>    # count-pressure interval (-1=off)
-python agentctl.py memory set memory_age_trigger_minutes <min>   # staleness threshold in minutes
-python agentctl.py memory set memory_age_minutes_timer <min|-1>  # staleness check interval (-1=off)
+python agentctl.py memory set auto_memory_age <true|false>        # enable/disable background aging
+python agentctl.py memory set short_hwm <n>                       # ST row count that triggers aging
+python agentctl.py memory set short_lwm <n>                       # target ST count after aging
+python agentctl.py memory set recent_turns_protect <n>            # last N ST rows' topics protected
+python agentctl.py memory set staleness_override_minutes <min>    # protected topics age past this
+python agentctl.py memory set chunk_importance_threshold <n>      # imp >= this promoted verbatim to LT
+python agentctl.py memory set memory_age_count_timer <min|-1>     # count-pressure interval (-1=off)
+python agentctl.py memory set memory_age_trigger_minutes <min>    # staleness threshold in minutes
+python agentctl.py memory set memory_age_minutes_timer <min|-1>   # staleness check interval (-1=off)
 python agentctl.py memory test                                    # live toggle test: disable, verify off, re-enable, verify on
 ```
 
@@ -250,7 +254,11 @@ All feature flags are live — changes to `plugins-enabled.json` take effect on 
   "fuzzy_dedup_threshold": 0.78,
   "summarizer_model": "summarizer-anthropic",
   "auto_memory_age": true,
-  "memory_age_entrycount": 50,
+  "short_hwm": 100,
+  "short_lwm": 50,
+  "recent_turns_protect": 10,
+  "staleness_override_minutes": 2880,
+  "chunk_importance_threshold": 8,
   "memory_age_count_timer": 60,
   "memory_age_trigger_minutes": 2880,
   "memory_age_minutes_timer": 360
@@ -273,9 +281,13 @@ All feature flags are live — changes to `plugins-enabled.json` take effect on 
 | `fuzzy_dedup_threshold` | `0.78` | No | Similarity ratio (0.0–1.0) above which a new save is treated as a duplicate. Read fresh each call. |
 | `summarizer_model` | `"summarizer-anthropic"` | No | Model key used by `summarize_and_save()` on `!reset`. Must be a valid key in `llm-models.json`. |
 | `auto_memory_age` | `true` | No | Master switch for background aging tasks. When false, both timers are suppressed. |
-| `memory_age_entrycount` | `50` | No | Max short-term rows before count-pressure aging removes the overflow. |
+| `short_hwm` | `100` | No | ST row count that triggers count-pressure aging. Aging loops until ST < `short_lwm`. |
+| `short_lwm` | `50` | No | Target ST count after an aging pass. Gap between HWM and LWM controls how many rows each pass removes. |
+| `recent_turns_protect` | `10` | No | Topics appearing in the last N ST rows are protected from chunking. Increase to preserve more recent context. |
+| `staleness_override_minutes` | `2880` | No | Protected topics are unprotected if ALL their rows are older than this (48h default). Prevents eternally protected monotopics. |
+| `chunk_importance_threshold` | `8` | No | Rows at or above this importance are promoted verbatim to LT in addition to the summary. |
 | `memory_age_count_timer` | `60` | No | How often (minutes) the count-pressure task runs. Set to `-1` to disable. |
-| `memory_age_trigger_minutes` | `2880` | No | Staleness threshold in minutes (2880 = 48h). Rows not accessed in this time are candidates for staleness aging. |
+| `memory_age_trigger_minutes` | `2880` | No | Staleness threshold in minutes (48h). Topics with rows older than this are candidates for staleness aging. |
 | `memory_age_minutes_timer` | `360` | No | How often (minutes) the staleness task runs. Set to `-1` to disable. |
 
 **Choosing a threshold:** SequenceMatcher ratio on real paraphrased duplicates typically
@@ -307,25 +319,41 @@ Facts age from short-term to long-term via two independent background tasks (see
 
 Two async tasks run continuously inside the server process. Both re-read config fresh on each cycle — no restart needed for config changes.
 
+Both tasks use the same topic-chunk summarization algorithm:
+
+1. Identify "protected" topics — those appearing in the last `recent_turns_protect` ST rows by id DESC.
+2. Waive protection if ALL rows for that topic are older than `staleness_override_minutes`.
+3. Order remaining candidate topics by oldest row first.
+4. For each candidate topic: summarize all its ST rows → write 1-5 summary rows **directly to LT** via the haiku summarizer; also promote any rows with importance ≥ `chunk_importance_threshold` verbatim to LT.
+5. Delete all ST rows for that topic + remove from Qdrant.
+6. Repeat until ST count < `short_lwm`.
+
+ST rows are always kept full-detail. **No summarization happens in ST.** Summaries are written directly to LT.
+
 **Count-pressure task** (`memory_age_count_timer`, default: every 60 min)
 
-Triggers when the short-term table exceeds `memory_age_entrycount` rows. Moves exactly the overflow rows — those with the lowest importance and oldest `last_accessed` time — to long-term. Has no age threshold; even recently saved rows can be moved if the table is over the cap.
+Triggers when the short-term table exceeds `short_hwm` rows. Processes oldest unprotected topics one at a time until ST count drops below `short_lwm`.
 
 **Staleness task** (`memory_age_minutes_timer`, default: every 360 min)
 
-Moves all rows whose `last_accessed` is older than `memory_age_trigger_minutes` minutes (default: 2880 min = 48h). Safety ceiling: max 200 rows per pass. Also ordered by importance ASC, last_accessed ASC.
+Processes topics that have at least one row older than `memory_age_trigger_minutes` (48h default) and are not in the protected set. Loops until ST count < `short_lwm` or no more stale candidates.
 
-**`last_accessed` semantics:** Updated automatically whenever `load_context_block()` injects memories into a request. This means memories that are actively recalled stay in short-term longer. MySQL's `ON UPDATE CURRENT_TIMESTAMP` alone is insufficient — the code issues an explicit `UPDATE` after each injection batch.
+**`last_accessed` semantics:** Updated automatically whenever `load_context_block()` injects memories. Memories that are actively recalled stay in short-term longer. Both tiers have `last_accessed` — LT rows have it updated when retrieved by semantic search.
 
-**Disabling a timer:** Set the timer to `-1`. The task loop continues running (no restart needed) but skips the aging pass. The other timer remains active independently.
+**Monotopic escape valve:** If a single topic dominates ST and aging can't make progress, `!memtrim` hard-deletes rows (no summarization) to force count below LWM.
+
+**Disabling a timer:** Set the timer to `-1`. The task loop continues running but skips the aging pass. The other timer remains active independently.
 
 #### Runtime memory commands
 
 ```
-!memstats                                 show memory system health: DB counts, vector index, feature flag states
-!memory                                   list all short-term memories
-!memory list [short|long]                 list by tier
-!memory show <id> [short|long]            show one row in full
+!memstats                                              show memory system health: DB counts, vector index, feature flag states
+!memage                                                manually trigger one count + staleness aging pass
+!memtrim [N]                                           escape valve: hard-delete N oldest ST rows (no summarization); no arg = trim to LWM
+!membackfill                                           embed any MySQL rows missing from Qdrant (gap-only, idempotent)
+!memory                                                list all short-term memories
+!memory list [short|long]                              list by tier
+!memory show <id> [short|long]                         show one row in full
 !memory update <id> [tier=short] [importance=N] [content=text] [topic=label]
 ```
 

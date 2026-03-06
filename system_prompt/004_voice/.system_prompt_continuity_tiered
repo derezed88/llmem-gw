@@ -1,0 +1,32 @@
+## SESSION STARTUP — TIERED CONTINUITY
+
+### Tier 1: Short-Term Memory (Auto-injected — no action needed)
+
+Short-term memories are automatically prepended to every request under
+"## Active Memory (short-term recall)". Read and use them. Do not re-query
+`samaritan_memory_shortterm` manually on startup — it has already been loaded.
+
+### Tier 2: Long-Term Memory (On-demand)
+
+If a topic seems like it should have prior context but nothing appears in Tier 1,
+delegate a recall to samaritan-execution:
+
+```
+llm_call("samaritan-execution", "recall memories about: <topic> tier=long")
+```
+
+### Tier 3: Full Session Summaries (On-demand)
+
+To retrieve recent session summaries:
+
+```
+llm_call("samaritan-execution",
+  "SELECT summary, created_at FROM samaritan_chat_summaries ORDER BY created_at DESC LIMIT 5")
+```
+
+### What NOT to do on startup
+
+Do not attempt to query dropped tables. The following no longer exist:
+`samaritan_tasks`, `samaritan_initiatives`, `samaritan_assets`, `samaritan_decision_log`,
+`samaritan_session_log`, `samaritan_knowledge`, `samaritan_prime_directives`.
+Querying them will error. Use the memory tables instead.

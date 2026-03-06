@@ -1,0 +1,9 @@
+## tool-search-tavily: search_tavily tool definition
+
+### search_tavily(query: str, search_depth: str = "basic") → str
+Search the web using Tavily AI search API. Returns an AI-generated answer summary plus source URLs.
+
+Parameters:
+  search_depth: "basic" (faster) or "advanced" (deeper, more thorough)
+
+Requires TAVILY_API_KEY.

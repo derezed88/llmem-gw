@@ -15,7 +15,7 @@ from langchain_core.messages import (
 #from .prompt import get_current_prompt
 import time
 
-from config import log, MAX_TOOL_ITERATIONS, LLM_REGISTRY, RATE_LIMITS, LIVE_LIMITS, LLM_TOOLSETS, save_llm_model_field
+from config import log, MAX_TOOL_ITERATIONS, LLM_REGISTRY, RATE_LIMITS, LIVE_LIMITS, LLM_TOOLSETS, LLM_TOOLSET_META, save_llm_model_field
 from state import push_tok, push_done, push_flush, push_err, current_client_id, sessions, wait_for_gate, resolve_gate, has_pending_gate, update_session_token_stats
 from prompt import get_current_prompt, load_prompt_for_folder
 from database import execute_sql
@@ -113,7 +113,7 @@ def _check_outbound_agent_message(message: str) -> str | None:
 # LangChain LLM Factory
 # ---------------------------------------------------------------------------
 
-def _build_lc_llm(model_key: str):
+def _build_lc_llm(model_key: str, use_cache: bool = False):
     """
     Build a LangChain chat model from LLM_REGISTRY config.
 
@@ -121,9 +121,16 @@ def _build_lc_llm(model_key: str):
     to the constructor.  When "default", no sampling parameters are passed so
     the API backend uses its own defaults.
 
+    use_cache=True (stream_level >= 1): return cached client if available,
+    otherwise build and store. ChatOpenAI/ChatGoogleGenerativeAI are stateless
+    so sharing across sessions/requests is safe.
+
     Returns a ChatOpenAI or ChatGoogleGenerativeAI instance.
     Both expose the same .ainvoke() / .astream() interface.
     """
+    if use_cache and model_key in _llm_client_cache:
+        return _llm_client_cache[model_key]
+
     cfg = LLM_REGISTRY[model_key]
     use_custom = cfg.get("token_selection_setting", "default") == "custom"
 
@@ -147,7 +154,10 @@ def _build_lc_llm(model_key: str):
         max_tokens = cfg.get("max_tokens")
         if max_tokens is not None:
             kwargs["max_tokens"] = int(max_tokens)
-        return ChatOpenAI(**kwargs)
+        client = ChatOpenAI(**kwargs)
+        if use_cache:
+            _llm_client_cache[model_key] = client
+        return client
 
     if cfg["type"] == "GEMINI":
         kwargs = dict(
@@ -164,7 +174,10 @@ def _build_lc_llm(model_key: str):
         max_tokens = cfg.get("max_tokens")
         if max_tokens is not None:
             kwargs["max_output_tokens"] = int(max_tokens)
-        return ChatGoogleGenerativeAI(**kwargs)
+        client = ChatGoogleGenerativeAI(**kwargs)
+        if use_cache:
+            _llm_client_cache[model_key] = client
+        return client
 
     raise ValueError(f"Unsupported model type '{cfg['type']}' for model '{model_key}'")
 
@@ -252,7 +265,94 @@ def update_tool_definitions():
     _CURRENT_OPENAI_TOOLS = get_all_openai_tools()
 
 
-def _resolve_model_tools(model_key: str) -> list:
+def _get_heat_value(heat_curve: list | None, call_count: int) -> int:
+    """Return the heat value for a given call count from a heat_curve list.
+    Index = call_count - 1 (0-based). Last entry is the cap."""
+    if not heat_curve:
+        return 3  # default heat if no curve defined
+    idx = min(call_count - 1, len(heat_curve) - 1)
+    return heat_curve[max(0, idx)]
+
+
+def _subscribe_toolset(session: dict, ts_name: str, call_count: int | None = None) -> None:
+    """Subscribe a toolset in the session, setting heat from its heat_curve.
+    call_count=None means first call (call_count=1).
+    Updates call_count if already subscribed."""
+    subs = session.setdefault("tool_subscriptions", {})
+    meta = LLM_TOOLSET_META.get(ts_name, {})
+    heat_curve = meta.get("heat_curve")
+    existing = subs.get(ts_name)
+    if existing is None:
+        new_count = call_count if call_count is not None else 1
+        subs[ts_name] = {
+            "heat": _get_heat_value(heat_curve, new_count),
+            "call_count": new_count,
+        }
+    else:
+        new_count = (existing["call_count"] + 1) if call_count is None else call_count
+        subs[ts_name] = {
+            "heat": _get_heat_value(heat_curve, new_count),
+            "call_count": new_count,
+        }
+
+
+def _compute_active_tools(model_key: str, client_id: str) -> set[str]:
+    """
+    Compute the set of individual tool names that should be active for this invocation.
+
+    Active tools = always_active toolsets + toolsets with heat > 0 in session subscriptions.
+    Only considers toolsets the model is authorized to use (in its llm_tools config).
+    """
+    cfg = LLM_REGISTRY.get(model_key, {})
+    authorized_toolsets = cfg.get("llm_tools", [])
+    session = sessions.get(client_id, {})
+    subs = session.get("tool_subscriptions", {})
+
+    active_tool_names: set[str] = set()
+    for ts_name in authorized_toolsets:
+        if ts_name not in LLM_TOOLSETS:
+            # Literal tool name — treat as always active
+            active_tool_names.add(ts_name)
+            continue
+        meta = LLM_TOOLSET_META.get(ts_name, {})
+        if meta.get("always_active", True):
+            active_tool_names.update(LLM_TOOLSETS[ts_name])
+        else:
+            sub = subs.get(ts_name)
+            if sub and sub.get("heat", 0) > 0:
+                active_tool_names.update(LLM_TOOLSETS[ts_name])
+    return active_tool_names
+
+
+def _get_cold_tool_names(model_key: str, client_id: str) -> list[str]:
+    """Return names of individual tools that are authorized but currently cold."""
+    cfg = LLM_REGISTRY.get(model_key, {})
+    authorized_toolsets = cfg.get("llm_tools", [])
+    session = sessions.get(client_id, {})
+    subs = session.get("tool_subscriptions", {})
+
+    cold: list[str] = []
+    for ts_name in authorized_toolsets:
+        if ts_name not in LLM_TOOLSETS:
+            continue
+        meta = LLM_TOOLSET_META.get(ts_name, {})
+        if meta.get("always_active", True):
+            continue
+        sub = subs.get(ts_name)
+        if not sub or sub.get("heat", 0) <= 0:
+            cold.extend(LLM_TOOLSETS[ts_name])
+    return cold
+
+
+def _toolset_for_tool(tool_name: str) -> str | None:
+    """Return the toolset name that contains the given tool, or None."""
+    for ts_name, tools in LLM_TOOLSETS.items():
+        if tool_name in tools:
+            return ts_name
+    return None
+
+
+def _resolve_model_tools(model_key: str, active_tools: set[str] | None = None) -> list:
     """
     Resolve a model's llm_tools list into StructuredTool objects.
 
@@ -260,7 +360,8 @@ def _resolve_model_tools(model_key: str) -> list:
       - A group name (key in LLM_TOOLSETS, e.g. "core", "admin") → expanded to all tools in that group
       - A literal tool name (e.g. "sysprompt_cfg") → included directly
 
-    Deduplicates, then filters _CURRENT_LC_TOOLS to only matching tools.
+    If active_tools is provided, only tools in that set are returned (hot/cold filtering).
+    If active_tools is None, all authorized tools are returned (legacy behaviour for llm_call).
     Returns [] if the model has no llm_tools configured (no tools bound).
     """
     cfg = LLM_REGISTRY.get(model_key, {})
@@ -269,16 +370,17 @@ def _resolve_model_tools(model_key: str) -> list:
         return []
 
     # Expand toolset names to individual tool names.
-    # Each entry is either a group name (key in LLM_TOOLSETS) or a literal tool name.
     allowed_names: set[str] = set()
     for ts_name in toolset_names:
         if ts_name in LLM_TOOLSETS:
             allowed_names.update(LLM_TOOLSETS[ts_name])
         else:
-            # Treat as a literal tool name; warn if it doesn't exist at bind time
             allowed_names.add(ts_name)
 
-    # Filter the global tool list to only allowed tools
+    # Apply hot/cold filter if active_tools provided
+    if active_tools is not None:
+        allowed_names &= active_tools
+
     return [t for t in _CURRENT_LC_TOOLS if t.name in allowed_names]
 
 
@@ -286,6 +388,14 @@ def _resolve_model_tools(model_key: str) -> list:
 
 # Sliding-window call timestamps: key = "client_id:tool_type" -> [timestamps]
 _rate_timestamps: dict[str, list[float]] = {}
+
+# LLM client cache (Level 1 stream optimization): model_key -> ChatOpenAI | ChatGoogleGenerativeAI
+# ChatOpenAI/ChatGoogleGenerativeAI are stateless — safe to share across sessions.
+_llm_client_cache: dict[str, object] = {}
+
+# Sentence boundary regex for Level 3 astream() chunking.
+# Splits after sentence-ending punctuation followed by whitespace.
+_SENT_RE = re.compile(r'(?<=[.!?])\s+')
 
 
 async def check_rate_limit(client_id: str, tool_name: str, tool_type: str) -> tuple[bool, str]:
@@ -654,7 +764,7 @@ def try_force_tool_calls(text: str, valid_tool_names: set[str] | None = None) ->
 _MEMORY_SAVE_RE = re.compile(
     r'memory_save\s*\(\s*'
     r'topic\s*=\s*(?P<tq>["\'])(?P<topic>(?:(?!(?P=tq)).)+)(?P=tq)'
-    r'\s*,\s*content\s*=\s*(?P<cq>["\'])(?P<content>(?:(?!(?P=cq)).)+)(?P=cq)'
+    r'\s*,\s*content\s*=\s*(?P<cq>["\'])(?P<content>(?:(?!(?P=cq)).|(?P=cq)(?=\w))+)(?P=cq)'
     r'(?:\s*,\s*importance\s*=\s*(?P<importance>\d+))?'
     r'(?:\s*,\s*source\s*=\s*(?P<sq>["\'])(?P<source>(?:(?!(?P=sq)).)+)(?P=sq))?'
     r'[^)]*\)',
@@ -713,7 +823,10 @@ async def _scan_and_save_memories(text: str, client_id: str, model_key: str) -> 
         topic = m.group("topic").strip()
         content = m.group("content").strip()
         importance = int(m.group("importance")) if m.group("importance") else 5
-        source = m.group("source") or "session"
+        # memory_scan runs on assistant response text — default source is "assistant".
+        # Only override if the model explicitly wrote source="user" or source="session".
+        raw_source = m.group("source")
+        source = raw_source if raw_source in ("user", "session") else "assistant"
         if not topic or not content:
             continue
         try:
@@ -741,7 +854,8 @@ async def _scan_and_save_memories(text: str, client_id: str, model_key: str) -> 
             topic = str(args.get("topic", "")).strip()
             content = str(args.get("content", "")).strip()
             importance = int(args.get("importance", 5))
-            source = str(args.get("source", "session"))
+            raw_source = str(args.get("source", ""))
+            source = raw_source if raw_source in ("user", "session") else "assistant"
             if not topic or not content:
                 continue
             try:
@@ -767,7 +881,8 @@ async def _scan_and_save_memories(text: str, client_id: str, model_key: str) -> 
             topic = params.get("topic", "").strip()
             content = params.get("content", "").strip()
             importance = int(params.get("importance", 5))
-            source = params.get("source", "session")
+            raw_source = params.get("source", "")
+            source = raw_source if raw_source in ("user", "session") else "assistant"
             if not topic or not content:
                 continue
             try:
@@ -848,7 +963,8 @@ async def auto_enrich_context(messages: list[dict], client_id: str) -> list[dict
             if re.search(pattern, text, re.IGNORECASE):
                 result = await execute_sql(sql)
                 enrichments.append(f"[auto-retrieved via: {label}]\n{result}")
-                await push_tok(client_id, f"\n[context] Auto-queried: {label}\n")
+                if not sessions.get(client_id, {}).get("tool_suppress", False):
+                    await push_tok(client_id, f"\n[context] Auto-queried: {label}\n")
         except Exception:
             pass
 
@@ -857,13 +973,19 @@ async def auto_enrich_context(messages: list[dict], client_id: str) -> list[dict
     if _memory_feature("context_injection"):
         try:
             from memory import load_context_block
-            # Use last 3 messages (last user + up to 2 prior turns) as semantic query
-            recent = messages[-6:] if len(messages) >= 6 else messages
-            query_text = " ".join(
-                m.get("content", "")[:300]
-                for m in recent
-                if m.get("role") in ("user", "assistant") and m.get("content")
-            ).strip()
+            # Prefer model-derived current_topic as query seed (set from <<topic>> tag each turn).
+            # Fall back to concatenation of last 3 turns if no topic tracked yet.
+            _session_ctx = sessions.get(client_id, {})
+            current_topic = _session_ctx.get("current_topic", "")
+            if current_topic:
+                query_text = current_topic
+            else:
+                recent = messages[-6:] if len(messages) >= 6 else messages
+                query_text = " ".join(
+                    m.get("content", "")[:300]
+                    for m in recent
+                    if m.get("role") in ("user", "assistant") and m.get("content")
+                ).strip()
             mem_block = await load_context_block(min_importance=3, query=query_text)
             if mem_block:
                 enrichments.append(mem_block)
@@ -889,21 +1011,30 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
     this is purely an LLM abstraction swap.
     """
     try:
-        llm = _build_lc_llm(model_key)
+        _stream_level = sessions.get(client_id, {}).get("stream_level", 0)
+        llm = _build_lc_llm(model_key, use_cache=(_stream_level >= 1))
 
-        # Bind per-model tools so only the model's configured toolsets are sent.
+        # Compute active tools (always_active + hot subscriptions) for this invocation.
+        # This set drives both the API schema and the system prompt tool sections.
+        _active_tools = _compute_active_tools(model_key, client_id)
+        _cold_tools = _get_cold_tool_names(model_key, client_id)
+
+        # Bind per-model tools so only active tools are sent.
         # This keeps tool count under provider limits (e.g. Gemini 2.5 Flash ~35).
-        _model_tools = _resolve_model_tools(model_key)
+        _model_tools = _resolve_model_tools(model_key, active_tools=_active_tools)
         llm_with_tools = llm.bind_tools(_model_tools) if _model_tools else llm
-        log.info(f"agentic_lc: model={model_key} bound {len(_model_tools)} tools")
+        log.info(
+            f"agentic_lc: model={model_key} stream_level={_stream_level} "
+            f"bound {len(_model_tools)} tools ({len(_cold_tools)} cold)"
+        )
 
-        # Load per-model system prompt (stateless; falls back to global if not configured)
+        # Load per-model system prompt with active tool filter
         model_cfg = LLM_REGISTRY.get(model_key, {})
         sp_folder_rel = model_cfg.get("system_prompt_folder", "")
         if sp_folder_rel and sp_folder_rel.lower() != "none":
             from config import BASE_DIR
             sp_folder_abs = os.path.join(BASE_DIR, sp_folder_rel)
-            system_prompt = load_prompt_for_folder(sp_folder_abs)
+            system_prompt = load_prompt_for_folder(sp_folder_abs, active_tools=_active_tools, cold_tools=_cold_tools or None)
         else:
             system_prompt = get_current_prompt()
 
@@ -927,7 +1058,12 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
             bool(LLM_REGISTRY.get(model_key, {}).get("memory_scan", False))
             and _memory_feature("post_response_scan")
         )
-        _memory_scan_suppress = sessions.get(client_id, {}).get("memory_scan_suppress", False)
+        # Strip memory_save() text when scan is disabled (model shouldn't write them)
+        # OR when session-level suppress is set (cosmetic suppress for scan-enabled models).
+        _memory_scan_suppress = (
+            not _memory_scan
+            or sessions.get(client_id, {}).get("memory_scan_suppress", False)
+        )
         # Tool-call loop detection: track the last N consecutive tool-call fingerprints.
         # If the same set of tool+args repeats >= _TOOL_LOOP_THRESHOLD times in a row,
         # the model is stuck in a deterministic loop (Qwen3, Hermes, etc.).
@@ -939,10 +1075,52 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
             if not _suppress:
                 await push_tok(client_id, "\n[thinking…]\n")
             try:
-                ai_msg: AIMessage = await asyncio.wait_for(
-                    llm_with_tools.ainvoke(ctx),
-                    timeout=invoke_timeout,
-                )
+                if _stream_level >= 3:
+                    # Level 3: accumulate astream() chunks, then sentence-push if no tool calls.
+                    # Strategy: buffer all chunks (needed to detect tool_calls before pushing text),
+                    # then sentence-split and push text chunks if the response is a final answer.
+                    # Tool-call turns fall through to the existing tool-execution path unchanged.
+                    _chunks = []
+                    _text_parts: list[str] = []
+                    try:
+                        async with asyncio.timeout(invoke_timeout):
+                            async for _chunk in llm_with_tools.astream(ctx):
+                                _chunks.append(_chunk)
+                                if _chunk.content:
+                                    _text_parts.append(_chunk.content)
+                    except asyncio.TimeoutError:
+                        await push_tok(client_id, f"\n[LLM timeout after {invoke_timeout}s — aborting turn]\n")
+                        await push_done(client_id)
+                        return ""
+                    if not _chunks:
+                        ai_msg = AIMessage(content="")
+                    else:
+                        # Aggregate chunks: LangChain AIMessageChunk supports + operator
+                        ai_msg = _chunks[0]
+                        for _c in _chunks[1:]:
+                            ai_msg = ai_msg + _c
+                    # Sentence-push only on final-answer turns (no tool calls)
+                    _astream_text_pushed = False
+                    if not ai_msg.tool_calls and _text_parts:
+                        _full_text = "".join(_text_parts)
+                        # Strip memory calls on full text BEFORE sentence-splitting:
+                        # splitting first can break a memory_save(...) call mid-content
+                        # when the content string contains periods, causing partial
+                        # fragments that no longer match the regex.
+                        if _memory_scan_suppress:
+                            _full_text = _strip_memory_calls(_full_text)
+                        _sentences = _SENT_RE.split(_full_text)
+                        for _s in _sentences:
+                            _s = _s.strip()
+                            if _s:
+                                await push_tok(client_id, _s + " ")
+                        _astream_text_pushed = True
+                else:
+                    ai_msg: AIMessage = await asyncio.wait_for(
+                        llm_with_tools.ainvoke(ctx),
+                        timeout=invoke_timeout,
+                    )
+                    _astream_text_pushed = False
             except asyncio.TimeoutError:
                 await push_tok(client_id, f"\n[LLM timeout after {invoke_timeout}s — aborting turn]\n")
                 await push_done(client_id)
@@ -970,7 +1148,9 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
                 # No tool calls — final answer
                 final = _content_to_str(ai_msg.content)
                 if final:
-                    await push_tok(client_id, _strip_memory_calls(final) if _memory_scan_suppress else final)
+                    # Level 3: text was already sentence-pushed via astream; skip re-push
+                    if not _astream_text_pushed:
+                        await push_tok(client_id, _strip_memory_calls(final) if _memory_scan_suppress else final)
                 else:
                     # Gemini 2.5 Flash returns empty content + no tool calls when
                     # too many tools are bound (>~35). On first turn only, retry
@@ -1066,6 +1246,62 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
                     await push_done(client_id)
                     return final
 
+            # --- Auto-subscribe: check if any tool calls target cold toolsets ---
+            # If a cold tool is called (e.g. from conversation history context),
+            # subscribe its toolset and re-invoke with the updated schema + prompt.
+            _cold_toolsets_hit: list[str] = []
+            for _tc in ai_msg.tool_calls:
+                _ts = _toolset_for_tool(_tc["name"])
+                if _ts and _ts in (sessions.get(client_id, {}).get("tool_subscriptions", {})):
+                    pass  # already subscribed
+                elif _ts:
+                    _ts_meta = LLM_TOOLSET_META.get(_ts, {})
+                    if not _ts_meta.get("always_active", True):
+                        _cold_toolsets_hit.append(_ts)
+
+            if _cold_toolsets_hit:
+                _session = sessions.get(client_id, {})
+                for _ts in _cold_toolsets_hit:
+                    _subscribe_toolset(_session, _ts, call_count=1)
+                    log.info(f"agentic_lc: auto-subscribed cold toolset={_ts} for client={client_id}")
+                if not _suppress:
+                    await push_tok(client_id, f"\n[activating tools: {', '.join(_cold_toolsets_hit)}…]\n")
+                # Recompute active tools and rebuild llm_with_tools + system_prompt
+                _active_tools = _compute_active_tools(model_key, client_id)
+                _cold_tools = _get_cold_tool_names(model_key, client_id)
+                _model_tools = _resolve_model_tools(model_key, active_tools=_active_tools)
+                llm_with_tools = llm.bind_tools(_model_tools) if _model_tools else llm
+                # Remove the ai_msg that referenced cold tools and re-invoke
+                ctx.pop()
+                try:
+                    if _stream_level >= 3:
+                        _chunks = []
+                        async with asyncio.timeout(invoke_timeout):
+                            async for _chunk in llm_with_tools.astream(ctx):
+                                _chunks.append(_chunk)
+                        ai_msg = _chunks[0] if _chunks else AIMessage(content="")
+                        for _c in _chunks[1:]:
+                            ai_msg = ai_msg + _c
+                    else:
+                        ai_msg = await asyncio.wait_for(
+                            llm_with_tools.ainvoke(ctx),
+                            timeout=invoke_timeout,
+                        )
+                except asyncio.TimeoutError:
+                    await push_tok(client_id, f"\n[LLM timeout after {invoke_timeout}s — aborting turn]\n")
+                    await push_done(client_id)
+                    return ""
+                update_session_token_stats(sessions.get(client_id, {}), getattr(ai_msg, "usage_metadata", None) or {})
+                ctx.append(ai_msg)
+                if not ai_msg.tool_calls:
+                    final = _content_to_str(ai_msg.content)
+                    if final:
+                        await push_tok(client_id, final)
+                    if _memory_scan and final:
+                        await _scan_and_save_memories(final, client_id, model_key)
+                    await push_done(client_id)
+                    return final
+
             # Execute all tool calls in this turn
             # --- Loop detection ---
             _tc_fp = "|".join(
@@ -1114,6 +1350,7 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
                 return final
             # ---------------------
             has_non_agent_call_output = False
+            _tools_used_this_turn: set[str] = set()
             for tc in ai_msg.tool_calls:
                 is_streaming_agent_call = (
                     tc["name"] == "agent_call"
@@ -1123,14 +1360,31 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
                     has_non_agent_call_output = True
                 result = await execute_tool(client_id, tc["name"], tc["args"])
                 ctx.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+                _tools_used_this_turn.add(tc["name"])
                 # Flush immediately after each streaming agent_call so Slack posts
                 # per-turn progress as it arrives rather than batching all turns.
-                # Without this, when the LLM issues N agent_calls in one batch
-                # (some models batch all turns), a single push_done at the end causes
-                # the Slack consumer to post the entire N-turn conversation as one
-                # block — the batch behaviour observed in Test 6 (5-turn).
                 if is_streaming_agent_call:
                     await push_done(client_id)
+
+            # Heat management: increment heat for used toolsets, decay unused ones
+            _session = sessions.get(client_id, {})
+            _subs = _session.get("tool_subscriptions", {})
+            _used_toolsets: set[str] = set()
+            for _tname in _tools_used_this_turn:
+                _ts = _toolset_for_tool(_tname)
+                if _ts:
+                    _used_toolsets.add(_ts)
+            for _ts in list(_subs.keys()):
+                _ts_meta = LLM_TOOLSET_META.get(_ts, {})
+                if _ts_meta.get("always_active", True):
+                    continue
+                if _ts in _used_toolsets:
+                    _subscribe_toolset(_session, _ts)  # increments call_count → new heat
+                else:
+                    _subs[_ts]["heat"] = max(0, _subs[_ts].get("heat", 0) - 1)
+                    if _subs[_ts]["heat"] == 0:
+                        log.debug(f"agentic_lc: toolset={_ts} decayed to cold for client={client_id}")
+
             # Signal end of this tool-call round trip for non-agent_call tools.
             # push_flush (not push_done) keeps api_client connected across tool
             # round trips while still letting shell.py display intermediate results.
@@ -1348,12 +1602,14 @@ async def llm_call(
 
                 result = await asyncio.wait_for(_run_tool(), timeout=timeout)
 
-                preview_len = sessions.get(client_id, {}).get("tool_preview_length", 500)
-                preview = (
-                    result if (preview_len == 0 or len(result) <= preview_len)
-                    else result[:preview_len] + "\n…(truncated)"
-                )
-                await push_tok(client_id, f"[llm_call ◀] {model}/{tool}:\n{preview}\n")
+                _sess = sessions.get(client_id, {})
+                if not _sess.get("tool_suppress", False):
+                    preview_len = _sess.get("tool_preview_length", 500)
+                    preview = (
+                        result if (preview_len == 0 or len(result) <= preview_len)
+                        else result[:preview_len] + "\n…(truncated)"
+                    )
+                    await push_tok(client_id, f"[llm_call ◀] {model}/{tool}:\n{preview}\n")
                 return result
 
             except asyncio.TimeoutError:
@@ -1461,7 +1717,8 @@ async def agent_call(
     api_key = os.getenv("API_KEY", "") or None
     timeout = 120
 
-    await push_tok(calling_client, f"\n[agent_call ▶] {agent_url} → {swarm_client_id}: {message[:100]}{'…' if len(message) > 100 else ''}\n")
+    if not calling_session.get("tool_suppress", False):
+        await push_tok(calling_client, f"\n[agent_call ▶] {agent_url} → {swarm_client_id}: {message[:100]}{'…' if len(message) > 100 else ''}\n")
 
     calling_session["_agent_call_depth"] = agent_call_depth + 1
     try:
@@ -1521,5 +1778,39 @@ async def dispatch_llm(model_key: str, messages: list[dict], client_id: str) -> 
         await push_err(client_id, f"Unknown model: '{model_key}'")
         return ""
 
-    messages = await auto_enrich_context(messages, client_id)
+    # Session-start tool_list auto-inject: on the first turn of a session, inject a
+    # synthetic assistant message containing the tool_list result so the model starts
+    # with full situational awareness of its capability space.
+    _session = sessions.get(client_id, {})
+    if not _session.get("tool_list_injected", False):
+        _session["tool_list_injected"] = True
+        try:
+            from tools import _tool_list_exec
+            from state import current_client_id as _cid_ctx
+            _tok = _cid_ctx.set(client_id)
+            _tl_result = await _tool_list_exec(action="list")
+            _cid_ctx.reset(_tok)
+            inject_msg = {
+                "role": "assistant",
+                "content": f"[Session start — authorized tools]\n{_tl_result}",
+            }
+            messages = [inject_msg] + list(messages)
+            log.info(f"dispatch_llm: injected tool_list for client={client_id}")
+        except Exception as _tl_err:
+            log.warning(f"dispatch_llm: tool_list inject failed: {_tl_err}")
+
+    _stream_level = sessions.get(client_id, {}).get("stream_level", 0)
+    if _stream_level >= 2:
+        # Level 2: fire enrichment concurrently with LLM invocation setup.
+        # Race against 300ms timeout — inject if ready, defer to next turn if slow.
+        # asyncio.shield() prevents the enrich task from being cancelled when the
+        # timeout fires; it completes in the background and is GC'd naturally.
+        enrich_task = asyncio.create_task(auto_enrich_context(messages, client_id))
+        try:
+            messages = await asyncio.wait_for(asyncio.shield(enrich_task), timeout=0.3)
+        except asyncio.TimeoutError:
+            log.debug("dispatch_llm: enrich timeout (>300ms), proceeding without this turn's enrichment")
+    else:
+        messages = await auto_enrich_context(messages, client_id)
+
     return await agentic_lc(model_key, messages, client_id)

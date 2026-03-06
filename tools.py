@@ -168,6 +168,7 @@ def get_core_tools():
     return {
         'lc': CORE_LC_TOOLS,
         'executors': {
+            'tool_list':             _tool_list_exec,
             'get_system_info':       get_system_info,
             'llm_call':              _agents.llm_call,
             'llm_list':              _agents.llm_list,
@@ -538,7 +539,7 @@ class _MemorySaveArgs(BaseModel):
     topic: str = Field(description="Short topic label, e.g. 'user-preferences', 'project-status', 'tasks'.")
     content: str = Field(description="One concise sentence describing the fact to remember.")
     importance: int = Field(default=5, description="Importance 1 (low) to 10 (critical). Default 5.")
-    source: str = Field(default="user", description="Source: 'user', 'session', or 'directive'.")
+    source: str = Field(default="assistant", description="Source: 'assistant' (your own conclusions/recommendations), 'user' (facts the user stated), 'session', or 'directive'. Default is 'assistant'.")
 
 class _MemoryRecallArgs(BaseModel):
     topic: str = Field(default="", description="Keyword to search — matches topic label OR content text. Use words from the 'Known topics' list in Active Memory when possible.")
@@ -557,7 +558,7 @@ class _MemoryAgeArgs(BaseModel):
     max_rows: int = Field(default=100, description="Max rows to age per call.")
 
 
-async def _memory_save_exec(topic: str, content: str, importance: int = 5, source: str = "user") -> str:
+async def _memory_save_exec(topic: str, content: str, importance: int = 5, source: str = "assistant") -> str:
     from memory import save_memory
     from state import current_client_id
     session_id = current_client_id.get("") or ""
@@ -631,7 +632,7 @@ class _LlmToolsArgs(BaseModel):
 
 
 async def _llm_tools_exec(action: str, name: str = "", tools: str = "") -> str:
-    from config import LLM_TOOLSETS, LLM_REGISTRY, save_llm_toolset, delete_llm_toolset
+    from config import LLM_TOOLSETS, LLM_TOOLSET_META, LLM_REGISTRY, save_llm_toolset, delete_llm_toolset
 
     if action == "list":
         if not LLM_TOOLSETS:
@@ -639,7 +640,9 @@ async def _llm_tools_exec(action: str, name: str = "", tools: str = "") -> str:
         lines = ["Toolsets (llm-tools.json):"]
         for ts_name in sorted(LLM_TOOLSETS.keys()):
             tool_list = LLM_TOOLSETS[ts_name]
-            lines.append(f"  {ts_name}: {', '.join(tool_list)} ({len(tool_list)} tools)")
+            meta = LLM_TOOLSET_META.get(ts_name, {})
+            always = "always" if meta.get("always_active", True) else "hot/cold"
+            lines.append(f"  {ts_name} [{always}]: {', '.join(tool_list)} ({len(tool_list)} tools)")
         # Also show per-model assignments
         lines.append("\nModel → toolsets:")
         for model_name in sorted(LLM_REGISTRY.keys()):
@@ -653,7 +656,9 @@ async def _llm_tools_exec(action: str, name: str = "", tools: str = "") -> str:
         ts = LLM_TOOLSETS.get(name)
         if ts is None:
             return f"ERROR: Toolset '{name}' not found. Use llm_tools(action='list') to see available toolsets."
-        return f"Toolset '{name}': {', '.join(ts)} ({len(ts)} tools)"
+        meta = LLM_TOOLSET_META.get(name, {})
+        always = "always_active" if meta.get("always_active", True) else f"hot/cold heat_curve={meta.get('heat_curve')}"
+        return f"Toolset '{name}' [{always}]: {', '.join(ts)} ({len(ts)} tools)"
 
     if action == "write":
         if not name:
@@ -672,6 +677,7 @@ async def _llm_tools_exec(action: str, name: str = "", tools: str = "") -> str:
         ok, msg = delete_llm_toolset(name)
         if ok:
             LLM_TOOLSETS.pop(name, None)
+            LLM_TOOLSET_META.pop(name, None)
         return msg
 
     if action == "add":
@@ -1099,10 +1105,83 @@ async def _limits_cfg_exec(action: str, key: str = "", value: str = "") -> str:
     return f"Unknown action '{action}'. Valid: list, read, write"
 
 
+# ---------------------------------------------------------------------------
+# tool_list — always-active capability discovery tool
+# ---------------------------------------------------------------------------
+
+class _ToolListArgs(BaseModel):
+    action: str = Field(
+        default="list",
+        description="'list' — show all authorized tools with hot/cold status. 'describe' — full description for one tool.",
+    )
+    tool: str = Field(default="", description="Tool name for action='describe'.")
+
+
+async def _tool_list_exec(action: str = "list", tool: str = "") -> str:
+    """Discover authorized tools and their hot/cold status for the current session."""
+    from config import LLM_TOOLSETS, LLM_TOOLSET_META, LLM_REGISTRY
+    from agents import _compute_active_tools, _get_cold_tool_names, _CURRENT_LC_TOOLS
+    from state import sessions, current_client_id
+
+    client_id = current_client_id.get(None)
+    session = sessions.get(client_id, {}) if client_id else {}
+    model_key = session.get("model", "")
+
+    if action == "list":
+        cfg = LLM_REGISTRY.get(model_key, {})
+        authorized_toolsets = cfg.get("llm_tools", [])
+        if not authorized_toolsets:
+            return "No tools authorized for this model."
+
+        active = _compute_active_tools(model_key, client_id) if client_id else set()
+        subs = session.get("tool_subscriptions", {})
+
+        lines = ["Authorized tools (hot = active in current schema, cold = available on demand):"]
+        for ts_name in authorized_toolsets:
+            meta = LLM_TOOLSET_META.get(ts_name, {})
+            tools_in_set = LLM_TOOLSETS.get(ts_name, [ts_name])
+            if meta.get("always_active", True):
+                status = "always"
+            else:
+                sub = subs.get(ts_name, {})
+                heat = sub.get("heat", 0)
+                status = f"hot(heat={heat})" if heat > 0 else "cold"
+            for t in tools_in_set:
+                lines.append(f"  {t}: [{status}]")
+        lines.append("\nCall tool_list(action='describe', tool='<name>') for full usage details on any tool.")
+        return "\n".join(lines)
+
+    if action == "describe":
+        if not tool:
+            return "ERROR: 'tool' required for action='describe'."
+        for lc_tool in _CURRENT_LC_TOOLS:
+            if lc_tool.name == tool:
+                schema = lc_tool.args_schema.schema() if lc_tool.args_schema else {}
+                params = schema.get("properties", {})
+                param_lines = [f"  {k}: {v.get('description', '')}" for k, v in params.items()]
+                param_str = "\n".join(param_lines) if param_lines else "  (no parameters)"
+                return f"Tool: {tool}\n{lc_tool.description}\n\nParameters:\n{param_str}"
+        return f"Tool '{tool}' not found or not loaded."
+
+    return "Unknown action. Valid: list, describe"
+
+
 def _make_core_lc_tools() -> list:
     """Build CORE_LC_TOOLS after agents module is available (avoids circular import)."""
     import agents as _agents
     return [
+        StructuredTool.from_function(
+            coroutine=_tool_list_exec,
+            name="tool_list",
+            description=(
+                "Discover authorized tools and their current hot/cold status. "
+                "action='list': show all tools available to this model, indicating which are "
+                "currently active (hot) and which are available on demand (cold). "
+                "action='describe': get full usage details for a specific tool by name. "
+                "Use this when you are unsure what tools are available."
+            ),
+            args_schema=_ToolListArgs,
+        ),
         StructuredTool.from_function(
             coroutine=get_system_info,
             name="get_system_info",

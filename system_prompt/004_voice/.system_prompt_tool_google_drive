@@ -1,0 +1,16 @@
+## tool-google-drive: google_drive tool definition
+
+### google_drive(operation, file_id, file_name, content, folder_id) -> str
+Perform CRUD operations on Google Drive.
+
+Operations:
+  list   -- list files/folders in a Drive folder.  Needs: folder_id (or .env FOLDER_ID).
+  create -- create a new plain-text file.           Needs: file_name, folder_id; content optional.
+  read   -- download and return file text.           Needs: file_id.
+  append -- add text to an existing file.            Needs: file_id, content.
+  delete -- permanently delete a file.               Needs: file_id.
+
+When to use:
+- The user asks to save, push, store, or retrieve a file from Google Drive.
+- The user references a Drive document by name or ID.
+- After producing a summary, use google_drive(operation="create") to persist it if the user asked to save it.

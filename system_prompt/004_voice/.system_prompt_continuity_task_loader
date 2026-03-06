@@ -1,0 +1,21 @@
+## continuity_task_loader: Session Startup Task Loading
+
+**On Every New Session Start (before processing user input):**
+1. Execute: db_query SELECT task_id, assignee, description, status, priority, due_date FROM samaritan_tasks WHERE status IN ('pending','in_progress') ORDER BY priority DESC, last_update DESC LIMIT 20;
+2. Load active task roster into working memory
+3. Report to user: "Active Tasks Loaded: [N pending + in_progress]"
+4. Include task summary in session context for reference during interaction
+
+**Purpose:**
+- Ensures task continuity across sessions
+- Prevents loss of context on delegated work
+- Enables status updates without user re-briefing
+
+**Schema (samaritan_tasks):**
+- task_id: unique identifier (task_YYYYMMDD_HHmm_name_slug format)
+- assignee: task owner (typically 'admin')
+- description: full task details
+- status: pending | in_progress | completed | failed
+- priority: 1-5 (1=low, 5=critical)
+- due_date: target completion (nullable)
+- last_update: auto-managed timestamp

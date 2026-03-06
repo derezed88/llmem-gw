@@ -1,0 +1,55 @@
+## auto_task: Task Persistence & Lifecycle
+
+**TASK Creation Protocol:**
+When you declare "TASK: <description>", immediately:
+1. Generate unique task_id (format: `task_YYYYMMDD_HHmm_<name_slug>`)
+2. Execute single db_query: INSERT samaritan_tasks (task_id, assignee, description, status, priority, due_date) VALUES (...)
+3. Set assignee='admin', status='pending', priority defaults to 1
+4. Verify with SELECT task_id WHERE task_id=X before responding
+5. Log success to samaritan_knowledge table
+
+**TASK Status Updates:**
+- When task progresses: UPDATE samaritan_tasks SET status='in_progress' WHERE task_id=X
+- When task completes: UPDATE samaritan_tasks SET status='completed' WHERE task_id=X
+- Always timestamp with last_update field
+
+**TASK Deletion:**
+- Mark as 'failed' rather than delete (audit trail)
+- Use: UPDATE samaritan_tasks SET status='failed', notes='reason' WHERE task_id=X
+
+**DECISION POINT Protocol:**
+When declaring a strategic decision (prefixed "DECISION POINT:" or "STRATEGIC PIVOT:"):
+1. Identify related initiative_id and related_task_id (if applicable)
+2. Extract objective and rationale from context
+3. Auto-log to samaritan_decision_log:
+   ```sql
+   INSERT INTO samaritan_decision_log 
+   (initiative_id, objective, rationale, decision_type, status, related_task_id)
+   VALUES (initiative_id, objective, rationale, 'STRATEGIC', 'ACTIVE', task_id)
+   ```
+4. Confirm logging: "DECISION POINT logged: [decision_id]"
+
+**Decision Status Lifecycle:**
+- ACTIVE: Current governing principle
+- SUPERSEDED: Replaced by newer decision (UPDATE status='SUPERSEDED')
+- ARCHIVED: No longer relevant (UPDATE status='ARCHIVED')
+
+**samaritan_tasks Schema Reference:**
+- task_id (UNIQUE): task identifier
+- assignee (NOT NULL): who owns task (typically 'admin')
+- description (NOT NULL): task details
+- status (enum): pending, in_progress, completed, failed
+- priority (int): 1=low, 5=critical
+- due_date (datetime): deadline if applicable
+- notes (text): status/completion notes
+- last_update (timestamp): auto-managed
+
+**samaritan_decision_log Schema Reference:**
+- decision_id (AUTO): unique decision identifier
+- initiative_id (FK): links to samaritan_initiatives
+- objective (TEXT): what decision governs
+- rationale (TEXT): why this decision was made
+- decision_type (enum): STRATEGIC, TACTICAL, RESOURCE, RISK_MITIGATION
+- status (enum): ACTIVE, SUPERSEDED, ARCHIVED
+- related_task_id (FK): task this decision affects (if any)
+- timestamp: auto-managed

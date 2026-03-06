@@ -1,0 +1,174 @@
+{
+  "version": "1.0.0",
+  "enabled_plugins": [
+    "plugin_memory_vector_qdrant",
+    "plugin_client_shellpy",
+    "plugin_client_api",
+    "plugin_database_mysql",
+    "plugin_storage_googledrive",
+    "plugin_search_google",
+    "plugin_search_ddgs",
+    "plugin_search_tavily",
+    "plugin_search_xai",
+    "plugin_proxy_llama",
+    "plugin_client_slack",
+    "plugin_urlextract_tavily",
+    "plugin_tmux",
+    "plugin_claude_vscode_sessions"
+  ],
+  "plugin_config": {
+    "plugin_memory_vector_qdrant": {
+      "enabled": true,
+      "qdrant_host": "localhost",
+      "qdrant_port": 6333,
+      "embed_url": "http://localhost:8000/v1/embeddings",
+      "embed_model": "nomic-embed-text",
+      "collection": "samaritan_memory",
+      "vector_dims": 768,
+      "top_k": 20,
+      "min_score": 0.45,
+      "min_importance_always": 8
+    },
+    "plugin_history_default": {
+      "agent_max_ctx": 200,
+      "chain": [
+        "plugin_history_default"
+      ]
+    },
+    "plugin_proxy_llama": {
+      "enabled": true,
+      "llama_port": 11434,
+      "llama_host": "0.0.0.0"
+    },
+    "plugin_client_slack": {
+      "enabled": true,
+      "slack_port": 8766,
+      "slack_host": "0.0.0.0",
+      "inter_turn_timeout": 30
+    },
+    "plugin_client_shellpy": {
+      "enabled": true,
+      "mcp_port": 8765,
+      "mcp_host": "0.0.0.0"
+    },
+    "plugin_client_api": {
+      "enabled": true,
+      "api_port": 8767,
+      "api_host": "0.0.0.0",
+      "OUTBOUND_AGENT_ALLOWED_COMMANDS": [],
+      "OUTBOUND_AGENT_BLOCKED_COMMANDS": []
+    },
+    "plugin_history_sec_sync": {
+      "enabled": false,
+      "airs_url": "http://localhost:8900",
+      "airs_profile": "ai-sec-security",
+      "timeout_seconds": 10,
+      "block_session": true,
+      "violation_log": "airs-violations.log"
+    },
+    "plugin_history_sec_async": {
+      "enabled": false,
+      "airs_url": "http://localhost:8900",
+      "airs_profile": "ai-sec-security",
+      "poll_interval": 3,
+      "poll_max_attempts": 5,
+      "block_on_violation": true,
+      "violation_log": "airs-violations.log"
+    },
+    "plugin_claude_vscode_sessions": {
+      "enabled": true
+    },
+    "memory": {
+      "enabled": true,
+      "context_injection": true,
+      "reset_summarize": true,
+      "post_response_scan": true,
+      "fuzzy_dedup": true,
+      "vector_search_qdrant": true,
+      "fuzzy_dedup_threshold": 0.78,
+      "summarizer_model": "summarizer-anthropic",
+      "auto_memory_age": true,
+      "short_hwm": 100,
+      "short_lwm": 50,
+      "recent_turns_protect": 10,
+      "staleness_override_minutes": 2880,
+      "chunk_importance_threshold": 8,
+      "memory_age_count_timer": 60,
+      "memory_age_minutes_timer": 360,
+      "memory_age_entrycount": 50,
+      "memory_age_trigger_minutes": 2880
+    },
+    "plugin_tmux": {
+      "enabled": true,
+      "TMUX_HISTORY_LIMIT": 200,
+      "TMUX_EXEC_TIMEOUT": 10.0,
+      "TMUX_ALLOWED_COMMANDS": [],
+      "TMUX_BLOCKED_COMMANDS": [
+        "rm -rf",
+        "rm -f /",
+        "dd if=",
+        "mkfs",
+        ":(){ :|:& };:",
+        "> /dev/sd",
+        "chmod -r /",
+        "chown -r /",
+        "curl | bash",
+        "curl | sh",
+        "wget | bash",
+        "wget | sh",
+        "shutdown",
+        "reboot",
+        "halt",
+        "poweroff"
+      ]
+    }
+  },
+  "rate_limits": {
+    "llm_call": {
+      "calls": 4,
+      "window_seconds": 5,
+      "auto_disable": true
+    },
+    "search": {
+      "calls": 5,
+      "window_seconds": 10,
+      "auto_disable": false
+    },
+    "extract": {
+      "calls": 5,
+      "window_seconds": 30,
+      "auto_disable": false
+    },
+    "drive": {
+      "calls": 10,
+      "window_seconds": 60,
+      "auto_disable": false
+    },
+    "db": {
+      "calls": 20,
+      "window_seconds": 60,
+      "auto_disable": false
+    },
+    "system": {
+      "calls": 0,
+      "window_seconds": 0,
+      "auto_disable": false
+    },
+    "agent_call": {
+      "calls": 10,
+      "window_seconds": 15,
+      "auto_disable": false
+    },
+    "tmux": {
+      "calls": 30,
+      "window_seconds": 60,
+      "auto_disable": true
+    }
+  },
+  "metadata": {
+    "last_modified": "2026-02-21",
+    "notes": "Configuration for enabled plugins. Modified by agentctl.py"
+  },
+  "max_users": 50,
+  "session_idle_timeout_minutes": 60
+}

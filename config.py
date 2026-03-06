@@ -91,8 +91,11 @@ def load_llm_registry():
                 "llm_tools_gates": config.get('llm_tools_gates', []),
                 "memory_scan": config.get('memory_scan', False),
                 "memory_scan_suppress": config.get('memory_scan_suppress', False),
+                "conv_log": config.get('conv_log', False),
                 "max_tokens": config.get('max_tokens'),
                 "tool_suppress": config.get('tool_suppress', False),
+                "agent_call_stream": config.get('agent_call_stream', None),
+                "stream_level": config.get('stream_level', None),
             }
 
         return registry
@@ -217,26 +220,56 @@ def save_llm_model_field(model_name: str, field: str, value) -> bool:
         return False
 
 
-def load_llm_tools() -> dict:
-    """Load named toolsets from llm-tools.json. Returns {name: [tool_names]}."""
+def load_llm_tools() -> tuple[dict, dict]:
+    """
+    Load named toolsets from llm-tools.json.
+
+    Returns:
+        toolsets: {name: [tool_names]}  — backward-compatible tool list mapping
+        meta:     {name: {always_active, heat_curve, sp_section}}  — full metadata
+    """
     try:
         with open(LLM_TOOLS_FILE, 'r') as f:
             data = json.load(f)
-        return data.get('toolsets', {})
+        raw = data.get('toolsets', {})
+        toolsets: dict = {}
+        meta: dict = {}
+        for name, entry in raw.items():
+            if isinstance(entry, list):
+                # v1.0 legacy format — plain list
+                toolsets[name] = entry
+                meta[name] = {"always_active": True, "heat_curve": None, "sp_section": None}
+            else:
+                # v1.1+ object format
+                toolsets[name] = entry.get("tools", [])
+                meta[name] = {
+                    "always_active": entry.get("always_active", True),
+                    "heat_curve":    entry.get("heat_curve", None),
+                    "sp_section":    entry.get("sp_section", None),
+                }
+        return toolsets, meta
     except FileNotFoundError:
         log.error("llm-tools.json not found — no toolsets available.")
-        return {}
+        return {}, {}
     except Exception as e:
         log.error(f"Error loading llm-tools.json: {e}")
-        return {}
+        return {}, {}
 
 
 def save_llm_toolset(name: str, tools: list[str]) -> bool:
-    """Persist a single toolset to llm-tools.json. Returns True on success."""
+    """Persist the tools list for a toolset to llm-tools.json. Returns True on success.
+    Preserves existing metadata fields (always_active, heat_curve, sp_section)."""
     try:
         with open(LLM_TOOLS_FILE, 'r') as f:
             data = json.load(f)
-        data.setdefault('toolsets', {})[name] = tools
+        toolsets = data.setdefault('toolsets', {})
+        existing = toolsets.get(name, {})
+        if isinstance(existing, list):
+            # Upgrade legacy list entry to object format
+            toolsets[name] = {"tools": tools, "always_active": True, "sp_section": None}
+        else:
+            existing["tools"] = tools
+            toolsets[name] = existing
         with open(LLM_TOOLS_FILE, 'w') as f:
             json.dump(data, f, indent=2)
         return True
@@ -351,7 +384,9 @@ LIVE_LIMITS: dict = {
 }
 
 # Named toolsets — loaded from llm-tools.json
-LLM_TOOLSETS = load_llm_tools()
+# LLM_TOOLSETS: {name: [tool_names]}  — used for tool authorization/expansion
+# LLM_TOOLSET_META: {name: {always_active, heat_curve, sp_section}}  — used for hot/cold lifecycle
+LLM_TOOLSETS, LLM_TOOLSET_META = load_llm_tools()
 
 # Rate limits by tool type — loaded from plugins-enabled.json
 RATE_LIMITS = load_rate_limits()

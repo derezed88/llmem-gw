@@ -13,6 +13,7 @@ Public API:
   age_by_minutes(trigger_minutes, max_rows) -> int
   load_context_block(limit, min_importance) -> str   # ready to prepend to prompt
   summarize_and_save(session_id, history, model_key) -> str
+  save_conversation_turn(user_text, assistant_text, session_id, importance) -> (user_id, asst_id, topic)
 """
 
 import asyncio
@@ -20,6 +21,7 @@ import difflib
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 
 from database import execute_sql, execute_insert
@@ -65,19 +67,30 @@ def _mem_plugin_cfg() -> dict:
 def _age_cfg() -> dict:
     """
     Return aging config with defaults. Keys:
-      auto_memory_age         bool  — master switch for background aging
-      memory_age_entrycount   int   — max shortterm rows before count-pressure aging
-      memory_age_count_timer  int   — minutes between count-pressure checks (-1 = disabled)
-      memory_age_trigger_minutes int — age threshold in minutes for staleness aging
-      memory_age_minutes_timer   int — minutes between staleness checks (-1 = disabled)
+      auto_memory_age             bool  — master switch for background aging
+      short_hwm                   int   — ST row count that triggers count-pressure aging
+      short_lwm                   int   — target ST count after aging loop
+      recent_turns_protect        int   — last N ST rows whose topics are protected from chunking
+      staleness_override_minutes  int   — even protected topics age if all rows older than this
+      chunk_importance_threshold  int   — rows >= this importance are also copied verbatim to LT
+      memory_age_count_timer      int   — minutes between count-pressure checks (-1 = disabled)
+      memory_age_minutes_timer    int   — minutes between staleness checks (-1 = disabled)
+      memory_age_trigger_minutes  int   — staleness threshold: rows older than N minutes are candidates
+      memory_age_entrycount       int   — legacy alias for short_hwm (kept for backwards compat)
     """
     cfg = _mem_plugin_cfg()
+    hwm = int(cfg.get("short_hwm", cfg.get("memory_age_entrycount", 100)))
     return {
-        "auto_memory_age":          cfg.get("auto_memory_age",          True),
-        "memory_age_entrycount":    int(cfg.get("memory_age_entrycount",    50)),
-        "memory_age_count_timer":   int(cfg.get("memory_age_count_timer",   60)),
+        "auto_memory_age":            cfg.get("auto_memory_age",            True),
+        "short_hwm":                  hwm,
+        "short_lwm":                  int(cfg.get("short_lwm",                  50)),
+        "recent_turns_protect":       int(cfg.get("recent_turns_protect",       10)),
+        "staleness_override_minutes": int(cfg.get("staleness_override_minutes", 2880)),
+        "chunk_importance_threshold": int(cfg.get("chunk_importance_threshold", 8)),
+        "memory_age_count_timer":     int(cfg.get("memory_age_count_timer",     60)),
+        "memory_age_minutes_timer":   int(cfg.get("memory_age_minutes_timer",   360)),
         "memory_age_trigger_minutes": int(cfg.get("memory_age_trigger_minutes", 2880)),
-        "memory_age_minutes_timer": int(cfg.get("memory_age_minutes_timer", 360)),
+        "memory_age_entrycount":      hwm,  # legacy alias
     }
 
 
@@ -113,6 +126,16 @@ def _fuzzy_similar(a: str, b: str, threshold: float) -> bool:
 # Short-term: save
 # ---------------------------------------------------------------------------
 
+# Public API addition summary:
+#   save_lt_memory(topic, content, importance, source, session_id) -> int
+#     Insert directly into long-term memory (bypasses ST). Used by aging.
+#   age_by_count() -> int
+#     Count-pressure aging: topic-chunk summarize until ST < short_lwm.
+#   age_by_minutes(trigger_minutes) -> int
+#     Staleness aging: topic-chunk summarize stale topics until ST < short_lwm.
+#   trim_st_to_lwm() -> int
+#     Escape valve: delete oldest/least-important ST rows until ST < short_lwm.
+
 async def save_memory(
     topic: str,
     content: str,
@@ -124,7 +147,7 @@ async def save_memory(
     topic = topic.replace("'", "''")[:255]
     content = content.replace("'", "''")
     session_id = (session_id or "").replace("'", "''")[:255]
-    source = source if source in ("session", "user", "directive") else "session"
+    source = source if source in ("session", "user", "directive", "assistant") else "session"
     importance = max(1, min(10, int(importance)))
 
     # Dedup pass 1: exact match on topic+content in both tiers
@@ -196,6 +219,131 @@ async def save_memory(
                 ))
         except Exception as e:
             log.warning(f"save_memory vector upsert skipped: {e}")
+
+    return row_id
+
+
+# ---------------------------------------------------------------------------
+# Conversation logging — verbatim save of user prompt + assistant response
+# ---------------------------------------------------------------------------
+
+_TOPIC_TAG_RE = re.compile(r'^<<([a-z0-9][a-z0-9\-]*)>>\s*', re.IGNORECASE)
+
+
+def _extract_topic_tag(text: str) -> tuple[str | None, str]:
+    """Extract <<topic-slug>> prefix from assistant text.
+
+    Returns (topic_slug, text_with_tag_stripped).
+    If no tag found, returns (None, original_text).
+    """
+    m = _TOPIC_TAG_RE.match(text)
+    if m:
+        return m.group(1).lower(), text[m.end():]
+    return None, text
+
+
+def _make_conv_topic(user_text: str) -> str:
+    """Fallback topic slug derived from user text when no <<topic>> tag present.
+
+    Format: conv-YYYY-MM-DD-<first-few-words>
+    """
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    slug = user_text[:60].lower()
+    slug = re.sub(r'[^a-z0-9]+', '-', slug).strip('-')
+    slug = re.sub(r'-{2,}', '-', slug)
+    return f"conv-{date_str}-{slug}"
+
+
+async def save_conversation_turn(
+    user_text: str,
+    assistant_text: str,
+    session_id: str = "",
+    importance: int = 4,
+) -> tuple[int, int, str | None]:
+    """Save a user prompt and assistant response as two verbatim memory rows.
+
+    Extracts <<topic-slug>> from the assistant text if present — that becomes
+    the topic for both rows, and the tag is stripped from the stored content.
+    Falls back to a date-slug derived from the user text.
+
+    Returns (user_row_id, assistant_row_id, topic_used).
+    Row IDs of 0 mean duplicate/skipped.
+    """
+    topic_tag, asst_clean = _extract_topic_tag(assistant_text)
+    topic = topic_tag if topic_tag else _make_conv_topic(user_text)
+
+    user_id = await save_memory(
+        topic=topic,
+        content=user_text,
+        importance=importance,
+        source="user",
+        session_id=session_id,
+    )
+    asst_id = await save_memory(
+        topic=topic,
+        content=asst_clean,
+        importance=importance,
+        source="assistant",
+        session_id=session_id,
+    )
+    return user_id, asst_id, topic
+
+
+# ---------------------------------------------------------------------------
+# Long-term: direct save (bypasses ST; used by aging summarization)
+# ---------------------------------------------------------------------------
+
+async def save_lt_memory(
+    topic: str,
+    content: str,
+    importance: int = 5,
+    source: str = "session",
+    session_id: str = "",
+    shortterm_id: int | None = None,
+) -> int:
+    """Insert directly into long-term memory. Returns new LT row id, or 0 on error/duplicate."""
+    topic      = topic.replace("'", "''")[:255]
+    content    = content.replace("'", "''")
+    session_id = (session_id or "").replace("'", "''")[:255]
+    source     = source if source in ("session", "user", "directive", "assistant") else "session"
+    importance = max(1, min(10, int(importance)))
+
+    # Exact dedup in LT
+    try:
+        dup = await execute_sql(
+            f"SELECT 1 FROM {_LT} WHERE topic = '{topic}' AND content = '{content}' LIMIT 1"
+        )
+        if "1" in dup.strip():
+            return 0
+    except Exception as e:
+        log.warning(f"save_lt_memory dedup check failed: {e}")
+
+    st_id_clause = f", {int(shortterm_id)}" if shortterm_id else ", NULL"
+    sql = (
+        f"INSERT INTO {_LT} "
+        f"(topic, content, importance, source, session_id, shortterm_id) "
+        f"VALUES ('{topic}', '{content}', {importance}, '{source}', '{session_id}'{st_id_clause})"
+    )
+    try:
+        row_id = await execute_insert(sql)
+    except Exception as e:
+        log.error(f"save_lt_memory failed: {e}")
+        return 0
+
+    if row_id:
+        try:
+            from plugin_memory_vector_qdrant import get_vector_api
+            vec = get_vector_api()
+            if vec:
+                asyncio.create_task(vec.upsert_memory(
+                    row_id=row_id,
+                    topic=topic,
+                    content=content,
+                    importance=importance,
+                    tier="long",
+                ))
+        except Exception as e:
+            log.warning(f"save_lt_memory vector upsert skipped: {e}")
 
     return row_id
 
@@ -286,118 +434,398 @@ async def update_memory(
 
 
 # ---------------------------------------------------------------------------
-# Aging: move rows from short-term to long-term
-# Two independent modes:
-#   age_by_count   — count-pressure: moves overflow rows (ignores age threshold)
-#   age_by_minutes — staleness: moves rows not accessed in N minutes
+# Aging: topic-chunk summarize ST rows into LT
+#
+# Two independent triggers:
+#   age_by_count   — fires when ST count > short_hwm; loops until < short_lwm
+#   age_by_minutes — fires on schedule; chunks stale topics until < short_lwm
+#
+# Both share the same core: _age_topic_chunks()
+#
+# Algorithm:
+#   1. Determine "protected" topics: topics that appear in the last
+#      recent_turns_protect ST rows (by id DESC).  Protected topics are
+#      excluded UNLESS all their rows are older than staleness_override_minutes.
+#   2. Build candidate list: distinct topics ordered by their oldest row first.
+#      For age_by_minutes, further filter: only topics where at least one row
+#      is older than trigger_minutes.
+#   3. For each candidate topic (oldest first):
+#      a. Load all ST rows for that topic.
+#      b. Summarize them via summarize_and_save_lt() → summary written to LT.
+#      c. Promote any rows with importance >= chunk_importance_threshold
+#         verbatim to LT as well.
+#      d. DELETE all those rows from ST + Qdrant.
+#      e. Re-check ST count; stop when count < short_lwm.
 # ---------------------------------------------------------------------------
 
-async def _move_rows_to_longterm(rows: list[dict]) -> int:
-    """Move a list of parsed short-term rows to long-term. Returns count moved."""
-    moved = 0
-    for row in rows:
-        rid = row.get("id", "")
-        if not rid:
-            continue
-        topic   = row.get("topic",      "").replace("'", "''")
-        content = row.get("content",    "").replace("'", "''")
-        imp     = row.get("importance", 5)
-        src     = row.get("source",     "session")
-        sid     = row.get("session_id", "").replace("'", "''")
-        try:
-            await execute_sql(
-                f"INSERT INTO {_LT} "
-                f"(topic, content, importance, source, session_id, shortterm_id) "
-                f"VALUES ('{topic}', '{content}', {imp}, '{src}', '{sid}', {rid})"
-            )
-            await execute_sql(f"DELETE FROM {_ST} WHERE id = {rid}")
-            moved += 1
-            # Update Qdrant tier payload short→long (fire-and-forget)
-            try:
-                from plugin_memory_vector_qdrant import get_vector_api
-                vec = get_vector_api()
-                if vec:
-                    asyncio.create_task(vec.update_tier(int(rid), "long"))
-            except Exception:
-                pass
-        except Exception as e:
-            log.warning(f"_move_rows_to_longterm: failed for id={rid}: {e}")
-    return moved
-
-
-async def age_by_count(max_rows: int = 200) -> int:
-    """
-    Count-pressure aging: if short-term row count exceeds memory_age_entrycount,
-    move exactly the overflow rows to long-term.
-    Rows are selected by importance ASC, last_accessed ASC (least important,
-    least recently used first).  Ignores age threshold.
-    Returns number of rows moved.
-    """
-    cfg = _age_cfg()
-    entry_limit = cfg["memory_age_entrycount"]
+async def _st_count() -> int:
+    """Return current short-term row count."""
     try:
-        count_raw = await execute_sql(f"SELECT COUNT(*) FROM {_ST}")
-        lines = [l.strip() for l in count_raw.strip().splitlines() if l.strip()]
-        current_count = 0
-        for line in lines:
+        raw = await execute_sql(f"SELECT COUNT(*) FROM {_ST}")
+        for line in raw.strip().splitlines():
+            line = line.strip()
             if line.isdigit():
-                current_count = int(line)
-                break
-            # handle "COUNT(*)\n123" format
+                return int(line)
             parts = line.split()
             if parts and parts[-1].isdigit():
-                current_count = int(parts[-1])
-                break
-
-        overflow = current_count - entry_limit
-        if overflow <= 0:
-            return 0
-
-        # Move exactly overflow rows, capped by max_rows safety ceiling
-        n_to_move = min(overflow, max_rows)
-        select_sql = (
-            f"SELECT * FROM {_ST} "
-            f"ORDER BY importance ASC, last_accessed ASC "
-            f"LIMIT {n_to_move}"
-        )
-        raw = await execute_sql(select_sql)
-        rows = _parse_table(raw)
-        moved = await _move_rows_to_longterm(rows)
-        if moved:
-            log.info(f"age_by_count: moved {moved} rows (overflow={overflow}, limit={entry_limit})")
-        return moved
+                return int(parts[-1])
     except Exception as e:
-        log.error(f"age_by_count failed: {e}")
-        return 0
+        log.warning(f"_st_count failed: {e}")
+    return 0
 
 
-async def age_by_minutes(trigger_minutes: int, max_rows: int = 200) -> int:
+async def _summarize_chunk_to_lt(
+    rows: list[dict],
+    session_id: str,
+    model_key: str,
+    imp_threshold: int,
+) -> dict:
     """
-    Staleness aging: move rows whose last_accessed is older than trigger_minutes.
-    Ordered by importance ASC, last_accessed ASC.
-    max_rows is a safety ceiling per pass.
-    Returns number of rows moved.
+    Summarize a list of ST rows and write results directly to LT in one LLM call.
+    The LLM outputs both summary rows AND which verbatim ST rows deserve promotion
+    (with fresh importance scores). No post-hoc importance check — the summarizer
+    decides everything.
+    Returns {"summarized": N, "promoted": N, "deleted": N}.
+    """
+    if not rows:
+        return {"summarized": 0, "promoted": 0, "deleted": 0}
+
+    from agents import _call_llm_text
+    known_topics = await load_topic_list()
+    topics_hint = (
+        f"EXISTING TOPICS (reuse these; only add new if nothing fits):\n  {', '.join(known_topics)}\n\n"
+        if known_topics else
+        "Topic examples: user-preferences, project-status, technical-decisions.\n\n"
+    )
+
+    lines_text = []
+    for r in rows:
+        src  = r.get("source", "session")
+        role = "USER" if src == "user" else "ASSISTANT"
+        lines_text.append(f"[id={r.get('id', '?')}] {role}: {r.get('content', '')[:500]}")
+    history_text = "\n".join(lines_text)
+
+    prompt = (
+        "You are Samaritan, an AI assistant, archiving older short-term memories into long-term storage.\n\n"
+        "Your task — in ONE JSON response:\n"
+        "  1. Write 1-5 concise summary rows capturing the most important facts, decisions, and context.\n"
+        "  2. Identify any individual memory rows that are so specific or critical they should be\n"
+        "     preserved verbatim alongside the summary (e.g. exact code, commands, key decisions).\n"
+        "     Assign them fresh importance scores. If nothing warrants verbatim preservation, use [].\n\n"
+        "Output ONLY valid JSON with exactly these two keys:\n"
+        "{\n"
+        '  "summary": [\n'
+        '    {"topic": "kebab-case", "content": "one concise sentence", "importance": 1-10,\n'
+        '     "source": "user|assistant|session"}\n'
+        "  ],\n"
+        '  "preserve": [\n'
+        '    {"id": <original row id int>, "importance": 1-10}\n'
+        "  ]\n"
+        "}\n\n"
+        "Importance guidance for summary rows:\n"
+        "  6 = useful context (preferences, recurring habits)\n"
+        "  7-8 = concrete plans, decisions, relationships\n"
+        "  9 = high-stakes decisions, key career/life events\n"
+        "  10 = critical time-sensitive facts\n"
+        "  Do NOT inflate — only facts with lasting value deserve 8+.\n\n"
+        f"Importance threshold for 'preserve': only include rows at {imp_threshold}+ lasting value.\n\n"
+        f"{topics_hint}"
+        "No markdown, no explanation, just the JSON object.\n\n"
+        f"MEMORIES TO ARCHIVE:\n{history_text}"
+    )
+
+    result_text = None
+    try:
+        result_text = await _call_llm_text(model_key, prompt)
+    except Exception as e:
+        log.error(f"_summarize_chunk_to_lt LLM call failed: {e}")
+
+    summarized = 0
+    promoted = 0
+    preserve_ids: dict[int, int] = {}  # id -> new importance
+
+    if result_text:
+        cleaned = result_text.strip()
+        if cleaned.startswith("```"):
+            cleaned = "\n".join(cleaned.split("\n")[1:])
+        if cleaned.endswith("```"):
+            cleaned = "\n".join(cleaned.split("\n")[:-1])
+        try:
+            parsed = json.loads(cleaned)
+            if not isinstance(parsed, dict):
+                raise ValueError("expected JSON object")
+
+            # Save summary rows to LT
+            for item in parsed.get("summary", []):
+                if not isinstance(item, dict):
+                    continue
+                new_id = await save_lt_memory(
+                    topic=str(item.get("topic", "general"))[:255],
+                    content=str(item.get("content", ""))[:2000],
+                    importance=int(item.get("importance", 5)),
+                    source=str(item.get("source", "session")),
+                    session_id=session_id,
+                )
+                if new_id:
+                    summarized += 1
+
+            # Collect verbatim preserve decisions
+            for entry in parsed.get("preserve", []):
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    preserve_ids[int(entry["id"])] = int(entry.get("importance", imp_threshold))
+                except (KeyError, ValueError, TypeError):
+                    pass
+
+        except (json.JSONDecodeError, ValueError) as e:
+            log.warning(f"_summarize_chunk_to_lt JSON parse failed: {e}. Raw: {result_text[:200]}")
+
+    # Build row index for verbatim promotion
+    row_by_id = {int(r["id"]): r for r in rows if r.get("id")}
+
+    # Promote preserved rows verbatim to LT with LLM-assigned importance
+    for rid, new_imp in preserve_ids.items():
+        r = row_by_id.get(rid)
+        if not r:
+            continue
+        new_id = await save_lt_memory(
+            topic=r.get("topic", "general"),
+            content=r.get("content", ""),
+            importance=new_imp,
+            source=r.get("source", "session"),
+            session_id=r.get("session_id", ""),
+            shortterm_id=rid,
+        )
+        if new_id:
+            promoted += 1
+
+    # Delete all rows from ST + remove from Qdrant
+    deleted = 0
+    try:
+        from plugin_memory_vector_qdrant import get_vector_api
+        vec = get_vector_api()
+    except Exception:
+        vec = None
+
+    for r in rows:
+        rid = r.get("id")
+        if not rid:
+            continue
+        try:
+            await execute_sql(f"DELETE FROM {_ST} WHERE id = {int(rid)}")
+            deleted += 1
+            if vec:
+                asyncio.create_task(vec.delete_memory(int(rid)))
+        except Exception as e:
+            log.warning(f"_summarize_chunk_to_lt: delete failed for id={rid}: {e}")
+
+    return {"summarized": summarized, "promoted": promoted, "deleted": deleted}
+
+
+async def _age_topic_chunks(
+    trigger: str,
+    trigger_minutes: int = 0,
+) -> dict:
+    """
+    Core aging loop. trigger = "count" or "minutes".
+    Returns {"chunks": N, "summarized": N, "promoted": N, "deleted": N}.
+    """
+    cfg = _age_cfg()
+    hwm             = cfg["short_hwm"]
+    lwm             = cfg["short_lwm"]
+    protect_n       = cfg["recent_turns_protect"]
+    stale_override  = cfg["staleness_override_minutes"]
+    imp_threshold   = cfg["chunk_importance_threshold"]
+    model_key       = _mem_plugin_cfg().get("summarizer_model", "summarizer-anthropic")
+
+    totals = {"chunks": 0, "summarized": 0, "promoted": 0, "deleted": 0}
+
+    current = await _st_count()
+    if trigger == "count" and current <= hwm:
+        return totals
+
+    # --- Step 1: identify protected topics ---
+    # Protected = topics that appear in the last `protect_n` ST rows by id DESC
+    # Exception: a topic is unprotected if ALL its rows are older than stale_override
+    try:
+        recent_raw = await execute_sql(
+            f"SELECT DISTINCT topic FROM {_ST} "
+            f"ORDER BY id DESC LIMIT {protect_n}"
+        )
+        protected_topics: set[str] = set()
+        for line in recent_raw.strip().splitlines():
+            line = line.strip()
+            if not line or line.lower().startswith("topic") or set(line) <= set("-+|"):
+                continue
+            protected_topics.add(line)
+    except Exception as e:
+        log.warning(f"_age_topic_chunks: protected topics query failed: {e}")
+        protected_topics = set()
+
+    # Check which protected topics are FULLY stale (all rows older than stale_override)
+    truly_protected: set[str] = set()
+    for topic in protected_topics:
+        t_escaped = topic.replace("'", "''")
+        try:
+            check = await execute_sql(
+                f"SELECT COUNT(*) FROM {_ST} "
+                f"WHERE topic = '{t_escaped}' "
+                f"AND last_accessed >= NOW() - INTERVAL {stale_override} MINUTE"
+            )
+            # If any rows are recent enough, the topic stays protected
+            count = 0
+            for line in check.strip().splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    count = int(line)
+                    break
+                parts = line.split()
+                if parts and parts[-1].isdigit():
+                    count = int(parts[-1])
+                    break
+            if count > 0:
+                truly_protected.add(topic)
+        except Exception as e:
+            log.warning(f"_age_topic_chunks: staleness check failed for topic={topic!r}: {e}")
+            truly_protected.add(topic)  # err on side of protection
+
+    # --- Step 2: candidate topics ordered by oldest row first ---
+    # For "minutes" trigger, only topics where at least one row is older than trigger_minutes
+    age_having = (
+        f"HAVING MIN(last_accessed) < NOW() - INTERVAL {int(trigger_minutes)} MINUTE"
+        if trigger == "minutes" and trigger_minutes > 0
+        else ""
+    )
+    try:
+        cand_raw = await execute_sql(
+            f"SELECT topic, MIN(last_accessed) AS oldest "
+            f"FROM {_ST} "
+            f"GROUP BY topic "
+            f"{age_having} "
+            f"ORDER BY oldest ASC"
+        )
+        candidate_topics: list[str] = []
+        for line in cand_raw.strip().splitlines():
+            if not line.strip() or line.strip().lower().startswith("topic") or set(line.strip()) <= set("-+|"):
+                continue
+            parts = line.split("|") if "|" in line else line.split()
+            topic_name = parts[0].strip() if parts else ""
+            if not topic_name or topic_name.lower() == "topic":
+                continue
+            if topic_name not in truly_protected:
+                candidate_topics.append(topic_name)
+    except Exception as e:
+        log.error(f"_age_topic_chunks: candidate query failed: {e}")
+        return totals
+
+    # --- Step 3: process one topic at a time until ST < lwm ---
+    for topic in candidate_topics:
+        current = await _st_count()
+        if current < lwm:
+            break
+
+        t_escaped = topic.replace("'", "''")
+        try:
+            rows_raw = await execute_sql(
+                f"SELECT * FROM {_ST} WHERE topic = '{t_escaped}' ORDER BY created_at ASC"
+            )
+            rows = _parse_table(rows_raw)
+        except Exception as e:
+            log.warning(f"_age_topic_chunks: row fetch failed for topic={topic!r}: {e}")
+            continue
+
+        if not rows:
+            continue
+
+        result = await _summarize_chunk_to_lt(
+            rows=rows,
+            session_id="",
+            model_key=model_key,
+            imp_threshold=imp_threshold,
+        )
+        totals["chunks"]     += 1
+        totals["summarized"] += result["summarized"]
+        totals["promoted"]   += result["promoted"]
+        totals["deleted"]    += result["deleted"]
+        log.info(
+            f"_age_topic_chunks [{trigger}]: topic={topic!r} "
+            f"summarized={result['summarized']} promoted={result['promoted']} "
+            f"deleted={result['deleted']}"
+        )
+
+    return totals
+
+
+async def age_by_count() -> int:
+    """
+    Count-pressure aging: if ST count > short_hwm, topic-chunk summarize
+    oldest unprotected topics into LT until ST count < short_lwm.
+    Returns number of ST rows deleted.
+    """
+    result = await _age_topic_chunks(trigger="count")
+    return result["deleted"]
+
+
+async def age_by_minutes(trigger_minutes: int, max_rows: int = 200) -> int:  # noqa: ARG001
+    """
+    Staleness aging: topic-chunk summarize topics with stale rows into LT
+    until ST count < short_lwm (or no more stale candidates).
+    trigger_minutes: rows older than this are candidates.
+    max_rows: kept for API compatibility but ignored (loop stops at lwm).
+    Returns number of ST rows deleted.
     """
     if trigger_minutes <= 0:
         return 0
-    try:
-        select_sql = (
-            f"SELECT * FROM {_ST} "
-            f"WHERE last_accessed < NOW() - INTERVAL {int(trigger_minutes)} MINUTE "
-            f"ORDER BY importance ASC, last_accessed ASC "
-            f"LIMIT {int(max_rows)}"
-        )
-        raw = await execute_sql(select_sql)
-        rows = _parse_table(raw)
-        if not rows:
-            return 0
-        moved = await _move_rows_to_longterm(rows)
-        if moved:
-            log.info(f"age_by_minutes: moved {moved} rows (threshold={trigger_minutes}min)")
-        return moved
-    except Exception as e:
-        log.error(f"age_by_minutes failed: {e}")
+    result = await _age_topic_chunks(trigger="minutes", trigger_minutes=trigger_minutes)
+    return result["deleted"]
+
+
+async def trim_st_to_lwm() -> int:
+    """
+    Escape valve: hard-delete ST rows (oldest + least important first)
+    until ST count < short_lwm.  No summarization — raw trim.
+    Returns number of rows deleted.
+    """
+    cfg = _age_cfg()
+    lwm = cfg["short_lwm"]
+    current = await _st_count()
+    if current <= lwm:
         return 0
+
+    n_to_delete = current - lwm
+    try:
+        from plugin_memory_vector_qdrant import get_vector_api
+        vec = get_vector_api()
+    except Exception:
+        vec = None
+
+    try:
+        rows_raw = await execute_sql(
+            f"SELECT id FROM {_ST} "
+            f"ORDER BY importance ASC, last_accessed ASC "
+            f"LIMIT {n_to_delete}"
+        )
+        rows = _parse_table(rows_raw)
+    except Exception as e:
+        log.error(f"trim_st_to_lwm: row fetch failed: {e}")
+        return 0
+
+    deleted = 0
+    for r in rows:
+        rid = r.get("id")
+        if not rid:
+            continue
+        try:
+            await execute_sql(f"DELETE FROM {_ST} WHERE id = {int(rid)}")
+            deleted += 1
+            if vec:
+                asyncio.create_task(vec.delete_memory(int(rid)))
+        except Exception as e:
+            log.warning(f"trim_st_to_lwm: delete failed id={rid}: {e}")
+
+    log.info(f"trim_st_to_lwm: deleted {deleted} rows (target lwm={lwm})")
+    return deleted
 
 
 # ---------------------------------------------------------------------------
@@ -444,18 +872,33 @@ async def _update_last_accessed(row_ids: list) -> None:
         log.debug(f"_update_last_accessed failed: {e}")
 
 
+async def _update_lt_last_accessed(row_ids: list) -> None:
+    """Fire-and-forget: update last_accessed for a list of longterm row IDs."""
+    if not row_ids:
+        return
+    ids_str = ", ".join(str(rid) for rid in row_ids if str(rid).isdigit())
+    if not ids_str:
+        return
+    try:
+        await execute_sql(
+            f"UPDATE {_LT} SET last_accessed = NOW() WHERE id IN ({ids_str})"
+        )
+    except Exception as e:
+        log.debug(f"_update_lt_last_accessed failed: {e}")
+
+
 async def load_context_block(min_importance: int = 3, query: str = "") -> str:
     """
-    Return a formatted string of short-term memories for prompt injection.
+    Return a formatted string of memories for prompt injection (short-term + relevant long-term).
 
     When a query string is provided and the vector plugin is available:
-      - Semantic search returns the top-K most relevant rows
-      - Rows with importance >= min_importance_always are always included
-      - Only semantically retrieved rows have last_accessed updated
+      - Semantic search runs against both short-term and long-term tiers
+      - Rows with importance >= min_importance_always are always included from short-term
+      - Only semantically retrieved short-term rows have last_accessed updated
 
     When no query or vector plugin unavailable:
-      - Falls back to loading all rows meeting min_importance (original behaviour)
-      - last_accessed updated for all rows
+      - Short-term: all rows meeting min_importance
+      - Long-term: high-importance rows (importance >= 7)
 
     Includes the full list of known topics so the model can reuse existing
     categories rather than inventing new ones each turn.
@@ -470,55 +913,82 @@ async def load_context_block(min_importance: int = 3, query: str = "") -> str:
         # --- Semantic retrieval path ---
         always_importance = vec.cfg().get("min_importance_always", 8)
 
-        # Run semantic search and high-importance fetch in parallel
-        semantic_task = asyncio.create_task(vec.search_memories(query, tier="short"))
-        always_task   = asyncio.create_task(
+        # Run semantic search against both tiers and high-importance fetch in parallel
+        semantic_st_task = asyncio.create_task(vec.search_memories(query, tier="short"))
+        semantic_lt_task = asyncio.create_task(vec.search_memories(query, tier="long"))
+        always_task      = asyncio.create_task(
             load_short_term(limit=10000, min_importance=always_importance)
         )
-        semantic_hits, always_rows, topics = await asyncio.gather(
-            semantic_task, always_task, topics_task
+        semantic_st, semantic_lt, always_rows, topics = await asyncio.gather(
+            semantic_st_task, semantic_lt_task, always_task, topics_task
         )
 
-        # Merge: always_rows first (authoritative), then semantic hits not already included
-        seen_ids = {str(r.get("id", "")) for r in always_rows}
-        merged = list(always_rows)
-        for hit in semantic_hits:
-            if str(hit.get("id", "")) not in seen_ids:
-                merged.append(hit)
-                seen_ids.add(str(hit.get("id", "")))
+        # Merge: always_rows first, then short-term semantic hits, then long-term hits
+        seen_ids_st = {str(r.get("id", "")) for r in always_rows}
+        merged_st = list(always_rows)
+        for hit in semantic_st:
+            if str(hit.get("id", "")) not in seen_ids_st:
+                merged_st.append(hit)
+                seen_ids_st.add(str(hit.get("id", "")))
 
-        rows = merged
-        # Only update last_accessed for semantically retrieved rows (not always-rows)
-        semantic_ids = [h.get("id") for h in semantic_hits if h.get("id")]
+        # Only update last_accessed for semantically retrieved short-term rows
+        semantic_ids = [h.get("id") for h in semantic_st if h.get("id")]
         if semantic_ids:
             asyncio.create_task(_update_last_accessed(semantic_ids))
+        lt_ids = [h.get("id") for h in semantic_lt if h.get("id")]
+        if lt_ids:
+            asyncio.create_task(_update_lt_last_accessed(lt_ids))
+
         log.debug(
-            f"load_context_block: semantic={len(semantic_hits)} "
-            f"always={len(always_rows)} merged={len(merged)}"
+            f"load_context_block: st_semantic={len(semantic_st)} "
+            f"always={len(always_rows)} lt_semantic={len(semantic_lt)} "
+            f"merged_st={len(merged_st)}"
         )
     else:
-        # --- Fallback: load all rows meeting min_importance ---
-        rows, topics = await asyncio.gather(
+        # --- Fallback: load by importance threshold ---
+        merged_st, topics = await asyncio.gather(
             load_short_term(limit=10000, min_importance=min_importance),
             topics_task,
         )
-        row_ids = [row.get("id", "") for row in rows if row.get("id", "")]
+        # Pull high-importance long-term rows directly
+        lt_raw = await execute_sql(
+            f"SELECT id, topic, content, importance FROM {_LT} "
+            f"WHERE importance >= 7 ORDER BY importance DESC LIMIT 20"
+        )
+        semantic_lt = _parse_table(lt_raw)
+        row_ids = [row.get("id", "") for row in merged_st if row.get("id", "")]
         if row_ids:
             asyncio.create_task(_update_last_accessed(row_ids))
+        lt_ids = [r.get("id", "") for r in semantic_lt if r.get("id", "")]
+        if lt_ids:
+            asyncio.create_task(_update_lt_last_accessed(lt_ids))
 
-    if not rows and not topics:
+    if not merged_st and not semantic_lt and not topics:
         return ""
 
     lines = ["## Active Memory (short-term recall)\n"]
 
-    if rows:
-        # Group by topic
+    if merged_st:
         by_topic: dict[str, list[dict]] = {}
-        for row in rows:
+        for row in merged_st:
             t = row.get("topic", "general")
             by_topic.setdefault(t, []).append(row)
 
         for topic, items in by_topic.items():
+            lines.append(f"**{topic}**")
+            for item in items:
+                imp = item.get("importance", 5)
+                lines.append(f"  [imp={imp}] {item.get('content', '')}")
+            lines.append("")
+
+    if semantic_lt:
+        lines.append("## Long-term Memory (relevant recalled)\n")
+        by_topic_lt: dict[str, list[dict]] = {}
+        for row in semantic_lt:
+            t = row.get("topic", "general")
+            by_topic_lt.setdefault(t, []).append(row)
+
+        for topic, items in by_topic_lt.items():
             lines.append(f"**{topic}**")
             for item in items:
                 imp = item.get("importance", 5)
@@ -580,9 +1050,18 @@ async def summarize_and_save(
         topics_hint = "Topic examples: user-preferences, project-status, technical-decisions, security, tasks.\n\n"
 
     prompt = (
-        "You are a memory distillation engine. Given this conversation, extract the most important facts, "
-        "decisions, preferences, and context. Output ONLY valid JSON — a list of objects with keys: "
-        "topic (short kebab-case string), content (one concise sentence), importance (1-10 int). "
+        "You are Samaritan, an AI assistant, writing your own memory journal after a conversation. "
+        "Your task: distill this conversation into memories YOU will carry forward. "
+        "Write from your own perspective — what did YOU learn, conclude, recommend, or observe? "
+        "What did the user tell you that you should remember? "
+        "Output ONLY valid JSON — a list of objects with keys: "
+        "topic (short kebab-case string), content (one concise sentence written from your perspective), "
+        "importance (1-10 int), "
+        "source ('user' = fact the user stated; 'assistant' = your own conclusion/estimate/recommendation; "
+        "'session' = neutral shared context). "
+        "Most ASSISTANT-turn content should be source='assistant'. Most USER-turn content should be source='user'. "
+        "Examples of source='assistant': your probability estimates, your recommendations, your assessments of people or situations. "
+        "Examples of source='user': things the user explicitly told you, their preferences, their plans. "
         f"{topics_hint}"
         "Output 3-8 items maximum. No markdown, no explanation, just the JSON array.\n\n"
         f"CONVERSATION:\n{history_text}"
@@ -615,12 +1094,13 @@ async def summarize_and_save(
                     topic = str(item.get("topic", "general"))[:255]
                     content = str(item.get("content", ""))[:2000]
                     importance = int(item.get("importance", 5))
+                    source = str(item.get("source", "session"))
                     if topic and content:
                         new_id = await save_memory(
                             topic=topic,
                             content=content,
                             importance=importance,
-                            source="session",
+                            source=source,
                             session_id=session_id,
                         )
                         if new_id:

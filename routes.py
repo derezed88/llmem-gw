@@ -117,6 +117,9 @@ async def cmd_help(client_id: str):
         "  !reset                                    - clear conversation history\n"
         "  !help                                     - this help\n"
         "  !input_lines <n>                          - resize input area (client-side only)\n"
+        "  !tools                                    - show tool heat status (hot/cold) for current model\n"
+        "  !tools reset                              - decay all tool subscriptions to cold\n"
+        "  !tools hot <toolset,...>                  - force-subscribe toolsets immediately\n"
         "\n"
         "Database:\n"
         "  !db_query <sql>                           - run SQL directly (no LLM)\n"
@@ -127,6 +130,9 @@ async def cmd_help(client_id: str):
         "  !memory show <id> [short|long]            - show one row in full\n"
         "  !memory update <id> [tier=short] [importance=N] [content=text] [topic=label]\n"
         "  !memstats                                 - memory system health dashboard\n"
+        "  !membackfill                              - embed missing rows into Qdrant vector index\n"
+        "  !memage                                   - manually trigger one topic-chunk aging pass\n"
+        "  !memtrim [N]                              - hard-delete N oldest ST rows (escape valve; default: trim to LWM)\n"
         "\n"
         "Search & Extract:\n"
         "  !search_ddgs <query>                      - search via DuckDuckGo\n"
@@ -523,8 +529,14 @@ async def cmd_memstats(client_id: str):
         lines.append(f"  {f:<28}: {'on' if val else 'OFF'}{' (inactive—master off)' if not master_on else ''}")
     lines.append(f"  {'fuzzy_dedup_threshold':<28}: {mem_cfg.get('fuzzy_dedup_threshold', 0.78):.2f}")
     lines.append(f"  {'summarizer_model':<28}: {mem_cfg.get('summarizer_model', 'summarizer-anthropic')}")
+    hwm = age_cfg["short_hwm"]
+    lwm = age_cfg["short_lwm"]
     lines.append(f"  {'auto_memory_age':<28}: {'on' if age_cfg['auto_memory_age'] else 'OFF'}")
-    lines.append(f"  {'memory_age_entrycount':<28}: {age_cfg['memory_age_entrycount']}")
+    lines.append(f"  {'short_hwm (aging trigger)':<28}: {hwm} rows")
+    lines.append(f"  {'short_lwm (aging target)':<28}: {lwm} rows")
+    lines.append(f"  {'recent_turns_protect':<28}: {age_cfg['recent_turns_protect']} turns")
+    lines.append(f"  {'staleness_override_minutes':<28}: {age_cfg['staleness_override_minutes']} min ({age_cfg['staleness_override_minutes']//60}h)")
+    lines.append(f"  {'chunk_importance_threshold':<28}: {age_cfg['chunk_importance_threshold']}")
 
     def _timer(v: int) -> str:
         return "disabled" if v == -1 else f"{v} min"
@@ -533,14 +545,148 @@ async def cmd_memstats(client_id: str):
     lines.append(f"  {'memory_age_trigger_minutes':<28}: {age_cfg['memory_age_trigger_minutes']} min ({age_cfg['memory_age_trigger_minutes']//60}h)")
     lines.append(f"  {'memory_age_minutes_timer':<28}: {_timer(age_cfg['memory_age_minutes_timer'])}")
 
-    # Pressure indicator
-    if st_count > 0:
-        limit = age_cfg["memory_age_entrycount"]
-        pct = int(st_count / limit * 100) if limit > 0 else 0
-        bar = "#" * min(20, pct // 5) + "." * max(0, 20 - pct // 5)
-        lines.append(f"\n  ST pressure: [{bar}] {pct}% of {limit} row limit")
+    # Pressure bar vs HWM/LWM
+    pct_hwm = int(st_count / hwm * 100) if hwm > 0 else 0
+    filled  = min(20, pct_hwm // 5)
+    lwm_pos = min(20, int(lwm / hwm * 20)) if hwm > 0 else 0
+    bar_chars = list("." * 20)
+    for i in range(filled):
+        bar_chars[i] = "#"
+    if 0 <= lwm_pos < 20:
+        bar_chars[lwm_pos] = "|"  # LWM marker
+    bar = "".join(bar_chars)
+    status = "AGING NOW" if st_count >= hwm else ("near HWM" if pct_hwm >= 80 else "ok")
+    lines.append(f"\n  ST pressure  [{bar}] {st_count}/{hwm} rows ({pct_hwm}%)  LWM={lwm}  [{status}]")
 
     await push_tok(client_id, "\n".join(lines))
+    await conditional_push_done(client_id)
+
+
+async def cmd_membackfill(client_id: str):
+    """
+    !membackfill — embed and upsert any MySQL memory rows missing from Qdrant.
+    Compares all MySQL row IDs against Qdrant point IDs; only processes the gap.
+    """
+    from database import execute_sql
+    from memory import _ST, _LT, _parse_table
+
+    try:
+        from plugin_memory_vector_qdrant import get_vector_api
+        vec = get_vector_api()
+        if not vec:
+            await push_tok(client_id, "Vector plugin not available.")
+            await conditional_push_done(client_id)
+            return
+    except Exception as e:
+        await push_tok(client_id, f"Vector plugin error: {e}")
+        await conditional_push_done(client_id)
+        return
+
+    await push_tok(client_id, "Scanning for missing Qdrant points...")
+
+    try:
+        qdrant_ids = vec.get_all_point_ids()
+    except Exception as e:
+        await push_tok(client_id, f"Failed to fetch Qdrant point IDs: {e}")
+        await conditional_push_done(client_id)
+        return
+
+    st_raw = await execute_sql(f"SELECT id, topic, content, importance FROM {_ST}")
+    lt_raw = await execute_sql(f"SELECT id, topic, content, importance FROM {_LT}")
+    st_rows = _parse_table(st_raw)
+    lt_rows = _parse_table(lt_raw)
+
+    missing_st = [r for r in st_rows if int(r["id"]) not in qdrant_ids]
+    missing_lt = [r for r in lt_rows if int(r["id"]) not in qdrant_ids]
+    total_missing = len(missing_st) + len(missing_lt)
+
+    if total_missing == 0:
+        await push_tok(client_id, f"No drift — all {len(qdrant_ids)} Qdrant points match MySQL.")
+        await conditional_push_done(client_id)
+        return
+
+    await push_tok(client_id, f"Found {total_missing} missing ({len(missing_st)} ST, {len(missing_lt)} LT). Backfilling...")
+
+    saved_st = await vec.backfill(missing_st, tier="short") if missing_st else 0
+    saved_lt = await vec.backfill(missing_lt, tier="long")  if missing_lt else 0
+
+    await push_tok(client_id, f"Done. Upserted {saved_st} short-term + {saved_lt} long-term rows into Qdrant.")
+    await conditional_push_done(client_id)
+
+
+async def cmd_memage(client_id: str):
+    """
+    !memage — manually trigger one full aging pass (count-pressure + staleness).
+    Uses the same logic as the background tasks but runs immediately.
+    """
+    from memory import age_by_count, age_by_minutes, _age_cfg, _st_count
+
+    cfg     = _age_cfg()
+    before  = await _st_count()
+    await push_tok(client_id, f"ST rows before: {before} (HWM={cfg['short_hwm']}, LWM={cfg['short_lwm']})\n")
+    await push_tok(client_id, "Running count-pressure aging pass...")
+
+    deleted_count = await age_by_count()
+    mid = await _st_count()
+    await push_tok(client_id, f" done ({deleted_count} rows deleted, ST now={mid})\n")
+
+    await push_tok(client_id, "Running staleness aging pass...")
+    deleted_min = await age_by_minutes(trigger_minutes=cfg["memory_age_trigger_minutes"])
+    after = await _st_count()
+    await push_tok(
+        client_id,
+        f" done ({deleted_min} rows deleted, ST now={after})\n"
+        f"Total deleted: {deleted_count + deleted_min} rows.\n"
+    )
+    await conditional_push_done(client_id)
+
+
+async def cmd_memtrim(client_id: str, arg: str):
+    """
+    !memtrim [N] — hard-delete N oldest/least-important ST rows without summarizing.
+    If N is omitted, trims to short_lwm.
+    Escape valve for when topic-chunk aging can't make progress.
+    """
+    from memory import trim_st_to_lwm, _st_count, _age_cfg
+    from database import execute_sql
+    from memory import _ST, _parse_table
+
+    cfg    = _age_cfg()
+    before = await _st_count()
+
+    if arg.strip().isdigit():
+        n = int(arg.strip())
+        await push_tok(client_id, f"Hard-trimming {n} oldest ST rows (ST before={before})...\n")
+        # Fetch target rows and delete them
+        try:
+            from plugin_memory_vector_qdrant import get_vector_api
+            vec = get_vector_api()
+        except Exception:
+            vec = None
+        try:
+            import asyncio
+            rows_raw = await execute_sql(
+                f"SELECT id FROM {_ST} ORDER BY importance ASC, last_accessed ASC LIMIT {n}"
+            )
+            rows = _parse_table(rows_raw)
+            deleted = 0
+            for r in rows:
+                rid = r.get("id")
+                if rid:
+                    await execute_sql(f"DELETE FROM {_ST} WHERE id = {int(rid)}")
+                    deleted += 1
+                    if vec:
+                        asyncio.create_task(vec.delete_memory(int(rid)))
+            after = await _st_count()
+            await push_tok(client_id, f"Deleted {deleted} rows. ST now={after}.\n")
+        except Exception as e:
+            await push_tok(client_id, f"Error during trim: {e}\n")
+    else:
+        await push_tok(client_id, f"Trimming ST to LWM={cfg['short_lwm']} (ST before={before})...\n")
+        deleted = await trim_st_to_lwm()
+        after   = await _st_count()
+        await push_tok(client_id, f"Deleted {deleted} rows. ST now={after}.\n")
+
     await conditional_push_done(client_id)
 
 
@@ -804,23 +950,95 @@ async def cmd_reset(client_id: str, session: dict):
         try:
             from memory import summarize_and_save
             summarizer_model = _memory_cfg().get("summarizer_model", "summarizer-anthropic")
-            await push_tok(client_id, "[memory] Summarizing session to memory...\n")
+            _reset_suppress = session.get("tool_suppress", False)
+            if not _reset_suppress:
+                await push_tok(client_id, "[memory] Summarizing session to memory...\n")
             status = await summarize_and_save(
                 session_id=client_id,
                 history=history,
                 model_key=summarizer_model,
             )
-            await push_tok(client_id, f"[memory] {status}\n")
+            if not _reset_suppress:
+                await push_tok(client_id, f"[memory] {status}\n")
         except Exception as _mem_err:
             log.warning(f"cmd_reset: memory summarize failed: {_mem_err}")
 
     session["history"] = []
+    session["tool_subscriptions"] = {}
+    session["tool_list_injected"] = False
     model_cfg = LLM_REGISTRY.get(session.get("model", ""), {})
     import plugin_history_default as _phd
     session["history_max_ctx"] = _phd.compute_effective_max_ctx(model_cfg)
     delete_history(client_id)
     await push_tok(client_id, f"Conversation history cleared ({history_len} messages removed).")
     await conditional_push_done(client_id)
+
+async def cmd_tools(client_id: str, arg: str, session: dict):
+    """
+    !tools                        - show heat status of all tools for current model
+    !tools reset                  - decay all subscriptions to cold, re-baseline
+    !tools hot <toolsets>         - force-subscribe toolsets (comma or space separated)
+    """
+    from config import LLM_REGISTRY, LLM_TOOLSETS, LLM_TOOLSET_META
+    from agents import _compute_active_tools, _subscribe_toolset
+
+    model_key = session.get("model", "")
+    cfg = LLM_REGISTRY.get(model_key, {})
+    authorized_toolsets = cfg.get("llm_tools", [])
+    subs = session.setdefault("tool_subscriptions", {})
+
+    subcmd = arg.strip().lower() if arg else ""
+
+    if subcmd == "reset":
+        session["tool_subscriptions"] = {}
+        session["tool_list_injected"] = False
+        await push_tok(client_id, "Tool subscriptions cleared. Tool list will re-inject on next turn.")
+        await conditional_push_done(client_id)
+        return
+
+    if subcmd.startswith("hot"):
+        rest = subcmd[3:].strip().replace(",", " ").split()
+        if not rest:
+            await push_tok(client_id, "Usage: !tools hot <toolset1> [toolset2 ...]")
+            await conditional_push_done(client_id)
+            return
+        activated = []
+        unknown = []
+        for ts in rest:
+            if ts in authorized_toolsets and ts in LLM_TOOLSETS:
+                _subscribe_toolset(session, ts, call_count=1)
+                activated.append(ts)
+            else:
+                unknown.append(ts)
+        msg_parts = []
+        if activated:
+            msg_parts.append(f"Force-subscribed: {', '.join(activated)}")
+        if unknown:
+            msg_parts.append(f"Unknown/unauthorized: {', '.join(unknown)}")
+        await push_tok(client_id, "\n".join(msg_parts))
+        await conditional_push_done(client_id)
+        return
+
+    # Default: show heat status table
+    lines = [f"Tool heat status — model: {model_key}"]
+    lines.append(f"{'Toolset':<16} {'Status':<18} {'Tools'}")
+    lines.append("-" * 70)
+    for ts_name in authorized_toolsets:
+        meta = LLM_TOOLSET_META.get(ts_name, {})
+        tools_in_set = LLM_TOOLSETS.get(ts_name, [ts_name])
+        if meta.get("always_active", True):
+            status = "always-active"
+        else:
+            sub = subs.get(ts_name, {})
+            heat = sub.get("heat", 0)
+            call_count = sub.get("call_count", 0)
+            heat_curve = meta.get("heat_curve", [])
+            cap = heat_curve[-1] if heat_curve else "?"
+            status = f"hot heat={heat}/{cap} calls={call_count}" if heat > 0 else "cold"
+        lines.append(f"  {ts_name:<14} {status:<18} {', '.join(tools_in_set)}")
+    await push_tok(client_id, "\n".join(lines))
+    await conditional_push_done(client_id)
+
 
 async def cmd_session(client_id: str, arg: str):
     """
@@ -1018,6 +1236,36 @@ async def cmd_vscode(client_id: str, arg: str):
     await conditional_push_done(client_id)
 
 
+async def cmd_stream(client_id: str, arg: str, session: dict):
+    """!stream [0-3] — show or set response streaming/latency optimization level.
+
+    0: off — ainvoke(), fresh client per request, serial enrich (default, conservative)
+    1: LLM client cache per model-key (~100–200ms saved per turn)
+    2: + parallel auto-enrich with 300ms timeout (inject if ready, defer if slow)
+    3: + astream() sentence-chunking to TTS (first sentence arrives in ~1s)
+    """
+    LEVELS = {
+        "0": "off — ainvoke(), fresh client, serial enrich",
+        "1": "LLM client cache per model-key (~100–200ms saved)",
+        "2": "+ parallel auto-enrich, 300ms timeout, inject-or-defer",
+        "3": "+ astream() sentence-chunking to TTS",
+    }
+    arg = arg.strip()
+    if not arg:
+        cur = session.get("stream_level", 0)
+        lines = [f"stream_level: {cur}\n"]
+        for k, v in LEVELS.items():
+            marker = "▶" if str(cur) == k else " "
+            lines.append(f" {marker} {k}: {v}")
+        await push_tok(client_id, "\n".join(lines) + "\n")
+    elif arg in LEVELS:
+        session["stream_level"] = int(arg)
+        await push_tok(client_id, f"Stream level set to {arg}: {LEVELS[arg]}\n")
+    else:
+        await push_tok(client_id, "Usage: !stream [0-3]\n" + "\n".join(f"  {k}: {v}" for k, v in LEVELS.items()) + "\n")
+    await conditional_push_done(client_id)
+
+
 async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip: str = None):
     from state import get_or_create_shorthand_id, load_history, load_session_config
 
@@ -1045,6 +1293,12 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
         # a model that explicitly requires suppression.
         _effective_tool_suppress = _model_tool_suppress or prior_cfg.get("tool_suppress", False)
         _effective_mss = model_cfg.get("memory_scan_suppress", False) or prior_cfg.get("memory_scan_suppress", False)
+        # agent_call_stream: model False wins (restrictive); model None defers to prior_cfg/default
+        _model_stream = model_cfg.get("agent_call_stream", None)
+        _effective_stream = (False if _model_stream is False else prior_cfg.get("agent_call_stream", True))
+        # stream_level: model sets default if specified; prior_cfg (user !stream command) overrides
+        _model_stream_level = model_cfg.get("stream_level", None)
+        _effective_stream_level = prior_cfg.get("stream_level", _model_stream_level if _model_stream_level is not None else 0)
         sessions[client_id] = {
             "model": model_key,
             "history": prior_history,
@@ -1052,11 +1306,13 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
             "tool_preview_length": prior_cfg.get("tool_preview_length", get_default_tool_preview_length()),
             "tool_suppress": _effective_tool_suppress,
             "memory_scan_suppress": _effective_mss,
+            "agent_call_stream": _effective_stream,
+            "stream_level": _effective_stream_level,
             "_client_id": client_id,
             "created_at": _time_init.time(),
+            "tool_subscriptions": {},
+            "tool_list_injected": False,
         }
-        if "agent_call_stream" in prior_cfg:
-            sessions[client_id]["agent_call_stream"] = prior_cfg["agent_call_stream"]
         # Assign shorthand ID when session is created
         get_or_create_shorthand_id(client_id)
         # Age stale short-term memories to long-term on every session start (new or rehydrated)
@@ -1110,6 +1366,8 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
                     await cmd_help(client_id)
                 elif cmd == "reset":
                     await cmd_reset(client_id, session)
+                elif cmd == "tools":
+                    await cmd_tools(client_id, arg, session)
                 elif cmd == "db_query":
                     await cmd_db_query(client_id, arg)
                 elif cmd in ("search_ddgs", "search_google", "search_tavily", "search_xai"):
@@ -1152,6 +1410,14 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
                     await cmd_memory(client_id, arg)
                 elif cmd == "memstats":
                     await cmd_memstats(client_id)
+                elif cmd == "membackfill":
+                    await cmd_membackfill(client_id)
+                elif cmd == "memage":
+                    await cmd_memage(client_id)
+                elif cmd == "memtrim":
+                    await cmd_memtrim(client_id, arg)
+                elif cmd == "stream":
+                    await cmd_stream(client_id, arg, session)
                 elif get_plugin_command(cmd) is not None:
                     await cmd_plugin_command(client_id, cmd, arg)
                 else:
@@ -1184,6 +1450,9 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
             return
         if cmd == "reset":
             await cmd_reset(client_id, session)
+            return
+        if cmd == "tools":
+            await cmd_tools(client_id, arg, session)
             return
         if cmd == "db_query":
             await cmd_db_query(client_id, arg)
@@ -1243,6 +1512,18 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
         if cmd == "memstats":
             await cmd_memstats(client_id)
             return
+        if cmd == "membackfill":
+            await cmd_membackfill(client_id)
+            return
+        if cmd == "memage":
+            await cmd_memage(client_id)
+            return
+        if cmd == "memtrim":
+            await cmd_memtrim(client_id, arg)
+            return
+        if cmd == "stream":
+            await cmd_stream(client_id, arg, session)
+            return
         if cmd == "stop":
             await cmd_stop(client_id)
             return
@@ -1298,10 +1579,30 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
     try:
         final = await dispatch_llm(session["model"], session["history"], client_id)
         if final:
+            # Strip memory_save() calls from final when memory_scan is disabled —
+            # keeps history and conv_log clean of inline save noise.
+            if not model_cfg.get("memory_scan", False):
+                from agents import _strip_memory_calls
+                final = _strip_memory_calls(final)
             session["history"].append({"role": "assistant", "content": final})
             # Post-response chain pass: plugins that inspect history[-1]["role"] == "assistant"
             # can filter or replace the response (e.g. security scanning).
             session["history"] = _run_history_chain(session["history"], session, model_cfg)
+            # Verbatim conversation logging — save user prompt + assistant response as paired
+            # memory rows when the model has conv_log enabled.
+            if model_cfg.get("conv_log"):
+                try:
+                    from memory import save_conversation_turn
+                    _, _, _topic = await save_conversation_turn(
+                        user_text=stripped,
+                        assistant_text=final,
+                        session_id=client_id,
+                    )
+                    if _topic:
+                        session["current_topic"] = _topic
+                except Exception as _cl_err:
+                    import logging as _log
+                    _log.getLogger("routes").warning(f"conv_log save failed: {_cl_err}")
         else:
             # Remove dangling user message if LLM returned empty — prevents consecutive
             # user turns in history, which causes Gemini to return empty on next request
@@ -1345,6 +1646,10 @@ async def endpoint_stream(request: Request):
         _model_tool_suppress = _mcfg.get("tool_suppress", get_default_tool_suppress())
         _effective_tool_suppress = _model_tool_suppress or prior_cfg.get("tool_suppress", False)
         _effective_mss = _mcfg.get("memory_scan_suppress", False) or prior_cfg.get("memory_scan_suppress", False)
+        _model_stream = _mcfg.get("agent_call_stream", None)
+        _effective_stream = (False if _model_stream is False else prior_cfg.get("agent_call_stream", True))
+        _model_stream_level = _mcfg.get("stream_level", None)
+        _effective_stream_level = prior_cfg.get("stream_level", _model_stream_level if _model_stream_level is not None else 0)
         sessions[client_id] = {
             "model": DEFAULT_MODEL,
             "history": prior_history,
@@ -1352,10 +1657,12 @@ async def endpoint_stream(request: Request):
             "tool_preview_length": prior_cfg.get("tool_preview_length", get_default_tool_preview_length()),
             "tool_suppress": _effective_tool_suppress,
             "memory_scan_suppress": _effective_mss,
+            "agent_call_stream": _effective_stream,
+            "stream_level": _effective_stream_level,
             "_client_id": client_id,
+            "tool_subscriptions": {},
+            "tool_list_injected": False,
         }
-        if "agent_call_stream" in prior_cfg:
-            sessions[client_id]["agent_call_stream"] = prior_cfg["agent_call_stream"]
         get_or_create_shorthand_id(client_id)
         # Age stale short-term memories to long-term on every session start (new or rehydrated)
         import asyncio as _asyncio

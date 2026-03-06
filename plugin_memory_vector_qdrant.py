@@ -283,6 +283,25 @@ class QdrantVectorPlugin(BasePlugin):
         log.info(f"backfill: upserted {saved}/{len(rows)} rows (tier={tier})")
         return saved
 
+    def get_all_point_ids(self) -> set[int]:
+        """Return all point IDs currently in Qdrant (scrolls all pages)."""
+        ids: set[int] = set()
+        offset = None
+        while True:
+            result, next_offset = self._qc.scroll(
+                collection_name=self._cfg["collection"],
+                offset=offset,
+                limit=1000,
+                with_payload=False,
+                with_vectors=False,
+            )
+            for p in result:
+                ids.add(p.id)
+            if next_offset is None:
+                break
+            offset = next_offset
+        return ids
+
     # ------------------------------------------------------------------
     # Config snapshot (for !memstats etc.)
     # ------------------------------------------------------------------

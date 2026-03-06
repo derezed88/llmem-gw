@@ -76,10 +76,11 @@ The combination of persistent memory, writable system prompt, and LLM access to 
 
 The pieces that make this possible:
 
-- **Persistent memory via MySQL and Google Drive** — the LLM stores facts, preferences, and outcomes across sessions. It can query what it learned yesterday and act on it today.
+- **Tiered persistent memory** — facts, preferences, and outcomes are stored in a three-tier hierarchy: short-term (hot context, injected every request), long-term (aged-out summaries, retrieved on demand), and cold archive (Google Drive). Memory ages automatically — short-term rows are summarised by the LLM and promoted to long-term without operator involvement.
+- **Semantic retrieval via vector search** — each turn, the agent embeds the current topic and queries a local Qdrant vector store to pull the most relevant long-term memories into context. Retrieval is score-gated and tier-aware: only memories that match the current topic surface, regardless of when they were stored.
+- **Topic-aware memory routing** — the agent tags every response with a `<<topic-slug>>` label. The system extracts this tag, uses it as the topic key for memory storage, and feeds it as the Qdrant query seed next turn. Memory stays coherent across long sessions without manual tagging.
 - **Writable, modular system prompt** — the LLM can append, replace, or delete sections of its own operating rules. A rule learned in one conversation becomes part of how it behaves in all future conversations.
 - **Full admin command access** — gate permissions, model selection, context limits, and rate limits are all tools the LLM can invoke. Tell it "use the local model for searches from now on" and it switches and remembers.
-- **PDDS memory hierarchy** — the agent follows a defined lookup chain (pretrain → DB → Drive → search) so it automatically draws on accumulated knowledge before reaching out to external sources.
 
 The result: an agent that gets better at your specific workflows the more you use it. It learns your terminology, stores your preferences, tightens its own behavior rules, and adapts its tool usage — without you writing code or editing config files. The operator retains control through gates and the system prompt's keyword guards, but within those bounds the agent is free to evolve.
 
@@ -194,7 +195,7 @@ That's it. [`plugin_loader.py`](plugin_loader.py) discovers it, wires it into th
 
 | Category | Tools |
 |---|---|
-| Memory / storage | `db_query` (MySQL), `google_drive` (list/read/write/search) |
+| Memory / storage | `db_query` (MySQL), `google_drive` (list/read/write/search), `memory_save`, `memory_recall`, `memory_age` |
 | Search | `search_ddgs` (no API key), `search_google`, `search_tavily`, `search_xai` |
 | Web | `url_extract` (Tavily content extraction) |
 | System | `get_system_info`, `read_system_prompt`, `update_system_prompt` |
@@ -509,6 +510,7 @@ Agent B ────HTTP──►    │   ChatOpenAI              │──► 
 | `plugin_search_google` | `search_google` | Google search via Gemini grounding |
 | `plugin_urlextract_tavily` | `url_extract` | Extract full text content from any URL via Tavily |
 | `plugin_tmux` | `tmux_new`, `tmux_exec`, `tmux_ls`, `tmux_kill_session`, `tmux_kill_server`, `tmux_history`, `tmux_history_limit` | Persistent PTY shell sessions — LLM can run shell commands and read output; whitelist/blacklist configurable |
+| `plugin_memory_vector_qdrant` | _(infrastructure)_ | Qdrant vector index for semantic memory retrieval. Embeds memory rows via a local embedding model and provides scored nearest-neighbour lookup by topic. MySQL remains the source of truth; Qdrant is the retrieval index. Requires a running Qdrant instance and a compatible embedding endpoint (e.g. nomic-embed-text via llama.cpp). |
 
 **History** — how conversation context is managed:
 

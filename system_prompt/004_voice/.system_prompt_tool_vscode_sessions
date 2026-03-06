@@ -1,0 +1,39 @@
+## tool-vscode-sessions: vscode_sessions_list and vscode_sessions_read tool definitions
+
+### vscode_sessions_list(date, project) -> str
+List local Claude Code chat sessions on this machine.
+
+Parameters:
+  date    -- ISO date prefix filter e.g. "2026-02-24". Leave empty for all dates.
+  project -- partial project path filter e.g. "agent-mcp". Leave empty for all projects.
+
+Returns a compact list: date, project name, 8-char ID prefix, and session title.
+
+### vscode_sessions_read(session_ids, mode, model) -> str
+Read one or more local Claude Code sessions into context.
+
+Parameters:
+  session_ids -- comma-separated session UUIDs or 8-char prefixes from vscode_sessions_list.
+  mode        -- "full" (default): verbatim user+assistant text. Prefer this — you summarize the
+                 content yourself after reading it. No extra API call.
+                 "summary": pre-summarized via a second llm_call before returning. Only use this
+                 if the session is clearly too large to fit in your context window.
+  model       -- Only used with mode="summary". agent-mcp model key for pre-summarization.
+                 Empty = current session model.
+
+Returns assembled session text with a header per session. Tool calls and results are stripped;
+only conversational turns are included.
+
+When to use:
+- The user asks what they worked on, what progress was made, or what decisions were taken
+  in a past VSCode/Claude Code session.
+- The user references a past session by project name, date, or topic.
+- The user asks you to summarize or continue work from a previous session.
+
+Workflow:
+1. Call vscode_sessions_list with a project= and/or date= filter to find candidates.
+2. Call vscode_sessions_read with the relevant session ID(s).
+   - Use mode="summary" for any session listed as >500kB. Large sessions will overflow
+     your context and prevent you from completing subsequent steps.
+   - Use mode="full" only for sessions clearly under 500kB.
+3. Reason over the returned content directly — it is now in your context.

@@ -1,64 +1,72 @@
 {
-  "version": "1.0.0",
+  "version": "1.1.0",
   "toolsets": {
-    "core": [
-      "get_system_info",
-      "help",
-      "llm_list",
-      "llm_call",
-      "sleep",
-      "reset",
-      "session"
-    ],
-    "admin": [
-      "model",
-      "llm_tools",
-      "model_cfg",
-      "sysprompt_cfg",
-      "config_cfg",
-      "limits_cfg"
-    ],
-    "db": [
-      "db_query"
-    ],
-    "search": [
-      "search_ddgs",
-      "search_google",
-      "search_tavily",
-      "search_xai"
-    ],
-    "drive": [
-      "google_drive"
-    ],
-    "vscode": [
-      "vscode_sessions_list",
-      "vscode_sessions_read"
-    ],
-    "extract": [
-      "url_extract"
-    ],
-    "agent": [
-      "agent_call"
-    ],
-    "tmux": [
-      "tmux_new",
-      "tmux_exec",
-      "tmux_ls",
-      "tmux_kill_session",
-      "tmux_kill_server",
-      "tmux_history",
-      "tmux_history_limit",
-      "tmux_call_limit"
-    ],
-    "memory": [
-      "memory_save",
-      "memory_recall",
-      "memory_age",
-      "memory_update"
-    ]
+    "tool_list": {
+      "tools": ["tool_list"],
+      "always_active": true,
+      "sp_section": null
+    },
+    "core": {
+      "tools": ["get_system_info", "help", "llm_list", "llm_call", "sleep", "reset", "session"],
+      "always_active": true,
+      "sp_section": null
+    },
+    "admin": {
+      "tools": ["model", "llm_tools", "model_cfg", "sysprompt_cfg", "config_cfg", "limits_cfg"],
+      "always_active": true,
+      "sp_section": null
+    },
+    "db": {
+      "tools": ["db_query"],
+      "always_active": false,
+      "heat_curve": [3, 5, 8],
+      "sp_section": "tool_db_query"
+    },
+    "search": {
+      "tools": ["search_ddgs", "search_google", "search_tavily", "search_xai"],
+      "always_active": false,
+      "heat_curve": [3, 4, 6],
+      "sp_section": "tool_search"
+    },
+    "drive": {
+      "tools": ["google_drive"],
+      "always_active": false,
+      "heat_curve": [3, 5, 8],
+      "sp_section": "tool_google_drive"
+    },
+    "vscode": {
+      "tools": ["vscode_sessions_list", "vscode_sessions_read"],
+      "always_active": false,
+      "heat_curve": [2, 4],
+      "sp_section": "tool_vscode_sessions"
+    },
+    "extract": {
+      "tools": ["url_extract"],
+      "always_active": false,
+      "heat_curve": [2, 3],
+      "sp_section": null
+    },
+    "agent": {
+      "tools": ["agent_call"],
+      "always_active": false,
+      "heat_curve": [3, 5],
+      "sp_section": null
+    },
+    "tmux": {
+      "tools": ["tmux_new", "tmux_exec", "tmux_ls", "tmux_kill_session", "tmux_kill_server", "tmux_history", "tmux_history_limit", "tmux_call_limit"],
+      "always_active": false,
+      "heat_curve": [3, 5, 8],
+      "sp_section": null
+    },
+    "memory": {
+      "tools": ["memory_save", "memory_recall", "memory_age", "memory_update"],
+      "always_active": false,
+      "heat_curve": [3, 5, 8],
+      "sp_section": null
+    }
   },
   "metadata": {
-    "last_modified": "2026-02-25",
-    "notes": "Named toolsets for per-model tool binding. Each model references toolset names in its llm_tools array."
+    "last_modified": "2026-03-05",
+    "notes": "Named toolsets for per-model tool binding. Toolsets with always_active=false participate in hot/cold lifecycle. heat_curve[i] = heat after (i+1) calls; last value is cap. Decay: -1 per turn unused."
   }
 }

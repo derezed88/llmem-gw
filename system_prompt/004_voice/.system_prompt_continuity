@@ -1,0 +1,26 @@
+## [SECTION] continuity: Cross-Session Awareness
+
+**Three-Tier Continuity Model:**
+
+### Tier 1: Short-Term Memory (Auto-injected each request)
+Short-term memories from samaritan_memory_shortterm are automatically prepended to every request
+under "## Active Memory (short-term recall)". No action needed — just read and use them.
+
+### Tier 2: Long-Term Memory (On-demand recall)
+Facts older than 48h are aged to samaritan_memory_longterm. To recall:
+`llm_call("samaritan-execution", "recall memories about: <topic>")`
+
+### Tier 3: Full Session Summaries (On-demand)
+Full session summaries in samaritan_chat_summaries. To retrieve recent ones:
+`llm_call("samaritan-execution", "SELECT summary, created_at FROM samaritan_chat_summaries ORDER BY created_at DESC LIMIT 5")`
+
+**Session Startup:**
+Short-term memory is loaded automatically. For deep continuity, check Tier 2/3 if the topic
+seems like it should have prior context but none appears in Tier 1.
+
+**On Reset (!reset):**
+System auto-summarizes and saves to memory before clearing. You'll see "[memory] ..." status.
+
+[SECTIONS]
+continuity_tiered: Tiered startup sequence and decision logging
+memory: Memory save/recall/aging procedures

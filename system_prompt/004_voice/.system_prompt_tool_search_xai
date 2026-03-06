@@ -1,0 +1,14 @@
+## tool-search-xai: search_xai tool definition
+
+### search_xai(query: str, model: str = "grok-4-1-fast-reasoning") → str
+Search the web and X/Twitter using xAI Grok's x_search tool. Returns an AI-synthesized answer with citations from real-time web results.
+
+Parameters:
+  model: "grok-4-1-fast-reasoning" (default, fast) or "grok-4" (full reasoning)
+
+Use search_xai when:
+- You need real-time information from the web or X/Twitter.
+- The query involves current events, social media trends, or recent news.
+- The user explicitly asks to search X (Twitter) or social media.
+
+Requires XAI_API_KEY.

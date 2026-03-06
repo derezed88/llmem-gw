@@ -288,13 +288,20 @@ def load_system_prompt() -> str:
     return _cached_full_prompt
 
 
-def load_prompt_for_folder(folder: str) -> str:
+def load_prompt_for_folder(folder: str, active_tools: set[str] | None = None,
+                           cold_tools: list[str] | None = None) -> str:
     """
     Stateless: load and assemble the system prompt from a specific folder.
     Does NOT mutate any global state — safe to call for any model at any time.
 
     The folder must contain a '.system_prompt' root file and optional
     '.system_prompt_<name>' section files.
+
+    active_tools: if provided, sections whose sp_section maps to a tool section file
+        are only included if that tool is in active_tools. Always-active toolset
+        sections are always included regardless.
+    cold_tools: if provided, a hint line listing cold tool names is appended to the
+        tools section for model awareness.
 
     Returns the assembled prompt string.
     """
@@ -312,9 +319,27 @@ def load_prompt_for_folder(folder: str) -> str:
 
     main_paragraph, section_list = _parse_main_prompt(content)
 
+    # Build a set of sp_section names that are active (from LLM_TOOLSET_META).
+    # Sections not in this set that correspond to a tool section file are skipped.
+    active_sp_sections: set[str] | None = None
+    if active_tools is not None:
+        from config import LLM_TOOLSET_META, LLM_TOOLSETS
+        active_sp_sections = set()
+        for ts_name, meta in LLM_TOOLSET_META.items():
+            sp_sec = meta.get("sp_section")
+            if not sp_sec:
+                continue
+            # Include this sp_section if any of its tools are in active_tools
+            ts_tools = LLM_TOOLSETS.get(ts_name, [])
+            if any(t in active_tools for t in ts_tools):
+                active_sp_sections.add(sp_sec)
+
     all_seen: Set[str] = set()
     sections: List[Dict] = []
     for short_name, description in section_list:
+        # If active_sp_sections is set and this section is a tool section not in it, skip
+        if active_sp_sections is not None and short_name.startswith("tool_") and short_name not in active_sp_sections:
+            continue
         loaded = _load_section_recursive(
             short_name, description, depth=0, parent=None,
             ancestors=set(), all_seen=all_seen, folder=folder
@@ -332,6 +357,11 @@ def load_prompt_for_folder(folder: str) -> str:
             parts.append(header + "\n" + body)
         else:
             parts.append(header)
+
+    # Append cold tool hint if any tools are cold
+    if cold_tools:
+        parts.append(f"\n\nCold tools available via tool_list: {', '.join(sorted(cold_tools))}")
+
     return '\n'.join(parts)
 
 

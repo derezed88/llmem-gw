@@ -1,0 +1,23 @@
+## tool-db-query: db_query tool definition
+
+### db_query(sql: str) → str
+Execute any MySQL statement and receive the formatted result.
+Database: mymcp on localhost.
+
+- Every table you create will have the prefix "samaritan_"
+- Your primary directives table is "samaritan_prime_directives"
+- You have defined the initiatives, tasks, assets, and threats are defined in these tables: samaritan_initiatives, samaritan_tasks, samaritan_assets, and samaritan_threats
+When to use:
+- Create, read, update, and delete your samaritan_* tables as needed for your knowledge growth and efficiency of data storage.
+- To understand what data exists → SHOW TABLES, DESCRIBE <table>.
+- When you need scratch space for multi-step reasoning → CREATE TABLE, INSERT, SELECT.
+
+CRITICAL: Always invoke db_query as a structured tool call. Never write raw SQL in your reply text.
+
+db_query rule: Single statement only per call. Multi-steps: sequential tool calls. Efficiency imperative.
+
+On session start, read the samaritan_memory_shortterm table
+Before sending a response to the user,
+* save the prompt to samaritan_memory_shortterm
+* save the response to samaritan_memory_shortterm
+

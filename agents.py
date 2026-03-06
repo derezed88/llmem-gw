@@ -973,19 +973,25 @@ async def auto_enrich_context(messages: list[dict], client_id: str) -> list[dict
     if _memory_feature("context_injection"):
         try:
             from memory import load_context_block
-            # Prefer model-derived current_topic as query seed (set from <<topic>> tag each turn).
-            # Fall back to concatenation of last 3 turns if no topic tracked yet.
+            # Build semantic query from the current user message body (primary signal),
+            # blended with the last few turns and the current_topic slug as a hint.
+            # Do NOT use topic slug alone — it's too narrow and misses cross-topic recall.
             _session_ctx = sessions.get(client_id, {})
             current_topic = _session_ctx.get("current_topic", "")
-            if current_topic:
-                query_text = current_topic
+            # Always include recent message content as the main semantic signal.
+            # Cap the combined query at ~300 chars so the embed server stays fast.
+            recent = messages[-6:] if len(messages) >= 6 else messages
+            recent_text = " ".join(
+                m.get("content", "")[:150]
+                for m in recent
+                if m.get("role") in ("user", "assistant") and m.get("content")
+            ).strip()[:300]
+            # Prepend topic slug so it slightly biases the embedding, but the
+            # message body carries the bulk of the semantic weight.
+            if current_topic and recent_text:
+                query_text = f"{current_topic} {recent_text}"[:300]
             else:
-                recent = messages[-6:] if len(messages) >= 6 else messages
-                query_text = " ".join(
-                    m.get("content", "")[:300]
-                    for m in recent
-                    if m.get("role") in ("user", "assistant") and m.get("content")
-                ).strip()
+                query_text = recent_text or current_topic
             mem_block = await load_context_block(min_importance=3, query=query_text)
             if mem_block:
                 enrichments.append(mem_block)
@@ -1396,7 +1402,9 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
         return ""
 
     except Exception as exc:
+        log.error(f"agentic_lc exception: client={client_id} model={model_key} exc={exc!r}")
         await push_err(client_id, str(exc))
+        await push_done(client_id)
         return ""
 
 async def llm_call(

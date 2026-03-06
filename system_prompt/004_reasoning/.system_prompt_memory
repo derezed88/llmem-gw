@@ -9,55 +9,19 @@ Memory tiers:
 - **Long-term (MySQL)**: Aged-out facts. Semantically relevant rows are **automatically injected** under "## Long-term Memory (relevant recalled)" — check this section before calling memory_recall.
 - **Archive (Google Drive)**: Bulk summaries. Retrieved on demand.
 
-### On Session Reset (!reset)
-The system automatically:
-1. Summarizes the departing conversation via summarizer-anthropic
-2. Extracts topic-tagged facts and saves them to short-term memory
-3. Stores a full summary row
-4. Clears history
+### How Memory Is Saved
+You do NOT save memory manually. The system handles all saves automatically:
+- **Every turn**: The verbatim user message and your response are logged to short-term memory by the conv_log pipeline. No action required from you.
+- **On !reset**: The system summarises the departing conversation via summarizer-anthropic, saves topic-tagged facts to short-term, stores a full summary row, then clears history.
 
-You do NOT need to manually trigger this.
+Do NOT write `memory_save(...)` calls in your response. They will not execute and will appear as noise in the output (see behavior rule 7).
 
-### When to Save a Memory Explicitly
+### How Topics Work
+Each memory row has a topic label. Topics come from the `<<topic-slug>>` tag you prepend to every response (see behavior rule 8). The system extracts this tag and uses it as the topic for that turn's logged rows.
 
-**Every turn** — scan the user's message for saveable facts before responding (see behavior rule 8).
+**Topic consistency matters** — the same topic slug across turns groups related memories together and produces tighter vector search results. When the conversation topic shifts, update your slug; when it continues, keep it stable.
 
-**Topics are dynamic.** Your context includes a **Known topics** list (injected under ## Active Memory).
-- **Prefer existing topics** — reuse a known topic when a fact fits it
-- **Create new topics** when a fact genuinely doesn't fit any existing one
-- Topic names: lowercase, hyphenated, concise (e.g. `travel-plans`, `user-preferences`, `job-interviews`)
-
-**Importance scale:**
-- 6: useful context (preferences, recurring habits)
-- 7-8: concrete plans, people, relationships
-- 9: high-stakes decisions, key career/life events
-- 10: critical time-sensitive facts (imminent appointments)
-
-**Also save your own conclusions** — when you make an estimate, recommendation, assessment, or reach a conclusion, save it with `source='assistant'` so you can recall your own prior reasoning later. Examples:
-- Probability estimates ("65% chance Lee gyms tonight")
-- Model/tool recommendations ("summarizer-anthropic best for CoT tasks")
-- Assessments about people or situations ("Lee unlikely to gym on weekends based on pattern")
-- Decisions you reached ("decided to use Qdrant for semantic retrieval over keyword search")
-
-Use `source='user'` for facts the user explicitly stated, `source='assistant'` for your own conclusions and judgments, and `source='session'` for neutral shared context neither party "owns".
-
-**DO NOT save**: conversational filler, questions, greetings, or facts already in ## Active Memory with identical content.
-
-**CRITICAL**: You do NOT have `memory_save` as a registered tool. Instead, the system intercepts
-`memory_save(...)` calls written literally in your response text and executes them automatically.
-You MUST write the call in your response — silent prose about saving is not enough.
-
-Write each save on its own line in this exact format (no code fences — plain text only):
-memory_save(topic="travel-plans", content="Admin and Lee are visiting parents in San Jose after the Monday interview", importance=7)
-memory_save(topic="family", content="Admin's parents live in San Jose", importance=6, source="user")
-memory_save(topic="user-preferences", content="Lee prefers concise responses without filler phrases", importance=6, source="user")
-memory_save(topic="llm-delegation", content="I recommend summarizer-anthropic for CoT tasks based on quality testing", importance=7)
-memory_save(topic="lee-gym", content="I estimate 65% chance Lee gyms tonight given early finish and bag present", importance=6)
-
-**CRITICAL**: Always use double quotes `"` for all string arguments — never single quotes `'`. Single quotes inside content (e.g. apostrophes) will break the parser.
-Optionally add `source="user"` when saving something the user explicitly stated, or `source="session"` for neutral shared context. Omitting source defaults to `"assistant"` (your own perspective).
-
-The system will scan your response and execute each `memory_save(...)` line. You will not see a tool result — this is expected. Do not repeat the call or ask for confirmation.
+Topic names: lowercase, hyphenated, concise (e.g. `travel-plans`, `user-preferences`, `system-design`).
 
 ### When to Use memory_recall
 

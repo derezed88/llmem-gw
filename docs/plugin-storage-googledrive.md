@@ -39,12 +39,12 @@ FOLDER_ID=<Google Drive folder ID>
 1. Create a project in Google Cloud Console
 2. Enable the Google Drive API
 3. Create OAuth2 credentials (Desktop app)
-4. Download as `credentials.json` into the mymcp directory
+4. Download as `credentials.json` into the llmem-gw directory
 5. Run the server — it will open a browser for authorization on first use
 6. `token.json` is created automatically
 
 ## Enable
 
 ```bash
-python agentctl.py enable plugin_storage_googledrive
+python llmemctl.py enable plugin_storage_googledrive
 ```

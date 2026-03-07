@@ -148,8 +148,8 @@ async def run_agent(host: str = "0.0.0.0"):
         log.error("")
         log.error("Fix options:")
         log.error("  1. Stop the process already using the port")
-        log.error("  2. Change the port:  python agentctl.py port-set <plugin> <new_port>")
-        log.error("  3. List configured ports:  python agentctl.py port-list")
+        log.error("  2. Change the port:  python llmemctl.py port-set <plugin> <new_port>")
+        log.error("  3. List configured ports:  python llmemctl.py port-list")
         log.error("=" * 70)
         sys.exit(1)
 
@@ -289,8 +289,8 @@ def main():
         epilog="""
 Examples:
   python agent-mcp.py                 # Start with plugins from plugins-enabled.json
-  python agentctl.py list       # List available plugins
-  python agentctl.py enable plugin_llama_proxy  # Enable llama proxy
+  python llmemctl.py list       # List available plugins
+  python llmemctl.py enable plugin_llama_proxy  # Enable llama proxy
 
 Configuration Files:
   plugins-enabled.json    - Which plugins to enable

@@ -35,7 +35,7 @@ Environment variables:
     AIRS_SYNC_URL           Base URL override (takes priority over config)
 
 Adding to chain:
-    python agentctl.py history-chain-add plugin_history_sec_sync
+    python llmemctl.py history-chain-add plugin_history_sec_sync
 """
 
 import asyncio

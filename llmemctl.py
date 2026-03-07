@@ -265,7 +265,7 @@ class PluginManager:
             if all_missing_envs or all_missing_files:
                 print(f"  Then configure: .env vars and config files")
 
-            print(f"\n{Colors.CYAN}Detailed help:{Colors.RESET} {Colors.BOLD}python agentctl.py info <plugin_name>{Colors.RESET}")
+            print(f"\n{Colors.CYAN}Detailed help:{Colors.RESET} {Colors.BOLD}python llmemctl.py info <plugin_name>{Colors.RESET}")
 
         print()
 
@@ -478,7 +478,7 @@ class PluginManager:
             print(f"  {color}{plugin_name:<30}{Colors.RESET} {current_port:>6}  {port_key}{marker}")
 
         print()
-        print(f"  Change port: {Colors.BOLD}python agentctl.py port-set <plugin> <port>{Colors.RESET}")
+        print(f"  Change port: {Colors.BOLD}python llmemctl.py port-set <plugin> <port>{Colors.RESET}")
         print()
 
     def port_set(self, plugin_name: str, port: int) -> bool:

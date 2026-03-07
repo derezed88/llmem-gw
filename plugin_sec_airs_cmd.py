@@ -2,7 +2,7 @@
 plugin_sec_airs_cmd.py — !airs shell/Slack command for AIRS scan results.
 
 NOT a history chain plugin — named outside plugin_history_* intentionally so
-agentctl.py history-list does not discover it.  Loaded at startup by agent-mcp.py
+llmemctl.py history-list does not discover it.  Loaded at startup by agent-mcp.py
 via the regular plugin manifest.
 It reads violation data written by plugin_history_sec_async into the session dict
 and presents it on demand from any client (shell.py, Slack, open-webui, etc.).

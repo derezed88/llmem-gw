@@ -7,7 +7,7 @@ The MCP Agent is a multi-client AI agent server. It maintains persistent session
 ```
 Clients                 Server                          Backends
 ───────                 ──────                          ────────
-shell.py     ──SSE──►  agent-mcp.py                    OpenAI API (grok, gpt, local)
+shell.py     ──SSE──►  llmem-gw.py                    OpenAI API (grok, gpt, local)
 open-webui    ─HTTP─►  ┌──────────────────────┐        Gemini API
 LM Studio app ─HTTP─►  │  routes.py           │        Local llama.cpp / Ollama
 Slack  ─Socket Mode──►  │  (process_request)   │
@@ -32,7 +32,7 @@ Slack  ─Socket Mode──►  │  (process_request)   │
 
 | File | Responsibility |
 |---|---|
-| `agent-mcp.py` | Entry point. Initialises plugins, builds Starlette app, starts uvicorn |
+| `llmem-gw.py` | Entry point. Initialises plugins, builds Starlette app, starts uvicorn |
 | `config.py` | LLM registry (loaded from `llm-models.json`), environment loading, rate limit config |
 | `state.py` | In-memory session store, SSE queues, context vars |
 | `routes.py` | HTTP endpoints, `!command` routing, `@model` switching, `process_request()` |
@@ -199,7 +199,7 @@ Plugins are declared in `plugin-manifest.json` and enabled/disabled in `plugins-
 - `plugin_search_google` — `google_search` tool
 - `plugin_urlextract_tavily` — `url_extract` tool
 
-### Plugin loading sequence (agent-mcp.py startup)
+### Plugin loading sequence (llmem-gw.py startup)
 
 1. Read `plugin-manifest.json` — all known plugins and their metadata
 2. Read `plugins-enabled.json` — which plugins are active
@@ -247,14 +247,14 @@ These tools are also available as LLM tool calls with the same names.
 
 ## Swarm / Multi-Agent Coordination
 
-The `agent_call` tool allows any LLM session to contact another agent-mcp instance
+The `agent_call` tool allows any LLM session to contact another llmem-gw instance
 and return its response. This enables multi-agent workflows: delegation, verification,
 parallel perspectives, or fan-out across specialised nodes.
 
 ### How it works
 
 ```
-Primary node (human session)          Remote node (any agent-mcp instance)
+Primary node (human session)          Remote node (any llmem-gw instance)
 ────────────────────────────          ─────────────────────────────────────
 agentic_lc() calls agent_call()  ──► POST /api/v1/submit  (plugin_client_api)
                                        process_request() → LLM → tool calls

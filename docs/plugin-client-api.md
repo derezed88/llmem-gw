@@ -167,8 +167,8 @@ health = await client.health()              # {"status": "ok", ...}
 ## Port Configuration
 
 ```bash
-python agentctl.py port-list
-python agentctl.py port-set plugin_client_api 8777
+python llmemctl.py port-list
+python llmemctl.py port-set plugin_client_api 8777
 ```
 
 ---

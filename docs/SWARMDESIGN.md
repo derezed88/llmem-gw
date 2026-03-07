@@ -1,6 +1,6 @@
 # Swarm Design Guide
 
-This document describes the agent-mcp swarm foundation and the design space for extending it into a full multi-agent coordination system. The foundation is intentionally minimal — the transport and session plumbing are in place, but no discovery or naming scheme is built in. This leaves every topology option open for operators and contributors to implement as their use case demands.
+This document describes the llmem-gw swarm foundation and the design space for extending it into a full multi-agent coordination system. The foundation is intentionally minimal — the transport and session plumbing are in place, but no discovery or naming scheme is built in. This leaves every topology option open for operators and contributors to implement as their use case demands.
 
 ---
 
@@ -8,7 +8,7 @@ This document describes the agent-mcp swarm foundation and the design space for 
 
 The following is already implemented and working:
 
-**`plugin_client_api`** — each agent-mcp instance can expose a JSON/SSE HTTP API (port 8767 by default). Any process that can make HTTP requests can submit messages and receive streaming responses. No special protocol beyond HTTP/SSE.
+**`plugin_client_api`** — each llmem-gw instance can expose a JSON/SSE HTTP API (port 8767 by default). Any process that can make HTTP requests can submit messages and receive streaming responses. No special protocol beyond HTTP/SSE.
 
 **`agent_call(agent_url, message)`** — a core tool available to every LLM on every instance. The LLM calls another agent by URL, the remote agent processes the message through its full stack (LLM, tools, gates), and returns the complete response as a tool result. The calling LLM sees the result in its tool context and continues reasoning.
 
@@ -109,7 +109,7 @@ CREATE TABLE swarm_agents (
 **Startup registration** (could be a startup hook or a shell script):
 
 ```bash
-mysql -u $MYSQL_USER -p$MYSQL_PASS mymcp \
+mysql -u $MYSQL_USER -p$MYSQL_PASS llmem_gw \
   -e "INSERT INTO swarm_agents (name, url, model, description)
       VALUES ('NUC11', 'http://192.168.x.x:8767', 'qwen25', 'Local 7B model')
       ON DUPLICATE KEY UPDATE url=VALUES(url), last_seen=NOW();"

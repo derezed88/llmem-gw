@@ -4,7 +4,7 @@
 
 ```bash
 source venv/bin/activate
-python agent-mcp.py
+python llmem-gw.py
 ```
 
 In a second terminal:
@@ -18,7 +18,7 @@ Type `!help` to see all commands.
 
 Enable the llama proxy plugin first:
 ```bash
-python agentctl.py enable plugin_proxy_llama
+python llmemctl.py enable plugin_proxy_llama
 ```
 
 Then start the server — it now listens on both ports:
@@ -49,9 +49,9 @@ Prefix any message with `@ModelName` to use a different model for one turn:
 ## Managing plugins and models
 
 ```bash
-python agentctl.py           # interactive menu
-python agentctl.py list      # plugin status overview
-python agentctl.py models    # model list
+python llmemctl.py           # interactive menu
+python llmemctl.py list      # plugin status overview
+python llmemctl.py models    # model list
 ```
 
 See [ADMINISTRATION.md](ADMINISTRATION.md) for full details.

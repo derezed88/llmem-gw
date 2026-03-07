@@ -1,6 +1,6 @@
 # History Plugin Development Guide
 
-This guide is for developers and architects who want to experiment with or replace the conversation history management strategy in agent-mcp.
+This guide is for developers and architects who want to experiment with or replace the conversation history management strategy in llmem-gw.
 
 ---
 
@@ -131,7 +131,7 @@ return list(history[-max_ctx:])
 
 ## System-Wide Resource Configuration
 
-These values are stored in `plugins-enabled.json` at the top level and managed via `agentctl.py`:
+These values are stored in `plugins-enabled.json` at the top level and managed via `llmemctl.py`:
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -149,16 +149,16 @@ And in `plugin_config.plugin_history_default`:
 
 ## Chain Configuration
 
-### Via agentctl.py (persistent)
+### Via llmemctl.py (persistent)
 
 ```bash
-python agentctl.py history-list                         # show chain + config
-python agentctl.py history-chain-add plugin_history_foo # append to chain
-python agentctl.py history-chain-remove plugin_history_foo
-python agentctl.py history-chain-move plugin_history_foo 1  # move to position 1
-python agentctl.py history-maxctx 500                   # set agent_max_ctx
-python agentctl.py max-users 100                        # set max sessions
-python agentctl.py session-timeout 120                  # set idle timeout (minutes)
+python llmemctl.py history-list                         # show chain + config
+python llmemctl.py history-chain-add plugin_history_foo # append to chain
+python llmemctl.py history-chain-remove plugin_history_foo
+python llmemctl.py history-chain-move plugin_history_foo 1  # move to position 1
+python llmemctl.py history-maxctx 500                   # set agent_max_ctx
+python llmemctl.py max-users 100                        # set max sessions
+python llmemctl.py session-timeout 120                  # set idle timeout (minutes)
 ```
 
 ### Via runtime commands (in-memory, lost on restart unless persisted)
@@ -174,7 +174,7 @@ python agentctl.py session-timeout 120                  # set idle timeout (minu
 
 ## Writing a New History Plugin
 
-1. Create `plugin_history_yourname.py` in the `mymcp/` directory.
+1. Create `plugin_history_yourname.py` in the `llmem-gw/` directory.
 
 2. Implement the contract:
 
@@ -192,12 +192,12 @@ def on_model_switch(session, old_model, new_model, old_cfg, new_cfg):
 
 3. Verify it's discovered:
 ```bash
-python agentctl.py history-list
+python llmemctl.py history-list
 ```
 
 4. Add it to the chain:
 ```bash
-python agentctl.py history-chain-add plugin_history_yourname
+python llmemctl.py history-chain-add plugin_history_yourname
 ```
 
 5. Restart the agent for the chain to reload.
@@ -206,7 +206,7 @@ python agentctl.py history-chain-add plugin_history_yourname
 
 ## Plugin Discovery
 
-`agentctl.py` discovers history plugins by globbing `plugin_history_*.py` in the project directory. Any file matching that pattern is listed as "available". It is **not** in the chain unless explicitly added via `agentctl.py history-chain-add` or by editing `plugins-enabled.json` directly.
+`llmemctl.py` discovers history plugins by globbing `plugin_history_*.py` in the project directory. Any file matching that pattern is listed as "available". It is **not** in the chain unless explicitly added via `llmemctl.py history-chain-add` or by editing `plugins-enabled.json` directly.
 
 `plugin_history_default` is always first in the chain and cannot be removed or moved from position 0.
 

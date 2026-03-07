@@ -34,7 +34,7 @@ None beyond base requirements.
 ## Enable
 
 ```bash
-python agentctl.py enable plugin_proxy_llama
+python llmemctl.py enable plugin_proxy_llama
 ```
 
 ## Configuration

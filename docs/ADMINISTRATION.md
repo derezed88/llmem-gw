@@ -12,7 +12,7 @@
 
 ```bash
 git clone <repo>
-cd agent-mcp
+cd llmem-gw
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt   # or install per-plugin deps below
@@ -39,33 +39,33 @@ cp .env.example .env              # fill in API keys
 
 ```bash
 source venv/bin/activate
-python agent-mcp.py
+python llmem-gw.py
 ```
 
 The server starts on port **8765** (MCP/shell.py) by default. Optional flags:
 
 ```bash
-python agent-mcp.py --help
+python llmem-gw.py --help
 ```
 
 ---
 
-## System Administration (`agentctl.py`)
+## System Administration (`llmemctl.py`)
 
-All plugin and model configuration is done through `agentctl.py`. Run interactively or with CLI arguments.
+All plugin and model configuration is done through `llmemctl.py`. Run interactively or with CLI arguments.
 
 ```bash
-python agentctl.py           # interactive menu
-python agentctl.py <cmd>     # direct CLI
+python llmemctl.py           # interactive menu
+python llmemctl.py <cmd>     # direct CLI
 ```
 
 ### Plugin Commands
 
 ```bash
-python agentctl.py list                    # list all plugins with status
-python agentctl.py info <plugin_name>      # detailed info + setup instructions
-python agentctl.py enable <plugin_name>    # enable a plugin
-python agentctl.py disable <plugin_name>   # disable a plugin
+python llmemctl.py list                    # list all plugins with status
+python llmemctl.py info <plugin_name>      # detailed info + setup instructions
+python llmemctl.py enable <plugin_name>    # enable a plugin
+python llmemctl.py disable <plugin_name>   # disable a plugin
 ```
 
 **Plugin status indicators:**
@@ -128,17 +128,17 @@ The JSON value takes precedence over `.env` if both are set.
 ### Model Commands
 
 ```bash
-python agentctl.py models                              # list all models
-python agentctl.py model-info <model_name>            # detailed model info
-python agentctl.py model-add                          # interactive wizard
-python agentctl.py model <model_name>                 # set as default model
-python agentctl.py model-cfg list                     # list all models (compact)
-python agentctl.py model-cfg read <name>              # show full model config
-python agentctl.py model-cfg write <name> <field> <value>  # update a field
-python agentctl.py model-cfg copy <source> <new_name>      # clone a model
-python agentctl.py model-cfg enable <name>            # enable a model
-python agentctl.py model-cfg disable <name>           # disable a model
-python agentctl.py model-cfg delete <name>            # remove a model
+python llmemctl.py models                              # list all models
+python llmemctl.py model-info <model_name>            # detailed model info
+python llmemctl.py model-add                          # interactive wizard
+python llmemctl.py model <model_name>                 # set as default model
+python llmemctl.py model-cfg list                     # list all models (compact)
+python llmemctl.py model-cfg read <name>              # show full model config
+python llmemctl.py model-cfg write <name> <field> <value>  # update a field
+python llmemctl.py model-cfg copy <source> <new_name>      # clone a model
+python llmemctl.py model-cfg enable <name>            # enable a model
+python llmemctl.py model-cfg disable <name>           # disable a model
+python llmemctl.py model-cfg delete <name>            # remove a model
 ```
 
 **Safety rules:** The default model cannot be disabled or removed. Change the default first with `model <name>`.
@@ -146,9 +146,9 @@ python agentctl.py model-cfg delete <name>            # remove a model
 ### Rate and Depth Limit Commands
 
 ```bash
-python agentctl.py limits list                        # show all limits
-python agentctl.py limits read <key>                  # read a specific limit
-python agentctl.py limits write <key> <value>         # update a limit
+python llmemctl.py limits list                        # show all limits
+python llmemctl.py limits read <key>                  # read a specific limit
+python llmemctl.py limits write <key> <value>         # update a limit
 ```
 
 Limit keys: `max_at_llm_depth`, `max_agent_call_depth`, `max_tool_iterations`,
@@ -215,26 +215,26 @@ If absent, bare names `memory_shortterm`, `memory_longterm`, `chat_summaries` ar
 }
 ```
 
-#### `agentctl.py` memory commands
+#### `llmemctl.py` memory commands
 
 ```bash
-python agentctl.py memory status                                  # show all feature states + settings
-python agentctl.py memory enable                                  # enable master switch
-python agentctl.py memory disable                                 # disable everything
-python agentctl.py memory enable <feature>                        # enable one feature
-python agentctl.py memory disable <feature>                       # disable one feature
-python agentctl.py memory set fuzzy_dedup_threshold <0-1>        # adjust similarity threshold
-python agentctl.py memory set summarizer_model <model_key>       # change summarizer model
-python agentctl.py memory set auto_memory_age <true|false>        # enable/disable background aging
-python agentctl.py memory set short_hwm <n>                       # ST row count that triggers aging
-python agentctl.py memory set short_lwm <n>                       # target ST count after aging
-python agentctl.py memory set recent_turns_protect <n>            # last N ST rows' topics protected
-python agentctl.py memory set staleness_override_minutes <min>    # protected topics age past this
-python agentctl.py memory set chunk_importance_threshold <n>      # imp >= this promoted verbatim to LT
-python agentctl.py memory set memory_age_count_timer <min|-1>     # count-pressure interval (-1=off)
-python agentctl.py memory set memory_age_trigger_minutes <min>    # staleness threshold in minutes
-python agentctl.py memory set memory_age_minutes_timer <min|-1>   # staleness check interval (-1=off)
-python agentctl.py memory test                                    # live toggle test: disable, verify off, re-enable, verify on
+python llmemctl.py memory status                                  # show all feature states + settings
+python llmemctl.py memory enable                                  # enable master switch
+python llmemctl.py memory disable                                 # disable everything
+python llmemctl.py memory enable <feature>                        # enable one feature
+python llmemctl.py memory disable <feature>                       # disable one feature
+python llmemctl.py memory set fuzzy_dedup_threshold <0-1>        # adjust similarity threshold
+python llmemctl.py memory set summarizer_model <model_key>       # change summarizer model
+python llmemctl.py memory set auto_memory_age <true|false>        # enable/disable background aging
+python llmemctl.py memory set short_hwm <n>                       # ST row count that triggers aging
+python llmemctl.py memory set short_lwm <n>                       # target ST count after aging
+python llmemctl.py memory set recent_turns_protect <n>            # last N ST rows' topics protected
+python llmemctl.py memory set staleness_override_minutes <min>    # protected topics age past this
+python llmemctl.py memory set chunk_importance_threshold <n>      # imp >= this promoted verbatim to LT
+python llmemctl.py memory set memory_age_count_timer <min|-1>     # count-pressure interval (-1=off)
+python llmemctl.py memory set memory_age_trigger_minutes <min>    # staleness threshold in minutes
+python llmemctl.py memory set memory_age_minutes_timer <min|-1>   # staleness check interval (-1=off)
+python llmemctl.py memory test                                    # live toggle test: disable, verify off, re-enable, verify on
 ```
 
 All changes take effect immediately — no server restart required. The server re-reads `plugins-enabled.json` on every request.
@@ -389,7 +389,7 @@ Or in `llm-models.json`:
 
 There is no inbound command ACL — any client that can reach the port can send any message, including `!commands`. Tool access is controlled per-model via `llm_tools` in `llm-models.json`, but the human-facing command interface has no restrictions for API clients.
 
-This is intentional. The API port is for trusted orchestrators: other agent-mcp instances, automation scripts, and inter-agent swarms. Inbound restriction is out of scope; network-level controls (firewall, SSH tunnel, VPN) are expected to restrict who can reach the port at all.
+This is intentional. The API port is for trusted orchestrators: other llmem-gw instances, automation scripts, and inter-agent swarms. Inbound restriction is out of scope; network-level controls (firewall, SSH tunnel, VPN) are expected to restrict who can reach the port at all.
 
 ### Outbound Agent Message Filters (`OUTBOUND_AGENT_*`)
 
@@ -472,9 +472,9 @@ Examples:
 !model_cfg write gemini25f llm_tools_gates        (empty value = clear all gates)
 ```
 
-Via agentctl:
+Via llmemctl:
 ```bash
-python agentctl.py model-cfg write gemini25f llm_tools_gates db_query,model_cfg write
+python llmemctl.py model-cfg write gemini25f llm_tools_gates db_query,model_cfg write
 ```
 
 Or directly in `llm-models.json`:
@@ -550,10 +550,10 @@ The reaper runs every 60 seconds and checks each session's `last_active` timesta
 !sessiontimeout 0               disable reaping entirely (runtime only)
 ```
 
-**Default:** 60 minutes. To persist the change across restarts, use `agentctl`:
+**Default:** 60 minutes. To persist the change across restarts, use `llmemctl`:
 
 ```bash
-python agentctl.py session-timeout <minutes>   # 0 = disabled
+python llmemctl.py session-timeout <minutes>   # 0 = disabled
 ```
 
 This writes `session_idle_timeout_minutes` to `plugins-enabled.json`.
@@ -754,7 +754,7 @@ depth-guarded via `max_at_llm_depth`.
 
 #### `agent_call` — Remote Agent Delegation (tool only)
 
-Sends a single message to another running agent-mcp instance and returns its response. The remote
+Sends a single message to another running llmem-gw instance and returns its response. The remote
 agent runs with its **own session context** (its own system prompt, its own history) — it receives
 only the message string. By default, remote tokens are streamed in real-time via `push_tok`.
 
@@ -817,14 +817,14 @@ If a runaway delegation chain occurs, switch models in shell.py:
 This calls `cancel_active_task()` which propagates `CancelledError` through all nested `at_llm`
 and `agent_call` awaits in the current coroutine chain, terminating the entire tree.
 
-#### Managing Limits via `agentctl.py`
+#### Managing Limits via `llmemctl.py`
 
 View and update limits from the command line (requires agent restart to take effect):
 
 ```bash
-python agentctl.py limit-list                         # show current values
-python agentctl.py limit-set max_at_llm_depth 1       # set at_llm depth
-python agentctl.py limit-set max_agent_call_depth 1   # set agent_call depth
+python llmemctl.py limit-list                         # show current values
+python llmemctl.py limit-set max_at_llm_depth 1       # set at_llm depth
+python llmemctl.py limit-set max_agent_call_depth 1   # set agent_call depth
 ```
 
 Limits are stored in the `"limits"` section of `llm-models.json`:
@@ -908,12 +908,12 @@ Container sections cannot be directly edited — edit their child sections inste
 
 ```bash
 source venv/bin/activate
-python agent-mcp.py
+python llmem-gw.py
 ```
 
 ### Production (systemd)
 
-Create `/etc/systemd/system/agent-mcp.service`:
+Create `/etc/systemd/system/llmem-gw.service`:
 
 ```ini
 [Unit]
@@ -923,11 +923,11 @@ After=network.target
 [Service]
 Type=simple
 User=YOUR_USER
-WorkingDirectory=/home/YOUR_USER/projects/agent-mcp
-ExecStart=/home/YOUR_USER/projects/agent-mcp/venv/bin/python agent-mcp.py
+WorkingDirectory=/home/YOUR_USER/projects/llmem-gw
+ExecStart=/home/YOUR_USER/projects/llmem-gw/venv/bin/python llmem-gw.py
 Restart=on-failure
 RestartSec=5
-EnvironmentFile=/home/YOUR_USER/projects/agent-mcp/.env
+EnvironmentFile=/home/YOUR_USER/projects/llmem-gw/.env
 StandardOutput=journal
 StandardError=journal
 
@@ -937,15 +937,15 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable agent-mcp
-sudo systemctl start agent-mcp
-sudo journalctl -u agent-mcp -f
+sudo systemctl enable llmem-gw
+sudo systemctl start llmem-gw
+sudo journalctl -u llmem-gw -f
 ```
 
 ### Development (tmux)
 
 ```bash
-tmux new-session -d -s mcp 'cd /home/YOUR_USER/projects/agent-mcp && source venv/bin/activate && python agent-mcp.py'
+tmux new-session -d -s mcp 'cd /home/YOUR_USER/projects/llmem-gw && source venv/bin/activate && python llmem-gw.py'
 tmux attach -t mcp
 ```
 
@@ -962,9 +962,9 @@ to `llm-models.json` for any models served via that tunnel.
 | File | Purpose | Edited by |
 |---|---|---|
 | `.env` | API keys and credentials | Admin manually |
-| `plugins-enabled.json` | Which plugins are active + per-plugin config + rate limits | `agentctl.py` or direct edit |
+| `plugins-enabled.json` | Which plugins are active + per-plugin config + rate limits | `llmemctl.py` or direct edit |
 | `plugin-manifest.json` | Plugin registry — metadata, deps, env vars (read-only) | Plugin authors only |
-| `llm-models.json` | Model registry (enabled, model_id, type, etc.) | `agentctl.py` |
+| `llm-models.json` | Model registry (enabled, model_id, type, etc.) | `llmemctl.py` |
 | `.system_prompt` | Root system prompt file | Admin manually or LLM via tool |
 | `.system_prompt_*` | Individual section files | Admin manually or LLM via tool |
 | `.aiops_session_id` | shell.py session persistence | shell.py automatically |
@@ -980,7 +980,7 @@ These two files have distinct, non-overlapping roles:
 Declares that a plugin *exists* and what it needs to run: its Python file, type,
 pip dependencies, required `.env` variables, and load priority.  This file is
 maintained by plugin authors and committed to the repo.  The agent and
-`agentctl.py` read it purely for validation — to check whether a plugin's
+`llmemctl.py` read it purely for validation — to check whether a plugin's
 dependencies and credentials are present before attempting to load it.  You never
 edit this file to enable or disable plugins.
 
@@ -990,25 +990,25 @@ Determines what actually runs.  It has three jobs:
 
 1. **`enabled_plugins` list** — the ordered list of plugin names the agent will
    attempt to load at startup.  Add a plugin here to activate it; remove it to
-   deactivate it entirely.  Managed by `agentctl.py enable/disable` or by
+   deactivate it entirely.  Managed by `llmemctl.py enable/disable` or by
    direct edit.
 
 2. **`plugin_config` blocks** — per-plugin runtime settings such as port, host,
    and the `enabled` flag.  The `enabled: false` pattern lets you keep a plugin
    in `enabled_plugins` (preserving its config) without starting it.  This is how
    `plugin_proxy_llama` and `plugin_client_slack` ship: configured but off until
-   you flip `"enabled": true` or run `agentctl.py enable <plugin>`.
+   you flip `"enabled": true` or run `llmemctl.py enable <plugin>`.
 
 3. **`rate_limits`** and **`default_model`** — server-wide settings also stored here.
 
-**Practical rule:** to enable or disable a plugin, always use `agentctl.py`
+**Practical rule:** to enable or disable a plugin, always use `llmemctl.py`
 or edit `plugins-enabled.json`.  Never add enable/disable logic to `plugin-manifest.json`.
 
-**Fresh installs:** `setup-agent-mcp.sh` clones the repo and copies credentials
+**Fresh installs:** `setup-llmem-gw.sh` clones the repo and copies credentials
 (`.env`, `credentials.json`, `llm-models.json`) from a reference installation.
 It intentionally does *not* copy `plugins-enabled.json` — the repo's version is
 the authoritative default for new installs, and port assignments are adjusted
-per-instance afterward with `agentctl.py port-set`.
+per-instance afterward with `llmemctl.py port-set`.
 
 ---
 

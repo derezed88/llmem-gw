@@ -33,5 +33,5 @@ Database name is `agent_mcp` on `localhost` (hardcoded default; change in `confi
 ## Enable
 
 ```bash
-python agentctl.py enable plugin_database_mysql
+python llmemctl.py enable plugin_database_mysql
 ```

@@ -162,7 +162,7 @@
   },
   "metadata": {
     "last_modified": "2026-02-21",
-    "notes": "Configuration for enabled plugins. Modified by agentctl.py"
+    "notes": "Configuration for enabled plugins. Modified by llmemctl.py"
   },
   "max_users": 50,
   "session_idle_timeout_minutes": 60

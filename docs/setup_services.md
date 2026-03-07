@@ -5,7 +5,7 @@
 ### 1. Create MCP Service
 
 ```bash
-sudo tee /etc/systemd/system/agent-mcp.service > /dev/null << 'EOF'
+sudo tee /etc/systemd/system/llmem-gw.service > /dev/null << 'EOF'
 [Unit]
 Description=Agent MCP Server
 After=network.target
@@ -13,13 +13,13 @@ After=network.target
 [Service]
 Type=simple
 User=YOUR_USER
-WorkingDirectory=/home/YOUR_USER/projects/agent-mcp
-ExecStart=/home/YOUR_USER/projects/agent-mcp/venv/bin/python agent-mcp.py
+WorkingDirectory=/home/YOUR_USER/projects/llmem-gw
+ExecStart=/home/YOUR_USER/projects/llmem-gw/venv/bin/python llmem-gw.py
 Restart=always
 RestartSec=10
-EnvironmentFile=/home/YOUR_USER/projects/agent-mcp/.env
-StandardOutput=append:/var/log/agent-mcp.log
-StandardError=append:/var/log/agent-mcp.log
+EnvironmentFile=/home/YOUR_USER/projects/llmem-gw/.env
+StandardOutput=append:/var/log/llmem-gw.log
+StandardError=append:/var/log/llmem-gw.log
 
 [Install]
 WantedBy=multi-user.target
@@ -34,14 +34,14 @@ If you expose the agent remotely via an SSH tunnel (e.g. Pinggy, ngrok), create 
 sudo tee /etc/systemd/system/ssh-tunnel.service > /dev/null << 'EOF'
 [Unit]
 Description=SSH Tunnel to Agent MCP
-After=network.target agent-mcp.service
-Requires=agent-mcp.service
+After=network.target llmem-gw.service
+Requires=llmem-gw.service
 
 [Service]
 Type=simple
 User=YOUR_USER
-WorkingDirectory=/home/YOUR_USER/projects/agent-mcp
-ExecStart=/bin/bash /home/YOUR_USER/projects/agent-mcp/start_tunnel.sh
+WorkingDirectory=/home/YOUR_USER/projects/llmem-gw
+ExecStart=/bin/bash /home/YOUR_USER/projects/llmem-gw/start_tunnel.sh
 Restart=always
 RestartSec=5
 StandardOutput=append:/var/log/ssh-tunnel.log
@@ -59,32 +59,32 @@ EOF
 sudo systemctl daemon-reload
 
 # Enable services (start on boot)
-sudo systemctl enable agent-mcp.service
+sudo systemctl enable llmem-gw.service
 
 # Start services now
-sudo systemctl start agent-mcp.service
+sudo systemctl start llmem-gw.service
 
 # Check status
-sudo systemctl status agent-mcp.service
+sudo systemctl status llmem-gw.service
 
 # View logs
-sudo journalctl -u agent-mcp.service -f
+sudo journalctl -u llmem-gw.service -f
 ```
 
 ### 4. Management Commands
 
 ```bash
 # Restart services
-sudo systemctl restart agent-mcp.service
+sudo systemctl restart llmem-gw.service
 
 # Stop services
-sudo systemctl stop agent-mcp.service
+sudo systemctl stop llmem-gw.service
 
 # Disable autostart
-sudo systemctl disable agent-mcp.service
+sudo systemctl disable llmem-gw.service
 
 # View recent logs
-sudo journalctl -u agent-mcp.service --since "1 hour ago"
+sudo journalctl -u llmem-gw.service --since "1 hour ago"
 ```
 
 ## Option 2: Tmux Session (Quick Setup)
@@ -96,8 +96,8 @@ sudo journalctl -u agent-mcp.service --since "1 hour ago"
 tmux new-session -d -s mcp
 
 # Window 0: MCP Server
-tmux send-keys -t mcp:0 "cd /home/YOUR_USER/projects/agent-mcp" C-m
-tmux send-keys -t mcp:0 "source venv/bin/activate && python agent-mcp.py" C-m
+tmux send-keys -t mcp:0 "cd /home/YOUR_USER/projects/llmem-gw" C-m
+tmux send-keys -t mcp:0 "source venv/bin/activate && python llmem-gw.py" C-m
 
 # Attach to see it
 tmux attach -t mcp
@@ -114,7 +114,7 @@ tmux attach -t mcp
 
 ```bash
 # Start detached screen
-screen -dmS mcp bash -c "cd /home/YOUR_USER/projects/agent-mcp && source venv/bin/activate && python agent-mcp.py"
+screen -dmS mcp bash -c "cd /home/YOUR_USER/projects/llmem-gw && source venv/bin/activate && python llmem-gw.py"
 
 # List screens
 screen -ls
@@ -146,8 +146,8 @@ sudo dpkg -i cloudflared-linux-amd64.deb
 
 # Login and configure
 cloudflared tunnel login
-cloudflared tunnel create agent-mcp
-cloudflared tunnel route dns agent-mcp mcp.yourdomain.com
+cloudflared tunnel create llmem-gw
+cloudflared tunnel route dns llmem-gw mcp.yourdomain.com
 
 # Create config
 mkdir -p ~/.cloudflared
@@ -162,5 +162,5 @@ ingress:
 EOF
 
 # Run tunnel
-cloudflared tunnel run agent-mcp
+cloudflared tunnel run llmem-gw
 ```

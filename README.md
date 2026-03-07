@@ -1,4 +1,4 @@
-# agent-mcp
+# llmem-gw
 
 A multi-client AI agent server with a plugin architecture. Maintains persistent conversation sessions, routes all requests through a unified LangChain-based LLM dispatch loop, enforces human-approval gates on tool calls, and exposes a modular plugin system for data tools and client interfaces.
 
@@ -23,12 +23,12 @@ You want to deploy a capable multi-LLM agent and shape its behavior — without 
 #### 5-Minute Start
 
 ```bash
-git clone https://github.com/derezed88/agent-mcp.git
-cd agent-mcp
+git clone https://github.com/derezed88/llmem-gw.git
+cd llmem-gw
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env          # add at least one API key (e.g. GEMINI_API_KEY)
-python agent-mcp.py           # server is running
+python llmem-gw.py           # server is running
 python shell.py               # connect and start chatting
 ```
 
@@ -99,64 +99,64 @@ All configuration is JSON + commands. Nothing requires a restart:
 !limit_set max_agent_call_depth 2      # raise swarm recursion limit
 ```
 
-Rate limits, session timeouts, tool permissions, model timeouts — all configurable live via `!commands` or `agentctl.py` CLI.
+Rate limits, session timeouts, tool permissions, model timeouts — all configurable live via `!commands` or `llmemctl.py` CLI.
 
 **The LLM has access to the same command surface you do.** Gate commands, model switching, session inspection, system prompt edits, and limit adjustments are all available as tools the LLM can call. You can instruct the agent in natural language ("switch to gemini", "allow drive reads from now on") and it executes the corresponding command itself, without you typing it.
 
-#### agentctl.py — Offline System Configuration
+#### llmemctl.py — Offline System Configuration
 
-`agentctl.py` is the operator's configuration tool, run while the server is stopped (or to set persistent defaults before first start). It edits `plugins-enabled.json`, `llm-models.json`, and `gate-defaults.json` directly. It also has an interactive menu mode (`python agentctl.py` with no arguments).
+`llmemctl.py` is the operator's configuration tool, run while the server is stopped (or to set persistent defaults before first start). It edits `plugins-enabled.json`, `llm-models.json`, and `gate-defaults.json` directly. It also has an interactive menu mode (`python llmemctl.py` with no arguments).
 
 **Plugins:**
 ```bash
-python agentctl.py list                          # show all plugins and enabled status
-python agentctl.py enable plugin_tmux            # enable a plugin
-python agentctl.py disable plugin_client_slack   # disable a plugin
-python agentctl.py info plugin_database_mysql    # show deps, env vars, tools
+python llmemctl.py list                          # show all plugins and enabled status
+python llmemctl.py enable plugin_tmux            # enable a plugin
+python llmemctl.py disable plugin_client_slack   # disable a plugin
+python llmemctl.py info plugin_database_mysql    # show deps, env vars, tools
 ```
 
 **Models:**
 ```bash
-python agentctl.py models                        # list all models
-python agentctl.py model gemini25f               # set default model
-python agentctl.py model-add                     # interactive: add a new model
-python agentctl.py model-enable gpt4om           # enable a disabled model
-python agentctl.py model-disable gpt4om          # disable without removing
-python agentctl.py model-context gemini25f 200   # set context window
-python agentctl.py model-llmcall gemini25f true  # allow model to call other LLMs
-python agentctl.py model-timeout gemini25f 120   # set LLM delegation timeout (s)
+python llmemctl.py models                        # list all models
+python llmemctl.py model gemini25f               # set default model
+python llmemctl.py model-add                     # interactive: add a new model
+python llmemctl.py model-enable gpt4om           # enable a disabled model
+python llmemctl.py model-disable gpt4om          # disable without removing
+python llmemctl.py model-context gemini25f 200   # set context window
+python llmemctl.py model-llmcall gemini25f true  # allow model to call other LLMs
+python llmemctl.py model-timeout gemini25f 120   # set LLM delegation timeout (s)
 ```
 
 **Gate defaults** (persisted to `gate-defaults.json`, loaded at every startup):
 ```bash
-python agentctl.py gate-list                          # show all gate defaults
-python agentctl.py llm-allow google_drive read false   # auto-allow Drive reads by default
-python agentctl.py llm-allow db * write false          # auto-allow all DB writes by default
-python agentctl.py gate-reset                         # restore factory defaults
+python llmemctl.py gate-list                          # show all gate defaults
+python llmemctl.py llm-allow google_drive read false   # auto-allow Drive reads by default
+python llmemctl.py llm-allow db * write false          # auto-allow all DB writes by default
+python llmemctl.py gate-reset                         # restore factory defaults
 ```
 
 **Rate limits:**
 ```bash
-python agentctl.py ratelimit-list                     # show current limits
-python agentctl.py ratelimit-set search 10 30         # 10 calls per 30s for search tools
-python agentctl.py ratelimit-autodisable llm_call true  # auto-disable on breach
+python llmemctl.py ratelimit-list                     # show current limits
+python llmemctl.py ratelimit-set search 10 30         # 10 calls per 30s for search tools
+python llmemctl.py ratelimit-autodisable llm_call true  # auto-disable on breach
 ```
 
 **Ports, limits, session defaults:**
 ```bash
-python agentctl.py port-list                          # show configured ports
-python agentctl.py port-set llama_port 11435          # change llama proxy port
-python agentctl.py limit-set max_agent_call_depth 2   # raise swarm recursion limit
-python agentctl.py history-maxctx 100                 # set global history window
-python agentctl.py max-users 20                       # max simultaneous sessions
-python agentctl.py session-timeout 120                # idle session timeout (minutes)
+python llmemctl.py port-list                          # show configured ports
+python llmemctl.py port-set llama_port 11435          # change llama proxy port
+python llmemctl.py limit-set max_agent_call_depth 2   # raise swarm recursion limit
+python llmemctl.py history-maxctx 100                 # set global history window
+python llmemctl.py max-users 20                       # max simultaneous sessions
+python llmemctl.py session-timeout 120                # idle session timeout (minutes)
 ```
 
 **History chain** (for custom history backends):
 ```bash
-python agentctl.py history-list                          # show chain and plugins
-python agentctl.py history-chain-add plugin_history_vec  # append custom plugin
-python agentctl.py history-chain-remove plugin_history_vec
+python llmemctl.py history-list                          # show chain and plugins
+python llmemctl.py history-chain-add plugin_history_vec  # append custom plugin
+python llmemctl.py history-chain-remove plugin_history_vec
 ```
 
 ---
@@ -236,7 +236,7 @@ POST /api/v1/gate/{gate_id}      ← respond to a gate programmatically
 GET  /api/v1/sessions            ← list active sessions
 ```
 
-`agent_call(agent_url, message)` lets any LLM call any other agent-mcp instance. Depth guards (`max_at_llm_depth`, `max_agent_call_depth`) prevent recursive runaway. Swarm session IDs are deterministic — repeated calls from the same session to the same remote agent reuse the same remote session, preserving history across calls.
+`agent_call(agent_url, message)` lets any LLM call any other llmem-gw instance. Depth guards (`max_at_llm_depth`, `max_agent_call_depth`) prevent recursive runaway. Swarm session IDs are deterministic — repeated calls from the same session to the same remote agent reuse the same remote session, preserving history across calls.
 
 Drive a session programmatically in ~10 lines via [`api_client.py`](api_client.py):
 
@@ -362,7 +362,7 @@ Every tool call passes through `check_human_gate()` before execution. Gates are 
 | `sysprompt_write` | `!sysprompt_gate_write true/false` | System prompt writes |
 | `session` / `model` / `reset` | `!session_gate_read/write true/false` etc. | Per operation |
 
-Gate defaults persist across restarts via `gate-defaults.json` (managed with `agentctl.py llm-allow`).
+Gate defaults persist across restarts via `gate-defaults.json` (managed with `llmemctl.py llm-allow`).
 
 Non-interactive clients (llama proxy, Slack) auto-reject gated calls immediately with an instructive message to the LLM. API clients get a 2-second window for programmatic approval.
 
@@ -382,7 +382,7 @@ Enable delegation per model with `!llm_call <model> true`. Rate-limited by defau
 The `plugin_client_api` plugin exposes a JSON/SSE HTTP API (port 8767 by default) for programmatic and agent-to-agent access. Combined with the `agent_call` tool, any LLM on any instance can reach any other instance that has the API plugin enabled.
 
 **`agent_call(agent_url, message)`** — core swarm tool:
-- Sends `message` to a remote agent-mcp instance at `agent_url`
+- Sends `message` to a remote llmem-gw instance at `agent_url`
 - The remote agent processes the message through its full stack (LLM, tools, gates)
 - Returns the complete text response to the calling LLM
 - Session persistence: the remote session is derived deterministically from the calling session + target URL, so repeated calls from the same session to the same agent reuse the same remote session (history preserved across calls)
@@ -416,8 +416,8 @@ Sections are editable by the LLM via `sysprompt_write` / `sysprompt_delete` tool
 ### 1. Clone and set up
 
 ```bash
-git clone https://github.com/derezed88/agent-mcp.git
-cd agent-mcp
+git clone https://github.com/derezed88/llmem-gw.git
+cd llmem-gw
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -436,7 +436,7 @@ Edit `llm-models.json` to match your models and endpoints. At minimum, make sure
 
 ```bash
 source venv/bin/activate
-python agent-mcp.py
+python llmem-gw.py
 ```
 
 ### 4. Connect with shell.py (in a second terminal)
@@ -464,7 +464,7 @@ Type `!help` to see all commands. Some useful ones to start:
 ```
 Clients                 Server                          Backends
 ───────                 ──────                          ────────
-shell.py    ──SSE──►   agent-mcp.py                    OpenAI API
+shell.py    ──SSE──►   llmem-gw.py                    OpenAI API
 open-webui  ─HTTP──►   ┌──────────────────────────┐    Gemini API
 LM Studio   ─HTTP──►   │ routes.py                │    xAI API
 Slack ─Socket Mode──►  │ agents.py (agentic_lc)   │    llama.cpp / Ollama
@@ -475,15 +475,15 @@ Agent B ────HTTP──►    │   ChatOpenAI              │──► 
                        └──────────────────────────┘
                                     │ agent_call tool
                                     ▼
-                             Agent B / Agent C  (other agent-mcp instances)
+                             Agent B / Agent C  (other llmem-gw instances)
 ```
 
-- **`agent-mcp.py`** — entry point; loads plugins, builds Starlette app, starts uvicorn servers
+- **`llmem-gw.py`** — entry point; loads plugins, builds Starlette app, starts uvicorn servers
 - **`agents.py`** — LangChain dispatch loop, tool execution, rate limiting, LLM delegation
 - **`tools.py`** — StructuredTool registry; single source of truth for all tool schemas
 - **`shell.py`** — interactive terminal client with gate approval UI
 - **`plugin_*.py`** — pluggable data tools and client interfaces
-- **`agentctl.py`** — CLI tool for managing plugins and models
+- **`llmemctl.py`** — CLI tool for managing plugins and models
 
 ---
 
@@ -521,9 +521,9 @@ Agent B ────HTTP──►    │   ChatOpenAI              │──► 
 Manage plugins:
 
 ```bash
-python agentctl.py list
-python agentctl.py enable <plugin_name>
-python agentctl.py disable <plugin_name>
+python llmemctl.py list
+python llmemctl.py enable <plugin_name>
+python llmemctl.py disable <plugin_name>
 ```
 
 ---
@@ -550,5 +550,5 @@ python agentctl.py disable <plugin_name>
 | `.env` | API keys and credentials (never commit) |
 | `llm-models.json` | Model registry — `type`, `host`, `env_key`, `enabled`, `tool_call_available`, `system_prompt_folder` |
 | `plugins-enabled.json` | Active plugins, rate limits, per-plugin config |
-| `gate-defaults.json` | Gate auto-allow defaults loaded at startup (managed via `agentctl.py llm-allow`) |
+| `gate-defaults.json` | Gate auto-allow defaults loaded at startup (managed via `llmemctl.py llm-allow`) |
 | `system_prompt/<folder>/` | Modular system prompt sections; `000_default/` ships with the repo |

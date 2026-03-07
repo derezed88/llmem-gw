@@ -306,6 +306,6 @@
   },
   "metadata": {
     "last_modified": "2026-02-25",
-    "notes": "LLM model registry. Modified by agentctl.py model commands."
+    "notes": "LLM model registry. Modified by llmemctl.py model commands."
   }
 }

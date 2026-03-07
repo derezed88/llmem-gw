@@ -107,7 +107,7 @@ MySQL is always written first. Qdrant is updated as a fire-and-forget async side
 | Dependency | Purpose | Install |
 |---|---|---|
 | Python 3.11+ | Runtime | System |
-| agent-mcp | Agent server framework | `git clone` + `pip install -r requirements.txt` |
+| llmem-gw | Agent server framework | `git clone` + `pip install -r requirements.txt` |
 | MySQL / MariaDB | Short-term and long-term memory storage (source of truth) | System |
 | Qdrant | Vector search index for semantic memory retrieval | Binary or Docker |
 | `qdrant-client>=1.7` | Qdrant Python client | `pip install qdrant-client` |
@@ -124,7 +124,7 @@ MySQL is always written first. Qdrant is updated as a fire-and-forget async side
 | Qdrant | 6333 | Vector search — collection `samaritan_memory` |
 | llama.cpp (nomic-embed-text) | 8000 | Embedding endpoint — `/v1/embeddings` |
 
-Firewall rules required: allow TCP 6333 and 8000 inbound from agent-mcp host.
+Firewall rules required: allow TCP 6333 and 8000 inbound from llmem-gw host.
 
 ### API Keys Required
 
@@ -499,7 +499,7 @@ Removing a topic: delete all rows with that topic from both memory tables.
 ### Aging Flow
 
 Rows age from short-term to long-term via two independent continuous background tasks
-started at server startup inside `agent-mcp.py`. No manual trigger or cron job is needed.
+started at server startup inside `llmem-gw.py`. No manual trigger or cron job is needed.
 
 ST rows are always kept full-detail. **No summarization happens in ST.** Summaries are written directly to LT.
 
@@ -543,25 +543,25 @@ The memory system is an optional feature. **All memory functionality is gated by
 **All changes take effect immediately — no server restart required.**
 The server re-reads this config on every request and every aging cycle.
 
-### Via agentctl
+### Via llmemctl
 
 ```bash
 # Show current state
-python3 agentctl.py memory status
+python3 llmemctl.py memory status
 
 # Disable everything (master switch)
-python3 agentctl.py memory disable
+python3 llmemctl.py memory disable
 
 # Re-enable everything
-python3 agentctl.py memory enable
+python3 llmemctl.py memory enable
 
 # Disable a specific sub-feature only
-python3 agentctl.py memory disable context_injection
-python3 agentctl.py memory disable reset_summarize
-python3 agentctl.py memory disable post_response_scan
+python3 llmemctl.py memory disable context_injection
+python3 llmemctl.py memory disable reset_summarize
+python3 llmemctl.py memory disable post_response_scan
 
 # Re-enable a sub-feature
-python3 agentctl.py memory enable reset_summarize
+python3 llmemctl.py memory enable reset_summarize
 ```
 
 ### Via JSON (manual)
@@ -622,7 +622,7 @@ Grok uses type hints without being asked.
 ### 2. Project Continuity
 
 ```
-Session 7: Long debug session on agent-mcp — found that Grok loops on tool calls,
+Session 7: Long debug session on llmem-gw — found that Grok loops on tool calls,
            fixed with fingerprint detection.
 !reset
 

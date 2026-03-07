@@ -40,5 +40,5 @@ SLACK_APP_TOKEN=xapp-...
 ## Enable
 
 ```bash
-python agentctl.py enable plugin_client_slack
+python llmemctl.py enable plugin_client_slack
 ```

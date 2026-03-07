@@ -42,7 +42,7 @@ echo ""
 
 # Test 3: Test re-enabling
 echo "Test 3: Test re-enabling Win11"
-python agentctl.py model-enable Win11 > /dev/null 2>&1
+python llmemctl.py model-enable Win11 > /dev/null 2>&1
 
 python -c "
 from config import load_llm_registry
@@ -60,7 +60,7 @@ echo ""
 
 # Test 4: Restore disabled state
 echo "Test 4: Restore Win11 to disabled state"
-python agentctl.py model-disable Win11 > /dev/null 2>&1
+python llmemctl.py model-disable Win11 > /dev/null 2>&1
 echo "  ✓ Win11 disabled again"
 echo ""
 

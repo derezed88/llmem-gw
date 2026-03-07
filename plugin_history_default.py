@@ -6,7 +6,7 @@ where N = min(agent_max_ctx, current_model.max_context).
 
 This is the first plugin in the history chain and must always be present.
 Additional plugin_history_*.py plugins may be appended to the chain via
-agentctl.py to further transform history before it is sent to the LLM.
+llmemctl.py to further transform history before it is sent to the LLM.
 
 CONTRACT:
 ---------
@@ -50,11 +50,11 @@ TWO-VARIABLE WINDOW SYSTEM:
     agent_max_ctx   (int) — system-wide ceiling, never exceeded regardless of model.
                             Configured in plugins-enabled.json → plugin_config →
                             plugin_history_default → agent_max_ctx.
-                            Manageable via: agentctl.py history-maxctx <n>
+                            Manageable via: llmemctl.py history-maxctx <n>
                             Runtime command: !maxctx <n>
 
     model max_context (int) — per-model preferred window from llm-models.json.
-                            Manageable via: agentctl.py model-context <model> <n>
+                            Manageable via: llmemctl.py model-context <model> <n>
 
     effective window  = min(agent_max_ctx, model["max_context"])
 

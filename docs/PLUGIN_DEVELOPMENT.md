@@ -3,7 +3,7 @@
 This document defines the complete contract for writing plugins that integrate
 with the MCP agent system. Any plugin that follows this spec will be automatically
 discovered, loaded, and surfaced in `!help` — with no changes required to
-mainline code (`agent-mcp.py`, `routes.py`).
+mainline code (`llmem-gw.py`, `routes.py`).
 
 ---
 
@@ -11,8 +11,8 @@ mainline code (`agent-mcp.py`, `routes.py`).
 
 | Type               | PLUGIN_TYPE value    | Must implement          | Loaded by          |
 |--------------------|----------------------|-------------------------|--------------------|
-| Data / AI tool     | `"data_tool"`        | `get_tools()`           | `agent-mcp.py`     |
-| Client interface   | `"client_interface"` | `get_routes()`          | `agent-mcp.py`     |
+| Data / AI tool     | `"data_tool"`        | `get_tools()`           | `llmem-gw.py`     |
+| Client interface   | `"client_interface"` | `get_routes()`          | `llmem-gw.py`     |
 
 Both types share the same base class and lifecycle methods.
 
@@ -45,13 +45,13 @@ the plugin system:
 | File | Role | Who edits it |
 |------|------|--------------|
 | `plugin-manifest.json` | **Static registry** — declares that a plugin *exists*: its file, type, dependencies, required env vars, and load priority. Never read at agent startup for enable/disable decisions — only for validation metadata. | Plugin author (once, when adding the plugin) |
-| `plugins-enabled.json` | **Runtime config** — which plugins to actually load, per-plugin config overrides (port, host, `enabled` flag), default model, and rate limits. This is the operator control panel. | `agentctl.py` or direct edit |
+| `plugins-enabled.json` | **Runtime config** — which plugins to actually load, per-plugin config overrides (port, host, `enabled` flag), default model, and rate limits. This is the operator control panel. | `llmemctl.py` or direct edit |
 
 **When you add a new plugin you touch both files:**
 1. Add an entry to `plugin-manifest.json` so the system knows the plugin exists and can validate its dependencies.
 2. Add the plugin name to the `enabled_plugins` list in `plugins-enabled.json` so the loader picks it up.  Add a `plugin_config` block only if you need non-default settings (port, host, or to start it disabled with `"enabled": false`).
 
-**The `enabled: false` pattern** lets you keep a plugin in `enabled_plugins` (so its config is preserved) without actually starting it.  This is how `plugin_proxy_llama` and `plugin_client_slack` ship — configured but off until the operator flips the flag.  Use `python agentctl.py enable <plugin>` or set it directly in `plugins-enabled.json`.
+**The `enabled: false` pattern** lets you keep a plugin in `enabled_plugins` (so its config is preserved) without actually starting it.  This is how `plugin_proxy_llama` and `plugin_client_slack` ship — configured but off until the operator flips the flag.  Use `python llmemctl.py enable <plugin>` or set it directly in `plugins-enabled.json`.
 
 ---
 
@@ -74,8 +74,8 @@ Every plugin must have an entry in `plugin-manifest.json`:
 
 **Fields:**
 - `type` — `"data_tool"` or `"client_interface"`
-- `file` — filename relative to the agent-mcp working directory
-- `description` — shown in `python agentctl.py list`
+- `file` — filename relative to the llmem-gw working directory
+- `description` — shown in `python llmemctl.py list`
 - `dependencies` — pip package names (validated at startup; use `>=` for minimum version)
 - `env_vars` — environment variable names required from `.env`; validated at startup
 - `config_files` — additional files that must exist (e.g., `credentials.json`)
@@ -258,12 +258,12 @@ def get_help(self) -> str:
     )
 ```
 
-Commands are auto-registered at startup by `agent-mcp.py` via `register_plugin_commands()`
+Commands are auto-registered at startup by `llmem-gw.py` via `register_plugin_commands()`
 and dispatched generically by `cmd_plugin_command()` in `routes.py`.
 
 ---
 
-## Startup Flow (what `agent-mcp.py` does)
+## Startup Flow (what `llmem-gw.py` does)
 
 ```
 for each plugin in plugins-enabled.json:
@@ -338,13 +338,13 @@ full tool access, or provide a specific list of tool names the model should use.
    list.  Optionally add a `plugin_config` block for non-default port/host settings,
    or to ship it disabled (`"enabled": false`) until credentials are ready.
 4. **Add env vars** to `.env` if required.
-5. **Restart** `python agent-mcp.py`.
-6. **Verify** with `python agentctl.py list` — plugin should show `✓` (green,
+5. **Restart** `python llmem-gw.py`.
+6. **Verify** with `python llmemctl.py list` — plugin should show `✓` (green,
    all deps and env vars present) or `–` (yellow, if you shipped it with `enabled: false`).
 7. **Test** with `!help` in the client — new tool should appear automatically.
 8. **Grant access** — add the new tool name to the `llm_tools` list for models that should use it in `llm-models.json`, or set `llm_tools` to `"all"`.
 
-No changes to `routes.py` or `agent-mcp.py` are needed for
+No changes to `routes.py` or `llmem-gw.py` are needed for
 standard `data_tool` search/drive/storage plugins.
 
 ---
@@ -474,10 +474,10 @@ def get_tools(self) -> Dict[str, Any]:
 | `plugin-manifest.json`   | Plugin metadata registry                                      |
 | `plugins-enabled.json`   | Which plugins are active; per-plugin config; rate limits      |
 | `llm-models.json`        | LLM model registry (add new models here)                      |
-| `agent-mcp.py`           | Startup orchestration; registers tools                        |
+| `llmem-gw.py`           | Startup orchestration; registers tools                        |
 | `tools.py`               | `StructuredTool` registry; `register_plugin_tools()`; per-model toolset filtering |
 | `agents.py`              | `agentic_lc()` loop; `_build_lc_llm()`; `execute_tool()`; `_content_to_str()` |
 | `routes.py`              | `!help`, unified `!command` dispatch                          |
-| `agentctl.py`      | CLI tool for system administration (plugins, models, config)  |
+| `llmemctl.py`      | CLI tool for system administration (plugins, models, config)  |
 | `.env`                   | API keys and credentials                                      |
 | `.system_prompt_tools`   | LLM-facing tool documentation (update manually for new tools) |

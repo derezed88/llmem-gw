@@ -1,41 +1,41 @@
 #!/bin/bash
-# setup-agent-mcp.sh
+# setup-llmem-gw.sh
 #
-# Clones the agent-mcp repo into the current directory, creates a venv,
+# Clones the llmem-gw repo into the current directory, creates a venv,
 # installs requirements, then copies working config from the reference
-# installation so agent-mcp.py is ready to run immediately.
+# installation so llmem-gw.py is ready to run immediately.
 #
 # Usage (local, same machine):
 #   cd /some/target/dir
-#   ./setup-agent-mcp.sh --source-dir /home/markj/projects/kaliLinuxNWScripts/mymcp
+#   ./setup-llmem-gw.sh --source-dir /home/markj/projects/kaliLinuxNWScripts/mymcp
 #
 # Usage (remote machine — SSH back to the dev host to pull secrets/config):
-#   ./setup-agent-mcp.sh --source-host 192.168.10.111 \
+#   ./setup-llmem-gw.sh --source-host 192.168.10.111 \
 #                        --source-dir /home/markj/projects/kaliLinuxNWScripts/mymcp \
 #                        [--source-user markj] [--branch <branch>] [--name <dirname>]
 #
 # Options:
 #   --branch <branch>       Git branch to check out after clone (default: main)
-#   --name <dirname>        Directory name to clone into (default: agent-mcp)
+#   --name <dirname>        Directory name to clone into (default: llmem-gw)
 #   --source-host <host>    Hostname/IP of the dev machine with the reference install
 #   --source-user <user>    SSH user on the source host (default: current $USER)
 #   --source-dir <path>     Absolute path to the reference install on the source host
 #                           (required)
 #
 # After completion:
-#   cd agent-mcp                                   (or --name value)
+#   cd llmem-gw                                   (or --name value)
 #   source venv/bin/activate
-#   python agentctl.py port-list             # verify/adjust ports BEFORE starting
-#   python agentctl.py port-set <plugin> <port>  # if ports conflict with other instances
-#   python agent-mcp.py      # terminal 1 - server
+#   python llmemctl.py port-list             # verify/adjust ports BEFORE starting
+#   python llmemctl.py port-set <plugin> <port>  # if ports conflict with other instances
+#   python llmem-gw.py      # terminal 1 - server
 #   python shell.py          # terminal 2 - client
 
 set -e
 
-REPO_SSH="git@github.com:derezed88/agent-mcp.git"
-REPO_HTTPS="https://github.com/derezed88/agent-mcp.git"
+REPO_SSH="git@github.com:derezed88/llmem-gw.git"
+REPO_HTTPS="https://github.com/derezed88/llmem-gw.git"
 BRANCH="main"
-DIR_NAME="agent-mcp"
+DIR_NAME="llmem-gw"
 SOURCE_HOST=""
 SOURCE_USER="${USER}"
 SOURCE_DIR=""   # derived below after arg parsing
@@ -141,7 +141,7 @@ if [ ! -x "$PYENV_ROOT/bin/pyenv" ]; then
     fi
 fi
 
-echo "=== agent-mcp setup ==="
+echo "=== llmem-gw setup ==="
 echo "Target:  $TARGET_DIR"
 echo "Branch:  $BRANCH"
 if [ -n "$SOURCE_HOST" ]; then
@@ -262,7 +262,7 @@ fi
 
 # NOTE: plugins-enabled.json is intentionally NOT copied from the reference.
 # The repo's version has clean defaults. Port overrides are applied below via
-# agentctl.py port-set so each instance gets its own port assignments.
+# llmemctl.py port-set so each instance gets its own port assignments.
 
 # Live system prompt sections (repo has defaults, but reference may have customizations)
 while IFS= read -r fpath; do
@@ -297,7 +297,7 @@ else:
 # ── 7. Show port configuration ───────────────────────────────────────────────
 echo ""
 echo "Configured listening ports:"
-python agentctl.py port-list
+python llmemctl.py port-list
 
 # ── 8. Summary ───────────────────────────────────────────────────────────────
 echo "=== Setup complete ==="
@@ -308,11 +308,11 @@ echo "  cd $TARGET_DIR"
 echo "  source venv/bin/activate"
 echo ""
 echo "  If running multiple instances on the same machine, change ports first:"
-echo "  python agentctl.py port-set plugin_client_shellpy 8770"
-echo "  python agentctl.py port-set plugin_client_api     8777"
+echo "  python llmemctl.py port-set plugin_client_shellpy 8770"
+echo "  python llmemctl.py port-set plugin_client_api     8777"
 echo ""
-echo "  python agent-mcp.py          # terminal 1 - server"
+echo "  python llmem-gw.py          # terminal 1 - server"
 echo "  python shell.py              # terminal 2 - client"
 echo ""
-echo "  python agentctl.py     # manage plugins, models, and ports"
+echo "  python llmemctl.py     # manage plugins, models, and ports"
 echo ""

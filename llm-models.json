@@ -282,7 +282,7 @@
       "max_context": 100000,
       "enabled": true,
       "description": "Samaritan execution arm (gpt-4o-mini, obedient tool caller)",
-      "llm_call_timeout": 60,
+      "llm_call_timeout": 120,
       "llm_tools": [
         "core",
         "db",

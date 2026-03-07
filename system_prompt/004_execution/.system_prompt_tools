@@ -5,4 +5,3 @@ tool-db-query: db_query tool definition
 tool-google-drive: google_drive tool definition
 tool-search-tavily: search_tavily tool definition
 tool-search-xai: search_xai tool definition
-tool-llm-list: llm_list tool definition

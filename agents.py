@@ -15,9 +15,9 @@ from langchain_core.messages import (
 #from .prompt import get_current_prompt
 import time
 
-from config import log, MAX_TOOL_ITERATIONS, LLM_REGISTRY, RATE_LIMITS, LIVE_LIMITS, LLM_TOOLSETS, LLM_TOOLSET_META, save_llm_model_field
+from config import log, MAX_TOOL_ITERATIONS, LLM_REGISTRY, RATE_LIMITS, LIVE_LIMITS, LLM_TOOLSETS, LLM_TOOLSET_META, TOOL_CALL_LOG_DEFAULT, save_llm_model_field
 from state import push_tok, push_done, push_flush, push_err, current_client_id, sessions, wait_for_gate, resolve_gate, has_pending_gate, update_session_token_stats
-from prompt import get_current_prompt, load_prompt_for_folder
+from prompt import load_prompt_for_folder
 from database import execute_sql
 from tools import (
     get_system_info,
@@ -615,6 +615,94 @@ async def execute_tool(client_id: str, tool_name: str, tool_args: dict) -> str:
         # Execute the tool
         result = await executor(**tool_args)
 
+        # Heat management: subscribe/increment heat for this toolset in the caller's session.
+        # This covers delegation paths (llm_call → execute_tool) where agentic_lc's own
+        # heat loop never runs, as well as the direct agentic_lc path (idempotent — the
+        # loop still handles decay for unused toolsets after this).
+        _ts = _toolset_for_tool(tool_name)
+        log.info(f"execute_tool heat: tool={tool_name} ts={_ts} client={client_id}")
+        if _ts:
+            _ts_meta = LLM_TOOLSET_META.get(_ts, {})
+            if not _ts_meta.get("always_active", True):
+                _caller_session = sessions.get(client_id, {})
+                _caller_model = _caller_session.get("model", "")
+                _authorized = LLM_REGISTRY.get(_caller_model, {}).get("llm_tools", [])
+                # Only track heat for toolsets the calling model is authorized to use.
+                # Delegates (one-shot llm_call targets) execute under the shell client's
+                # session, so we guard here to avoid subscribing toolsets the outer model
+                # (e.g. samaritan-voice) never has access to (e.g. drive).
+                _ts_authorized = (_ts in _authorized) or any(
+                    t in _authorized for t in LLM_TOOLSETS.get(_ts, [])
+                )
+                if _ts_authorized:
+                    _already_subscribed = _ts in _caller_session.get("tool_subscriptions", {})
+                    if not _already_subscribed:
+                        # Delegation path: toolset wasn't auto-activated by agentic_lc
+                        # (e.g. llm_call → execute_tool → url_extract). Subscribe it now.
+                        _subscribe_toolset(_caller_session, _ts)
+                        log.info(f"execute_tool heat: subscribed ts={_ts} heat={_caller_session['tool_subscriptions'].get(_ts)}")
+                    # Always mark as used this turn to protect from decay at text-exit.
+                    _caller_session.setdefault("_toolsets_used_this_turn", set()).add(_ts)
+                else:
+                    log.debug(f"execute_tool heat: skipped ts={_ts} — not authorized for model={_caller_model}")
+
+        # Tool call memory logging — save a compact summary as an inline ST row when enabled.
+        # Logs intent + outcome, NOT raw data. Result is summarized to ~150 chars so the
+        # learning trail is readable without bloating memory with search results / web content.
+        # source = calling model key — preserves delegation chain: caller → tool → delegatee.
+        _sess_for_log = sessions.get(client_id, {})
+        _caller_model = _sess_for_log.get("model", "")
+        _caller_cfg = LLM_REGISTRY.get(_caller_model, {})
+        _model_tool_log = _caller_cfg.get("conv_log_tools")
+        _do_tool_log = _model_tool_log if _model_tool_log is not None else TOOL_CALL_LOG_DEFAULT
+        if _do_tool_log:
+            try:
+                from memory import save_memory
+                _log_topic = _sess_for_log.get("current_topic") or "tool-call"
+                _result_str = str(result)
+                # Compact result summary: first non-empty line, capped at 150 chars
+                _result_lines = [ln.strip() for ln in _result_str.splitlines() if ln.strip()]
+                _result_summary = (_result_lines[0][:150] + "…") if _result_lines and len(_result_lines[0]) > 150 else (_result_lines[0] if _result_lines else "(empty)")
+                # Compact args: keep only the key intent fields, drop large payloads
+                _arg_summary: dict = {}
+                if tool_name in ("llm_call", "llm_call_clean"):
+                    _arg_summary["delegatee"] = tool_args.get("model", "")
+                    _arg_summary["prompt"] = tool_args.get("prompt", "")[:120]
+                    _arg_summary["mode"] = tool_args.get("mode", "text")
+                elif tool_name == "db_query":
+                    _arg_summary["sql"] = tool_args.get("sql", "")[:120]
+                elif tool_name in ("url_extract",):
+                    _arg_summary["url"] = tool_args.get("url", "")
+                elif tool_name in ("search_ddgs", "search_google", "search_tavily", "search_xai",
+                                   "google_search", "ddgs_search", "tavily_search"):
+                    _arg_summary["query"] = tool_args.get("query", "")[:100]
+                elif tool_name == "google_drive":
+                    _arg_summary["op"] = tool_args.get("operation", "")
+                    _arg_summary["name"] = tool_args.get("name", tool_args.get("file_name", ""))
+                else:
+                    # Generic: include scalar args only, skip large string values
+                    for _k, _v in tool_args.items():
+                        if isinstance(_v, (int, float, bool)):
+                            _arg_summary[_k] = _v
+                        elif isinstance(_v, str) and len(_v) <= 80:
+                            _arg_summary[_k] = _v
+                _log_entry = {
+                    "caller": _caller_model or "agent",
+                    "tool": tool_name,
+                    "args": _arg_summary,
+                    "status": "ok",
+                    "result": _result_summary,
+                }
+                asyncio.ensure_future(save_memory(
+                    topic=_log_topic,
+                    content=json.dumps(_log_entry, ensure_ascii=False),
+                    importance=3,
+                    source=_caller_model or "agent",
+                    session_id=client_id,
+                ))
+            except Exception as _tl_err:
+                log.debug(f"tool_call_log save failed for {tool_name}: {_tl_err}")
+
         # Display result with preview (length controlled by per-session tool_preview_length)
         # -1 = unlimited (no truncation), 0 = tags printed but no content, >0 = truncate to N chars
         sess = sessions.get(client_id, {})
@@ -973,25 +1061,19 @@ async def auto_enrich_context(messages: list[dict], client_id: str) -> list[dict
     if _memory_feature("context_injection"):
         try:
             from memory import load_context_block
-            # Build semantic query from the current user message body (primary signal),
-            # blended with the last few turns and the current_topic slug as a hint.
-            # Do NOT use topic slug alone — it's too narrow and misses cross-topic recall.
+            # Prefer model-derived current_topic as query seed (set from <<topic>> tag each turn).
+            # Fall back to concatenation of last 3 turns if no topic tracked yet.
             _session_ctx = sessions.get(client_id, {})
             current_topic = _session_ctx.get("current_topic", "")
-            # Always include recent message content as the main semantic signal.
-            # Cap the combined query at ~300 chars so the embed server stays fast.
-            recent = messages[-6:] if len(messages) >= 6 else messages
-            recent_text = " ".join(
-                m.get("content", "")[:150]
-                for m in recent
-                if m.get("role") in ("user", "assistant") and m.get("content")
-            ).strip()[:300]
-            # Prepend topic slug so it slightly biases the embedding, but the
-            # message body carries the bulk of the semantic weight.
-            if current_topic and recent_text:
-                query_text = f"{current_topic} {recent_text}"[:300]
+            if current_topic:
+                query_text = current_topic
             else:
-                query_text = recent_text or current_topic
+                recent = messages[-6:] if len(messages) >= 6 else messages
+                query_text = " ".join(
+                    m.get("content", "")[:300]
+                    for m in recent
+                    if m.get("role") in ("user", "assistant") and m.get("content")
+                ).strip()
             mem_block = await load_context_block(min_importance=3, query=query_text)
             if mem_block:
                 enrichments.append(mem_block)
@@ -1042,7 +1124,7 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
             sp_folder_abs = os.path.join(BASE_DIR, sp_folder_rel)
             system_prompt = load_prompt_for_folder(sp_folder_abs, active_tools=_active_tools, cold_tools=_cold_tools or None)
         else:
-            system_prompt = get_current_prompt()
+            system_prompt = ""
 
         # Per-model timeout for ainvoke (same setting used by llm_call).
         # Prevents indefinite stalls when the LLM API hangs or thinks too long.
@@ -1135,6 +1217,17 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
             ctx.append(ai_msg)
 
             if not ai_msg.tool_calls:
+                # Decay heat for unused toolsets on text-only turns (no tool calls).
+                _session = sessions.get(client_id, {})
+                _subs = _session.get("tool_subscriptions", {})
+                _used_ts = _session.pop("_toolsets_used_this_turn", set())
+                for _ts in list(_subs.keys()):
+                    if LLM_TOOLSET_META.get(_ts, {}).get("always_active", True):
+                        continue
+                    if _ts not in _used_ts:
+                        _subs[_ts]["heat"] = max(0, _subs[_ts].get("heat", 0) - 1)
+                        if _subs[_ts]["heat"] == 0:
+                            log.debug(f"agentic_lc: toolset={_ts} decayed to cold (no-tool turn) client={client_id}")
                 # Check for bare/XML tool calls from local models (Qwen, Hermes, etc.)
                 raw_text = _content_to_str(ai_msg.content)
                 _model_tool_names = {t.name for t in _model_tools} if _model_tools else None
@@ -1372,24 +1465,11 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
                 if is_streaming_agent_call:
                     await push_done(client_id)
 
-            # Heat management: increment heat for used toolsets, decay unused ones
-            _session = sessions.get(client_id, {})
-            _subs = _session.get("tool_subscriptions", {})
-            _used_toolsets: set[str] = set()
-            for _tname in _tools_used_this_turn:
-                _ts = _toolset_for_tool(_tname)
-                if _ts:
-                    _used_toolsets.add(_ts)
-            for _ts in list(_subs.keys()):
-                _ts_meta = LLM_TOOLSET_META.get(_ts, {})
-                if _ts_meta.get("always_active", True):
-                    continue
-                if _ts in _used_toolsets:
-                    _subscribe_toolset(_session, _ts)  # increments call_count → new heat
-                else:
-                    _subs[_ts]["heat"] = max(0, _subs[_ts].get("heat", 0) - 1)
-                    if _subs[_ts]["heat"] == 0:
-                        log.debug(f"agentic_lc: toolset={_ts} decayed to cold for client={client_id}")
+            # Heat management: no decay inside the tool-call loop.
+            # Decay fires exactly once per outer-model turn at the text-exit below.
+            # This ensures delegate hops (llm_call → execute_tool → url_extract) don't
+            # create extra decay opportunities — from the outer model's perspective the
+            # entire delegation is a single tool call within one turn.
 
             # Signal end of this tool-call round trip for non-agent_call tools.
             # push_flush (not push_done) keeps api_client connected across tool
@@ -1402,9 +1482,7 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
         return ""
 
     except Exception as exc:
-        log.error(f"agentic_lc exception: client={client_id} model={model_key} exc={exc!r}")
         await push_err(client_id, str(exc))
-        await push_done(client_id)
         return ""
 
 async def llm_call(
@@ -1456,7 +1534,14 @@ async def llm_call(
     # ---- Resolve system prompt string ----
     resolved_sys: str = ""
     if sys_prompt == "caller":
-        resolved_sys = get_current_prompt()
+        caller_model = session.get("model", "")
+        caller_cfg = LLM_REGISTRY.get(caller_model, {})
+        caller_sp_rel = caller_cfg.get("system_prompt_folder", "")
+        if caller_sp_rel and caller_sp_rel.lower() != "none":
+            caller_sp_abs = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), caller_sp_rel
+            )
+            resolved_sys = load_prompt_for_folder(caller_sp_abs)
     elif sys_prompt == "target":
         sp_folder_rel = cfg.get("system_prompt_folder", "")
         if sp_folder_rel and sp_folder_rel.lower() != "none":
@@ -1464,8 +1549,6 @@ async def llm_call(
                 os.path.dirname(os.path.abspath(__file__)), sp_folder_rel
             )
             resolved_sys = load_prompt_for_folder(sp_folder_abs)
-        else:
-            resolved_sys = get_current_prompt()  # fallback same as at_llm
 
     # ---- Depth guard (only when passing caller history, risk of recursion) ----
     if history == "caller":
@@ -1564,7 +1647,9 @@ async def llm_call(
 
             # Determine the tool's system prompt section to use as the leading system message
             # ONLY when no system prompt was already resolved (none or target without folder)
-            tool_sys = get_section_for_tool(tool)
+            _tool_sp_rel = cfg.get("system_prompt_folder", "")
+            _tool_sp_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), _tool_sp_rel) if _tool_sp_rel and _tool_sp_rel.lower() != "none" else None
+            tool_sys = get_section_for_tool(tool, folder=_tool_sp_abs)
             if not tool_sys:
                 tool_sys = f"You have access to one tool: {tool}. Use it to answer the user's request."
 

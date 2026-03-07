@@ -92,6 +92,7 @@ def load_llm_registry():
                 "memory_scan": config.get('memory_scan', False),
                 "memory_scan_suppress": config.get('memory_scan_suppress', False),
                 "conv_log": config.get('conv_log', False),
+                "conv_log_tools": config.get('conv_log_tools', None),  # None = use TOOL_CALL_LOG_DEFAULT
                 "max_tokens": config.get('max_tokens'),
                 "tool_suppress": config.get('tool_suppress', False),
                 "agent_call_stream": config.get('agent_call_stream', None),
@@ -220,13 +221,14 @@ def save_llm_model_field(model_name: str, field: str, value) -> bool:
         return False
 
 
-def load_llm_tools() -> tuple[dict, dict]:
+def load_llm_tools() -> tuple[dict, dict, bool]:
     """
     Load named toolsets from llm-tools.json.
 
     Returns:
-        toolsets: {name: [tool_names]}  — backward-compatible tool list mapping
-        meta:     {name: {always_active, heat_curve, sp_section}}  — full metadata
+        toolsets:          {name: [tool_names]}  — backward-compatible tool list mapping
+        meta:              {name: {always_active, heat_curve, sp_section}}  — full metadata
+        tool_call_log_default: bool — global default for conv_log_tools (metadata.tool_call_log)
     """
     try:
         with open(LLM_TOOLS_FILE, 'r') as f:
@@ -247,13 +249,14 @@ def load_llm_tools() -> tuple[dict, dict]:
                     "heat_curve":    entry.get("heat_curve", None),
                     "sp_section":    entry.get("sp_section", None),
                 }
-        return toolsets, meta
+        tool_call_log_default = bool(data.get('metadata', {}).get('tool_call_log', False))
+        return toolsets, meta, tool_call_log_default
     except FileNotFoundError:
         log.error("llm-tools.json not found — no toolsets available.")
-        return {}, {}
+        return {}, {}, False
     except Exception as e:
         log.error(f"Error loading llm-tools.json: {e}")
-        return {}, {}
+        return {}, {}, False
 
 
 def save_llm_toolset(name: str, tools: list[str]) -> bool:
@@ -386,7 +389,8 @@ LIVE_LIMITS: dict = {
 # Named toolsets — loaded from llm-tools.json
 # LLM_TOOLSETS: {name: [tool_names]}  — used for tool authorization/expansion
 # LLM_TOOLSET_META: {name: {always_active, heat_curve, sp_section}}  — used for hot/cold lifecycle
-LLM_TOOLSETS, LLM_TOOLSET_META = load_llm_tools()
+# TOOL_CALL_LOG_DEFAULT: global default for conv_log_tools (metadata.tool_call_log in llm-tools.json)
+LLM_TOOLSETS, LLM_TOOLSET_META, TOOL_CALL_LOG_DEFAULT = load_llm_tools()
 
 # Rate limits by tool type — loaded from plugins-enabled.json
 RATE_LIMITS = load_rate_limits()

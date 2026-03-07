@@ -2,6 +2,19 @@
 
 Use the short name form for any llm_call, not the model_id.
 
+### Google Drive reads — MANDATORY DELEGATION
+When the user asks to read, retrieve, or summarize any Google Drive file, you MUST follow this exact sequence.
+Do NOT answer from memory or prior context — always fetch fresh from Drive.
+
+Step 1 — get the file_id (skip if you already have it):
+  llm_call(model="samaritan-execution", prompt="List Drive files matching <name>", mode="tool", tool="google_drive", sys_prompt="none", history="none")
+
+Step 2 — read and summarize (REQUIRED, no exceptions):
+  llm_call(model="summarizer-gemini", prompt="Read the file with id=<file_id> and summarize it concisely", mode="tool", tool="google_drive", sys_prompt="none", history="none")
+
+Step 3 — your response MUST be based on the llm_call result returned in Step 2.
+Do NOT paraphrase from memory. The llm_call return value IS the answer — relay it to the user.
+
 ### llm_call(model: str, prompt: str, mode: str = "text", sys_prompt: str = "none", history: str = "none", tool: str = "") -> str
 Call another LLM model to process a prompt.
 - model: short name of the target model (use llm_list to see available models).

@@ -132,18 +132,40 @@ def register_plugin_tools(plugin_name: str, tool_defs: dict):
     log.info(f"Registered {len(lc_tools)} LC tools from {plugin_name}")
 
 
-def get_section_for_tool(tool_name: str) -> str:
+def get_section_for_tool(tool_name: str, folder: str | None = None) -> str:
     """
     Return the system prompt section body for a named tool.
     Tries 'tool-<name>' (hyphenated) and 'tool_<name>' (underscored) variants.
     Used by llm_call(mode='tool') to build the target model's system prompt.
+
+    If folder is provided, reads directly from that folder without touching the
+    global prompt cache (avoids root .system_prompt fallback).
     """
-    # Try hyphenated form first (canonical: tool-url-extract)
+    if folder:
+        import os
+        from prompt import load_prompt_for_folder
+        # Read the specific section file directly — no need to assemble the whole prompt
+        for variant in (
+            ".system_prompt_tool-" + tool_name.replace("_", "-"),
+            ".system_prompt_tool_" + tool_name,
+        ):
+            fpath = os.path.join(folder, variant)
+            if os.path.exists(fpath):
+                try:
+                    with open(fpath, "r", encoding="utf-8") as fh:
+                        raw = fh.read()
+                    # Strip leading ## header line if present
+                    lines = raw.split("\n", 1)
+                    return lines[1] if len(lines) > 1 and lines[0].startswith("## ") else raw
+                except Exception:
+                    pass
+        return ""
+
+    # Fallback: global cache (only hit if no folder provided)
     hyphenated = "tool-" + tool_name.replace("_", "-")
     section = get_section(hyphenated)
     if section:
         return section
-    # Try underscore form (tool_url_extract)
     underscored = "tool_" + tool_name
     section = get_section(underscored)
     if section:

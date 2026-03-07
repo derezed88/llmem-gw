@@ -19,54 +19,55 @@
     "db": {
       "tools": ["db_query"],
       "always_active": false,
-      "heat_curve": [3, 5, 8],
+      "heat_curve": [1, 1, 1],
       "sp_section": "tool_db_query"
     },
     "search": {
       "tools": ["search_ddgs", "search_google", "search_tavily", "search_xai"],
       "always_active": false,
-      "heat_curve": [3, 4, 6],
+      "heat_curve": [1, 1, 1],
       "sp_section": "tool_search"
     },
     "drive": {
       "tools": ["google_drive"],
       "always_active": false,
-      "heat_curve": [3, 5, 8],
+      "heat_curve": [1, 1, 1],
       "sp_section": "tool_google_drive"
     },
     "vscode": {
       "tools": ["vscode_sessions_list", "vscode_sessions_read"],
       "always_active": false,
-      "heat_curve": [2, 4],
+      "heat_curve": [1, 1],
       "sp_section": "tool_vscode_sessions"
     },
     "extract": {
       "tools": ["url_extract"],
       "always_active": false,
-      "heat_curve": [2, 3],
+      "heat_curve": [1, 1],
       "sp_section": null
     },
     "agent": {
       "tools": ["agent_call"],
       "always_active": false,
-      "heat_curve": [3, 5],
+      "heat_curve": [1, 1],
       "sp_section": null
     },
     "tmux": {
       "tools": ["tmux_new", "tmux_exec", "tmux_ls", "tmux_kill_session", "tmux_kill_server", "tmux_history", "tmux_history_limit", "tmux_call_limit"],
       "always_active": false,
-      "heat_curve": [3, 5, 8],
+      "heat_curve": [1, 1, 1],
       "sp_section": null
     },
     "memory": {
       "tools": ["memory_save", "memory_recall", "memory_age", "memory_update"],
       "always_active": false,
-      "heat_curve": [3, 5, 8],
+      "heat_curve": [1, 1, 1],
       "sp_section": null
     }
   },
   "metadata": {
-    "last_modified": "2026-03-05",
-    "notes": "Named toolsets for per-model tool binding. Toolsets with always_active=false participate in hot/cold lifecycle. heat_curve[i] = heat after (i+1) calls; last value is cap. Decay: -1 per turn unused."
+    "last_modified": "2026-03-06",
+    "tool_call_log": true,
+    "notes": "Named toolsets for per-model tool binding. Toolsets with always_active=false participate in hot/cold lifecycle. heat_curve[i] = heat after (i+1) calls; last value is cap. Decay: -1 per turn unused. tool_call_log=true (global default) enables saving tool call prompts+results to memory as inline ST rows between the user prompt and assistant response rows, sharing the same topic and sourced from the calling LLM. Overridable per-model via conv_log_tools in llm-models.json."
   }
 }

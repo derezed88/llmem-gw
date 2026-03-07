@@ -901,8 +901,12 @@ class PluginManager:
             # Type coercion
             if field in ("llm_tools", "llm_tools_gates"):
                 coerced = [t.strip() for t in value.split(",") if t.strip()]
-            elif field == "enabled":
-                coerced = value.lower() in ("true", "1", "yes")
+            elif field in ("enabled", "conv_log", "conv_log_tools", "memory_scan",
+                           "memory_scan_suppress", "tool_suppress", "agent_call_stream"):
+                if value.lower() in ("null", "none"):
+                    coerced = None
+                else:
+                    coerced = value.lower() in ("true", "1", "yes")
             elif field in ("llm_call_timeout", "max_context"):
                 coerced = int(value)
             elif field in ("temperature", "top_p"):
@@ -1061,7 +1065,7 @@ class PluginManager:
         Features: context_injection, reset_summarize, post_response_scan
         Master switch: 'all' (or no feature arg) toggles the 'enabled' key.
         """
-        FEATURES = ("context_injection", "reset_summarize", "post_response_scan", "fuzzy_dedup", "vector_search_qdrant")
+        FEATURES = ("context_injection", "reset_summarize", "post_response_scan", "fuzzy_dedup", "vector_search_qdrant", "tool_call_log")
         action = args[0] if args else "status"
         feature = args[1] if len(args) > 1 else "all"
 
@@ -1084,11 +1088,34 @@ class PluginManager:
         def _bool_str(val: bool) -> str:
             return f"{Colors.GREEN}enabled{Colors.RESET}" if val else f"{Colors.RED}disabled{Colors.RESET}"
 
+        # tool_call_log lives in llm-tools.json metadata, not plugins-enabled.json
+        def _get_tool_call_log_default() -> bool:
+            try:
+                with open("llm-tools.json") as _f:
+                    return bool(json.load(_f).get("metadata", {}).get("tool_call_log", False))
+            except Exception:
+                return False
+
+        def _set_tool_call_log_default(val: bool):
+            try:
+                with open("llm-tools.json") as _f:
+                    data = json.load(_f)
+                data.setdefault("metadata", {})["tool_call_log"] = val
+                with open("llm-tools.json", "w") as _f:
+                    json.dump(data, _f, indent=2)
+            except Exception as _e:
+                print(f"{Colors.RED}✗ Could not write llm-tools.json: {_e}{Colors.RESET}")
+
         if action == "status":
             master = mem_cfg.get("enabled", True)
             print(f"\n{Colors.BOLD}Memory system{Colors.RESET}  (plugins-enabled.json → plugin_config.memory)")
             print(f"  master switch       : {_bool_str(master)}")
             for feat in FEATURES:
+                if feat == "tool_call_log":
+                    val = _get_tool_call_log_default()
+                    note = f"  {Colors.GRAY}(global default; override per-model via conv_log_tools){Colors.RESET}"
+                    print(f"  {feat:<24}: {_bool_str(val)}{note}")
+                    continue
                 val = mem_cfg.get(feat, True)
                 active = master and val
                 note = "" if active else f"  {Colors.GRAY}(inactive — {'master off' if not master else 'feature off'}){Colors.RESET}"
@@ -1113,14 +1140,18 @@ class PluginManager:
             if feature == "all":
                 mem_cfg["enabled"] = new_val
                 label = "Master switch"
+                self._save_plugins_enabled()
+            elif feature == "tool_call_log":
+                _set_tool_call_log_default(new_val)
+                label = "tool_call_log (global default)"
             elif feature in FEATURES:
                 mem_cfg[feature] = new_val
                 label = feature
+                self._save_plugins_enabled()
             else:
                 print(f"{Colors.RED}✗ Unknown feature '{feature}'. "
                       f"Valid: all, {', '.join(FEATURES)}{Colors.RESET}")
                 return
-            self._save_plugins_enabled()
             state_str = "enabled" if new_val else "disabled"
             print(f"{Colors.GREEN}✓{Colors.RESET} {label}: {state_str} (persisted)")
             print(f"  Takes effect immediately — no server restart needed.")

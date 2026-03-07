@@ -1019,13 +1019,34 @@ async def cmd_tools(client_id: str, arg: str, session: dict):
         await conditional_push_done(client_id)
         return
 
-    # Default: show heat status table
+    # Default: show heat status table.
+    # Resolve each llm_tools entry: toolset group names are used directly; literal
+    # tool names are mapped to their containing toolset via _toolset_for_tool().
+    # Multiple literals from the same toolset collapse into one row.
+    from agents import _toolset_for_tool
+    seen_toolsets: set[str] = set()
+    resolved: list[tuple[str, list[str], bool]] = []  # (ts_name, tools_list, is_group)
+    for entry in authorized_toolsets:
+        if entry in LLM_TOOLSETS:
+            # Proper toolset group name
+            if entry not in seen_toolsets:
+                seen_toolsets.add(entry)
+                resolved.append((entry, LLM_TOOLSETS[entry], True))
+        else:
+            # Literal tool name — find its toolset
+            parent_ts = _toolset_for_tool(entry)
+            if parent_ts and parent_ts not in seen_toolsets:
+                seen_toolsets.add(parent_ts)
+                resolved.append((parent_ts, LLM_TOOLSETS[parent_ts], False))
+            elif not parent_ts:
+                # Orphan tool with no toolset — show as always-active literal
+                resolved.append((entry, [entry], False))
+
     lines = [f"Tool heat status — model: {model_key}"]
     lines.append(f"{'Toolset':<16} {'Status':<18} {'Tools'}")
     lines.append("-" * 70)
-    for ts_name in authorized_toolsets:
+    for ts_name, tools_in_set, is_group in resolved:
         meta = LLM_TOOLSET_META.get(ts_name, {})
-        tools_in_set = LLM_TOOLSETS.get(ts_name, [ts_name])
         if meta.get("always_active", True):
             status = "always-active"
         else:

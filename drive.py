@@ -9,6 +9,7 @@ from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
 
 # Absolute imports
 from config import log, DRIVE_FOLDER_ID, DRIVE_SCOPES, DRIVE_TOKEN_FILE, DRIVE_CREDS_FILE
+from state import current_client_id, sessions
 
 _drive_service = None
 
@@ -108,7 +109,9 @@ async def run_drive_op(operation: str, file_id: str | None, file_name: str | Non
     if not fid:
         return "Configuration Error: No valid folder_id found. Check FOLDER_ID in .env."
 
-    log.info("Drive op='%s' using folder_id='%s'", op, fid)
+    _cid = current_client_id.get("")
+    _model = sessions.get(_cid, {}).get("model", "?") if _cid else "?"
+    log.info("Drive op='%s' model=%s client=%s folder_id='%s'", op, _model, _cid, fid)
 
     try:
         if op == "list":

@@ -225,15 +225,11 @@ python llmemctl.py memory enable <feature>                        # enable one f
 python llmemctl.py memory disable <feature>                       # disable one feature
 python llmemctl.py memory set fuzzy_dedup_threshold <0-1>        # adjust similarity threshold
 python llmemctl.py memory set summarizer_model <model_key>       # change summarizer model
-python llmemctl.py memory set auto_memory_age <true|false>        # enable/disable background aging
-python llmemctl.py memory set short_hwm <n>                       # ST row count that triggers aging
-python llmemctl.py memory set short_lwm <n>                       # target ST count after aging
-python llmemctl.py memory set recent_turns_protect <n>            # last N ST rows' topics protected
-python llmemctl.py memory set staleness_override_minutes <min>    # protected topics age past this
-python llmemctl.py memory set chunk_importance_threshold <n>      # imp >= this promoted verbatim to LT
-python llmemctl.py memory set memory_age_count_timer <min|-1>     # count-pressure interval (-1=off)
-python llmemctl.py memory set memory_age_trigger_minutes <min>    # staleness threshold in minutes
-python llmemctl.py memory set memory_age_minutes_timer <min|-1>   # staleness check interval (-1=off)
+python llmemctl.py memory set auto_memory_age <true|false>       # enable/disable background aging
+python llmemctl.py memory set memory_age_entrycount <n>          # max short-term rows
+python llmemctl.py memory set memory_age_count_timer <min|-1>    # count-pressure interval (-1=off)
+python llmemctl.py memory set memory_age_trigger_minutes <min>   # staleness threshold in minutes
+python llmemctl.py memory set memory_age_minutes_timer <min|-1>  # staleness check interval (-1=off)
 python llmemctl.py memory test                                    # live toggle test: disable, verify off, re-enable, verify on
 ```
 
@@ -254,11 +250,7 @@ All feature flags are live — changes to `plugins-enabled.json` take effect on 
   "fuzzy_dedup_threshold": 0.78,
   "summarizer_model": "summarizer-anthropic",
   "auto_memory_age": true,
-  "short_hwm": 100,
-  "short_lwm": 50,
-  "recent_turns_protect": 10,
-  "staleness_override_minutes": 2880,
-  "chunk_importance_threshold": 8,
+  "memory_age_entrycount": 50,
   "memory_age_count_timer": 60,
   "memory_age_trigger_minutes": 2880,
   "memory_age_minutes_timer": 360
@@ -281,13 +273,9 @@ All feature flags are live — changes to `plugins-enabled.json` take effect on 
 | `fuzzy_dedup_threshold` | `0.78` | No | Similarity ratio (0.0–1.0) above which a new save is treated as a duplicate. Read fresh each call. |
 | `summarizer_model` | `"summarizer-anthropic"` | No | Model key used by `summarize_and_save()` on `!reset`. Must be a valid key in `llm-models.json`. |
 | `auto_memory_age` | `true` | No | Master switch for background aging tasks. When false, both timers are suppressed. |
-| `short_hwm` | `100` | No | ST row count that triggers count-pressure aging. Aging loops until ST < `short_lwm`. |
-| `short_lwm` | `50` | No | Target ST count after an aging pass. Gap between HWM and LWM controls how many rows each pass removes. |
-| `recent_turns_protect` | `10` | No | Topics appearing in the last N ST rows are protected from chunking. Increase to preserve more recent context. |
-| `staleness_override_minutes` | `2880` | No | Protected topics are unprotected if ALL their rows are older than this (48h default). Prevents eternally protected monotopics. |
-| `chunk_importance_threshold` | `8` | No | Rows at or above this importance are promoted verbatim to LT in addition to the summary. |
+| `memory_age_entrycount` | `50` | No | Max short-term rows before count-pressure aging removes the overflow. |
 | `memory_age_count_timer` | `60` | No | How often (minutes) the count-pressure task runs. Set to `-1` to disable. |
-| `memory_age_trigger_minutes` | `2880` | No | Staleness threshold in minutes (48h). Topics with rows older than this are candidates for staleness aging. |
+| `memory_age_trigger_minutes` | `2880` | No | Staleness threshold in minutes (2880 = 48h). Rows not accessed in this time are candidates for staleness aging. |
 | `memory_age_minutes_timer` | `360` | No | How often (minutes) the staleness task runs. Set to `-1` to disable. |
 
 **Choosing a threshold:** SequenceMatcher ratio on real paraphrased duplicates typically
@@ -319,45 +307,49 @@ Facts age from short-term to long-term via two independent background tasks (see
 
 Two async tasks run continuously inside the server process. Both re-read config fresh on each cycle — no restart needed for config changes.
 
-Both tasks use the same topic-chunk summarization algorithm:
-
-1. Identify "protected" topics — those appearing in the last `recent_turns_protect` ST rows by id DESC.
-2. Waive protection if ALL rows for that topic are older than `staleness_override_minutes`.
-3. Order remaining candidate topics by oldest row first.
-4. For each candidate topic: summarize all its ST rows → write 1-5 summary rows **directly to LT** via the haiku summarizer; also promote any rows with importance ≥ `chunk_importance_threshold` verbatim to LT.
-5. Delete all ST rows for that topic + remove from Qdrant.
-6. Repeat until ST count < `short_lwm`.
-
-ST rows are always kept full-detail. **No summarization happens in ST.** Summaries are written directly to LT.
-
 **Count-pressure task** (`memory_age_count_timer`, default: every 60 min)
 
-Triggers when the short-term table exceeds `short_hwm` rows. Processes oldest unprotected topics one at a time until ST count drops below `short_lwm`.
+Triggers when the short-term table exceeds `memory_age_entrycount` rows. Moves exactly the overflow rows — those with the lowest importance and oldest `last_accessed` time — to long-term. Has no age threshold; even recently saved rows can be moved if the table is over the cap.
 
 **Staleness task** (`memory_age_minutes_timer`, default: every 360 min)
 
-Processes topics that have at least one row older than `memory_age_trigger_minutes` (48h default) and are not in the protected set. Loops until ST count < `short_lwm` or no more stale candidates.
+Moves all rows whose `last_accessed` is older than `memory_age_trigger_minutes` minutes (default: 2880 min = 48h). Safety ceiling: max 200 rows per pass. Also ordered by importance ASC, last_accessed ASC.
 
-**`last_accessed` semantics:** Updated automatically whenever `load_context_block()` injects memories. Memories that are actively recalled stay in short-term longer. Both tiers have `last_accessed` — LT rows have it updated when retrieved by semantic search.
+**`last_accessed` semantics:** Updated automatically whenever `load_context_block()` injects memories into a request. This means memories that are actively recalled stay in short-term longer. MySQL's `ON UPDATE CURRENT_TIMESTAMP` alone is insufficient — the code issues an explicit `UPDATE` after each injection batch.
 
-**Monotopic escape valve:** If a single topic dominates ST and aging can't make progress, `!memtrim` hard-deletes rows (no summarization) to force count below LWM.
-
-**Disabling a timer:** Set the timer to `-1`. The task loop continues running but skips the aging pass. The other timer remains active independently.
+**Disabling a timer:** Set the timer to `-1`. The task loop continues running (no restart needed) but skips the aging pass. The other timer remains active independently.
 
 #### Runtime memory commands
 
 ```
-!memstats                                              show memory system health: DB counts, vector index, feature flag states
-!memage                                                manually trigger one count + staleness aging pass
-!memtrim [N]                                           escape valve: hard-delete N oldest ST rows (no summarization); no arg = trim to LWM
-!membackfill                                           embed any MySQL rows missing from Qdrant (gap-only, idempotent)
-!memory                                                list all short-term memories
-!memory list [short|long]                              list by tier
-!memory show <id> [short|long]                         show one row in full
+!memstats                                 show memory system health: DB counts, vector index, retrieval stats, feature flags
+!memory                                   list all short-term memories
+!memory list [short|long]                 list by tier
+!memory show <id> [short|long]            show one row in full
 !memory update <id> [tier=short] [importance=N] [content=text] [topic=label]
+!membackfill                              embed missing MySQL rows into Qdrant (gap-only, idempotent)
+!memreconcile                             remove orphaned Qdrant points not in MySQL
+!memreview [approve N,N|reject N,N|clear] AI-assisted topic review with HITL approval
+!memage                                   manually trigger one topic-chunk aging pass
+!memtrim [N]                              hard-delete N oldest ST rows (no summarization; default: trim to LWM)
 ```
 
-`!memstats` includes a **Config snapshot** section showing the master switch (`enabled (master)`) and each feature flag. Any flag showing `OFF (inactive—master off)` means the master switch is suppressing it.
+**`!membackfill`** — compares all MySQL row IDs (both ST and LT) against Qdrant point IDs. Any MySQL rows missing from Qdrant are embedded and upserted. Reports full drift metrics: Qdrant point count, MySQL row count, in-sync count, missing count, and orphan count. Use after restoring a DB backup or if the embedding server was down during saves.
+
+**`!memreconcile`** — the inverse of `!membackfill`. Finds Qdrant points whose IDs don't exist in either MySQL table (orphans created by manual DB deletes or failed aging) and batch-deletes them. Reports: total Qdrant points, MySQL rows, in-sync, orphans found, orphans deleted. Run this after manually deleting rows from `samaritan_memory_shortterm` or `samaritan_memory_longterm`.
+
+**`!memreview`** — AI-assisted topic hygiene review using `reviewer-gemini` (gemini-2.5-flash, temp=0.2). Gathers all topics from both ST and LT with row counts and sample content, then asks the model to propose merge/rename operations. Proposals are displayed with numbered indices for human approval.
+
+Usage workflow:
+1. `!memreview` — generate proposals (or show pending ones if they exist)
+2. Review the numbered list of merge/rename suggestions with reasons
+3. `!memreview approve 1,3` — execute proposals #1 and #3 (updates topic column in both ST and LT tables)
+4. `!memreview reject 2` — remove proposal #2 from the pending list
+5. `!memreview clear` — discard all pending proposals
+
+Proposals are stored in-memory per session and lost on server restart. The reviewer model is instructed to avoid false merges on shared-prefix topics (e.g. `memory-system` vs `memory-roadmap`).
+
+**`!memstats`** includes a **Retrieval Stats** section (counters since last restart) showing how often single-pass topic-slug retrieval was sufficient vs when two-pass (user-text) retrieval was needed, plus average hit counts for each pass. Also includes a **Config snapshot** section showing the master switch (`enabled (master)`) and each feature flag. Any flag showing `OFF (inactive—master off)` means the master switch is suppressing it.
 
 #### LLM memory tools
 
@@ -443,6 +435,70 @@ Tool access is controlled per-model via the `llm_tools` field in `llm-models.jso
 !llm_tools write <model> tool1,tool2    set specific tool list for a model
 !llm_tools write <model> none           remove all tool access (text-only)
 ```
+
+### Hot/Cold Tool Lifecycle (`llm-tools.json`)
+
+Tool registration and associated system prompt sections can be dynamically aged in and out of the active schema on a per-toolset basis. This is configured in `llm-tools.json` — **not** `llm-models.json`.
+
+#### How it works
+
+Each toolset entry in `llm-tools.json` has three lifecycle fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `always_active` | bool | If `true`, tools are always registered in the LLM schema (never aged out). If `false`, tools participate in the hot/cold lifecycle. |
+| `heat_curve` | list of ints | Heat values indexed by call count: `[heat_after_1st_call, heat_after_2nd_call, ..., cap]`. The last value is the cap — all further calls use it. `null` defaults to heat=3. |
+| `sp_section` | string or null | Name of the `.system_prompt_<name>` section file that documents this toolset's tools. If set, that system prompt section is **only included** when the toolset is active (hot). |
+
+#### Heat and decay
+
+- A toolset starts **cold** (heat = 0) — its tools are absent from the JSON schema sent to the LLM, and its `sp_section` is excluded from the system prompt.
+- When any tool in the toolset is called, the toolset becomes **hot**: heat is set from `heat_curve[call_count - 1]`.
+- Each subsequent LLM turn that does **not** use the toolset, heat decays by 1. When heat reaches 0, the toolset goes cold again.
+- Cold tools are still *authorized* for the model — the LLM is told about them via a hint line in the system prompt: `Cold (available on demand): tool_a, tool_b`.
+
+Example `heat_curve: [3, 5, 8]`:
+- 1st call → heat=3 (stays hot for 3 idle turns)
+- 2nd call → heat=5
+- 3rd+ call → heat=8 (cap)
+
+#### Toolset object format (v1.1+)
+
+```json
+"db": {
+  "tools": ["db_query"],
+  "always_active": false,
+  "heat_curve": [3, 5, 8],
+  "sp_section": "tool_db_query"
+}
+```
+
+Legacy v1.0 format (plain list) is still supported; it is treated as `always_active: true, heat_curve: null, sp_section: null`.
+
+#### Inspecting tool heat at runtime
+
+```
+!tools                                  show hot/cold status for all tools in current session
+```
+
+#### Adding or editing toolsets
+
+Edit `llm-tools.json` directly, or use the `llm_tools` tool at the shell:
+
+```
+!llm_tools list                         list toolsets with always_active/heat status
+```
+
+#### System prompt coupling (`sp_section`)
+
+When `sp_section` is set, `prompt.py:load_prompt_for_folder()` automatically includes or excludes the matching `.system_prompt_<name>` section file based on whether the toolset is hot. This means:
+
+- Cold toolset → its documentation is stripped from the system prompt → fewer tokens sent to the LLM.
+- Hot toolset → full tool documentation is injected → LLM knows exactly how to use the tool.
+
+Sections whose short name starts with `tool_` but whose toolset is cold are skipped. All other sections are always included.
+
+---
 
 ### Tool Call Gates (`llm_tools_gates`)
 

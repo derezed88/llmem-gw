@@ -177,6 +177,43 @@
       "token_selection_setting": "default",
       "llm_tools_gates": []
     },
+    "extractor-gemini": {
+      "model_id": "gemini-2.0-flash",
+      "type": "GEMINI",
+      "host": null,
+      "env_key": "GEMINI_API_KEY",
+      "max_context": 100000,
+      "enabled": true,
+      "description": "Google gemini-2.0-flash (extractor role)",
+      "llm_call_timeout": 120,
+      "llm_tools": [
+        "get_system_info",
+        "extract_files"
+      ],
+      "system_prompt_folder": "system_prompt/005_fileops",
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": 1,
+      "token_selection_setting": "custom",
+      "llm_tools_gates": []
+    },
+    "reviewer-gemini": {
+      "model_id": "gemini-2.5-flash",
+      "type": "GEMINI",
+      "host": null,
+      "env_key": "GEMINI_API_KEY",
+      "max_context": 1000000,
+      "enabled": true,
+      "description": "Google gemini-2.5-flash (topic reviewer role, low temp for deterministic analysis)",
+      "llm_call_timeout": 180,
+      "llm_tools": [],
+      "system_prompt_folder": "",
+      "temperature": 0.2,
+      "top_p": 0.95,
+      "top_k": 40,
+      "token_selection_setting": "custom",
+      "llm_tools_gates": []
+    },
     "summarizer-gemini": {
       "model_id": "gemini-2.5-flash",
       "type": "GEMINI",
@@ -189,13 +226,13 @@
       "llm_tools": [
         "get_system_info",
         "drive",
-        "vscode"
+        "extract_files"
       ],
-      "system_prompt_folder": "system_prompt/003_claudeVSCode",
-      "temperature": 1.0,
+      "system_prompt_folder": "system_prompt/005_fileops",
+      "temperature": 0.4,
       "top_p": 0.95,
       "top_k": 40,
-      "token_selection_setting": "default",
+      "token_selection_setting": "custom",
       "llm_tools_gates": []
     },
     "summarizer-anthropic": {
@@ -213,10 +250,8 @@
         "vscode"
       ],
       "system_prompt_folder": "system_prompt/003_claudeVSCode",
-      "temperature": 1.0,
-      "top_p": null,
-      "top_k": null,
-      "token_selection_setting": "default",
+      "temperature": 0.4,
+      "token_selection_setting": "custom",
       "llm_tools_gates": []
     },
     "samaritan-voice": {
@@ -226,7 +261,7 @@
       "env_key": "XAI_API_KEY",
       "max_context": 5000,
       "enabled": true,
-      "description": "Samaritan reasoning brain (Grok, minimal tools \u2014 delegates execution)",
+      "description": "Samaritan conversation",
       "llm_call_timeout": 90,
       "llm_tools": [
         "get_system_info",
@@ -248,14 +283,43 @@
       "agent_call_stream": true,
       "stream_level": 3
     },
-    "samaritan-reasoning": {
-      "model_id": "grok-4-1-fast-reasoning",
+    "samaritan-voice-fast": {
+      "model_id": "grok-4-1-fast-non-reasoning",
       "type": "OPENAI",
       "host": "https://api.x.ai/v1",
       "env_key": "XAI_API_KEY",
       "max_context": 5000,
       "enabled": true,
-      "description": "Samaritan reasoning brain (Grok, minimal tools \u2014 delegates execution)",
+      "description": "Samaritan low-latency voice (non-reasoning, persistent xAI TTS)",
+      "llm_call_timeout": 60,
+      "llm_tools": [
+        "get_system_info",
+        "llm_call", 
+        "llm_list",
+        "search_tavily",
+        "search_xai",
+        "extract"
+      ],
+      "system_prompt_folder": "system_prompt/004_voice",
+      "temperature": 0.6,
+      "top_p": 0.9,
+      "top_k": null,
+      "max_tokens": 2048, 
+      "token_selection_setting": "custom",
+      "tool_suppress": true,
+      "memory_scan": false,
+      "conv_log": true,
+      "agent_call_stream": true,
+      "stream_level": 3
+    },
+    "samaritan-reasoning": {
+      "model_id": "claude-sonnet-4-6",
+      "type": "OPENAI",
+      "host": "https://api.anthropic.com/v1",
+      "env_key": "ANTHROPIC_API_KEY",
+      "max_context": 5000,
+      "enabled": true,
+      "description": "Samaritan reasoning brain",
       "llm_call_timeout": 90,
       "llm_tools": [
         "get_system_info",
@@ -269,8 +333,8 @@
       "temperature": 0.6,
       "top_p": 0.9,
       "top_k": null,
-      "max_tokens": 4096,
-      "token_selection_setting": "custom",
+      "max_tokens": 128000,
+      "token_selection_setting": "default",
       "memory_scan": false,
       "conv_log": true
     },

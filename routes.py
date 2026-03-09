@@ -132,6 +132,7 @@ async def cmd_help(client_id: str):
         "  !memstats                                 - memory system health dashboard\n"
         "  !membackfill                              - embed missing rows into Qdrant vector index\n"
         "  !memreconcile                             - remove orphaned Qdrant points not in MySQL\n"
+        "  !memreview [approve N,N|reject N,N|clear] - AI topic review with HITL approval\n"
         "  !memage                                   - manually trigger one topic-chunk aging pass\n"
         "  !memtrim [N]                              - hard-delete N oldest ST rows (escape valve; default: trim to LWM)\n"
         "\n"
@@ -732,6 +733,282 @@ async def cmd_memreconcile(client_id: str):
             await push_tok(client_id, f"Delete batch failed at offset {i}: {e}\n")
 
     await push_tok(client_id, f"Deleted {deleted}/{len(orphan_ids)} orphaned Qdrant points.")
+    await conditional_push_done(client_id)
+
+
+# ---------------------------------------------------------------------------
+# !memreview — AI-assisted topic review with HITL approval
+# ---------------------------------------------------------------------------
+_pending_reviews: dict[str, list[dict]] = {}  # client_id → list of proposals
+
+
+async def cmd_memreview(client_id: str, arg: str = ""):
+    """
+    !memreview [approve N,N,...] [reject N,N,...] [clear]
+
+    No args: Calls reviewer model (config: reviewer_model) to analyse all topics and propose merges/renames.
+    approve N,N,...: Execute approved proposals by number.
+    reject N,N,...: Remove proposals from the pending list.
+    clear: Discard all pending proposals.
+    """
+    from database import fetch_dicts, execute_sql
+    from memory import _ST, _LT
+
+    parts = arg.strip().split(maxsplit=1) if arg.strip() else []
+    subcmd = parts[0].lower() if parts else ""
+
+    # ── approve / reject / clear ─────────────────────────────────────────
+    if subcmd == "clear":
+        _pending_reviews.pop(client_id, None)
+        await push_tok(client_id, "Pending review proposals cleared.")
+        await conditional_push_done(client_id)
+        return
+
+    if subcmd in ("approve", "reject"):
+        proposals = _pending_reviews.get(client_id, [])
+        if not proposals:
+            await push_tok(client_id, "No pending proposals. Run !memreview first.")
+            await conditional_push_done(client_id)
+            return
+
+        nums_str = parts[1] if len(parts) > 1 else ""
+        try:
+            nums = [int(n.strip()) for n in nums_str.split(",") if n.strip()]
+        except ValueError:
+            await push_tok(client_id, "Usage: !memreview approve 1,2,3 or !memreview reject 1,2")
+            await conditional_push_done(client_id)
+            return
+
+        if not nums:
+            await push_tok(client_id, "Specify proposal numbers: !memreview approve 1,3")
+            await conditional_push_done(client_id)
+            return
+
+        if subcmd == "reject":
+            rejected = []
+            for n in sorted(nums, reverse=True):
+                if 1 <= n <= len(proposals):
+                    p = proposals.pop(n - 1)
+                    rejected.append(f"#{n} ({p.get('action', '?')} {p.get('from', '?')})")
+            if not proposals:
+                _pending_reviews.pop(client_id, None)
+            await push_tok(client_id, f"Rejected: {', '.join(rejected) if rejected else 'none matched'}")
+            await conditional_push_done(client_id)
+            return
+
+        # ── approve: execute proposals ───────────────────────────────
+        applied = []
+        errors = []
+        for n in sorted(nums):
+            if n < 1 or n > len(proposals):
+                errors.append(f"#{n}: out of range")
+                continue
+            p = proposals[n - 1]
+            action = p.get("action", "")
+            old_topic = p.get("from", "")
+            new_topic = p.get("to", "")
+            if not old_topic or not new_topic:
+                errors.append(f"#{n}: invalid proposal")
+                continue
+
+            try:
+                # Collect affected row IDs before updating
+                affected_ids = []
+                for table in (_ST, _LT):
+                    rows = await fetch_dicts(
+                        f"SELECT id FROM {table} WHERE topic = '{old_topic}'"
+                    )
+                    affected_ids.extend(int(r["id"]) for r in rows)
+
+                # Update MySQL (both ST and LT tables)
+                for table in (_ST, _LT):
+                    await execute_sql(
+                        f"UPDATE {table} SET topic = '{new_topic}' "
+                        f"WHERE topic = '{old_topic}'"
+                    )
+
+                # Update Qdrant payload to match
+                if affected_ids:
+                    try:
+                        from plugin_memory_vector_qdrant import get_vector_api
+                        vec = get_vector_api()
+                        if vec:
+                            vec._qc.set_payload(
+                                collection_name=vec._cfg["collection"],
+                                payload={"topic": new_topic},
+                                points=affected_ids,
+                            )
+                    except Exception as qe:
+                        errors.append(f"#{n}: MySQL OK but Qdrant update failed: {qe}")
+
+                applied.append(f"#{n}: {action} '{old_topic}' → '{new_topic}' ({len(affected_ids)} rows)")
+            except Exception as e:
+                errors.append(f"#{n}: {e}")
+
+        # Remove applied proposals (reverse order to preserve indices)
+        for n in sorted(nums, reverse=True):
+            if 1 <= n <= len(proposals):
+                proposals.pop(n - 1)
+        if not proposals:
+            _pending_reviews.pop(client_id, None)
+
+        result_lines = []
+        if applied:
+            result_lines.append("Applied:\n" + "\n".join(f"  {a}" for a in applied))
+        if errors:
+            result_lines.append("Errors:\n" + "\n".join(f"  {e}" for e in errors))
+        remaining = len(_pending_reviews.get(client_id, []))
+        if remaining:
+            result_lines.append(f"\n{remaining} proposal(s) still pending.")
+        await push_tok(client_id, "\n".join(result_lines) if result_lines else "No valid proposals to apply.")
+        await conditional_push_done(client_id)
+        return
+
+    # ── show pending proposals if any exist ───────────────────────────────
+    if subcmd == "" and client_id in _pending_reviews and _pending_reviews[client_id]:
+        proposals = _pending_reviews[client_id]
+        lines = [f"**Pending Topic Review ({len(proposals)} proposals)**\n"]
+        for i, p in enumerate(proposals, 1):
+            reason = p.get("reason", "")
+            lines.append(
+                f"  {i}. [{p.get('action', '?')}] "
+                f"'{p.get('from', '?')}' → '{p.get('to', '?')}'"
+                f"  ({p.get('from_count', '?')} rows → {p.get('to_count', '?')} rows)"
+            )
+            if reason:
+                lines.append(f"     Reason: {reason}")
+        lines.append("\nUsage: !memreview approve 1,3  |  !memreview reject 2  |  !memreview clear")
+        await push_tok(client_id, "\n".join(lines))
+        await conditional_push_done(client_id)
+        return
+
+    # ── generate new review ──────────────────────────────────────────────
+    from memory import _mem_plugin_cfg
+    _review_model = _mem_plugin_cfg().get("reviewer_model", "reviewer-gemini")
+    await push_tok(client_id, f"Analysing topics with {_review_model}...\n")
+
+    # Gather topic stats + sample content from both tiers
+    st_rows = await fetch_dicts(
+        f"SELECT topic, content, importance FROM {_ST} ORDER BY topic, id DESC"
+    )
+    lt_rows = await fetch_dicts(
+        f"SELECT topic, content, importance FROM {_LT} ORDER BY topic, id DESC"
+    )
+
+    # Build topic summary with sample content (max 3 samples per topic per tier)
+    topic_data: dict[str, dict] = {}
+    for tier_name, rows in [("ST", st_rows), ("LT", lt_rows)]:
+        for r in rows:
+            t = r.get("topic", "unknown")
+            if t not in topic_data:
+                topic_data[t] = {"st_count": 0, "lt_count": 0, "samples": []}
+            topic_data[t][f"{tier_name.lower()}_count"] = topic_data[t].get(f"{tier_name.lower()}_count", 0) + 1
+            # Keep max 3 samples per topic (truncated)
+            samples = topic_data[t]["samples"]
+            if len([s for s in samples if s.startswith(f"[{tier_name}]")]) < 3:
+                content = str(r.get("content", ""))[:200]
+                samples.append(f"[{tier_name}] {content}")
+
+    if not topic_data:
+        await push_tok(client_id, "No topics found in memory.")
+        await conditional_push_done(client_id)
+        return
+
+    # Build the review prompt
+    topic_lines = []
+    for slug, data in sorted(topic_data.items()):
+        total = data.get("st_count", 0) + data.get("lt_count", 0)
+        topic_lines.append(
+            f"\n### {slug} (ST={data.get('st_count', 0)}, LT={data.get('lt_count', 0)}, total={total})"
+        )
+        for s in data["samples"]:
+            topic_lines.append(f"  {s}")
+
+    prompt = (
+        "You are a topic hygiene reviewer for a personal AI memory system.\n"
+        "Below is a list of all topic slugs with row counts and sample content.\n\n"
+        "Analyse the topics and propose:\n"
+        "1. **merge**: Two topics that represent the same real-world subject but have different slugs. "
+        "The 'to' field should be the more established topic (higher row count or better name).\n"
+        "2. **rename**: A single topic with a poor or inconsistent slug name.\n\n"
+        "Rules:\n"
+        "- Only propose merges when content clearly overlaps (same real-world subject).\n"
+        "- Do NOT merge topics that merely share a word prefix (e.g. 'memory-system' and 'memory-roadmap' are distinct).\n"
+        "- Do NOT propose changes for topics that are already well-named and distinct.\n"
+        "- Prefer shorter, clearer slugs.\n"
+        "- If no changes are needed, return an empty proposals list.\n\n"
+        "Return ONLY valid JSON (no markdown fences, no commentary):\n"
+        '{"proposals": [{"action": "merge"|"rename", "from": "old-slug", "to": "new-slug", "reason": "brief explanation"}]}\n\n'
+        "## Topics\n"
+        + "\n".join(topic_lines)
+    )
+
+    # Call reviewer model
+    try:
+        from agents import llm_call as _llm_call
+        from state import current_client_id
+
+        token = current_client_id.set(client_id)
+        try:
+            result = await _llm_call(
+                model=_review_model,
+                prompt=prompt,
+                mode="text",
+                sys_prompt="none",
+                history="none",
+            )
+        finally:
+            current_client_id.reset(token)
+    except Exception as e:
+        await push_tok(client_id, f"Review failed: {e}")
+        await conditional_push_done(client_id)
+        return
+
+    # Parse JSON response
+    import json as _json
+    try:
+        # Strip markdown fences if model adds them despite instructions
+        raw = result.strip()
+        if raw.startswith("```"):
+            raw = "\n".join(raw.split("\n")[1:])
+        if raw.endswith("```"):
+            raw = "\n".join(raw.split("\n")[:-1])
+        parsed = _json.loads(raw.strip())
+        proposals = parsed.get("proposals", [])
+    except (_json.JSONDecodeError, AttributeError) as e:
+        await push_tok(client_id, f"Failed to parse reviewer response:\n{result[:500]}\n\nError: {e}")
+        await conditional_push_done(client_id)
+        return
+
+    if not proposals:
+        await push_tok(client_id, "Reviewer found no changes needed. Topics look clean.")
+        await conditional_push_done(client_id)
+        return
+
+    # Enrich proposals with row counts
+    for p in proposals:
+        from_slug = p.get("from", "")
+        to_slug = p.get("to", "")
+        from_data = topic_data.get(from_slug, {})
+        to_data = topic_data.get(to_slug, {})
+        p["from_count"] = from_data.get("st_count", 0) + from_data.get("lt_count", 0)
+        p["to_count"] = to_data.get("st_count", 0) + to_data.get("lt_count", 0)
+
+    # Store and display
+    _pending_reviews[client_id] = proposals
+
+    lines = [f"**Topic Review ({len(proposals)} proposals)**\n"]
+    for i, p in enumerate(proposals, 1):
+        lines.append(
+            f"  {i}. [{p.get('action', '?')}] "
+            f"'{p.get('from', '?')}' → '{p.get('to', '?')}'"
+            f"  ({p.get('from_count', '?')} rows → {p.get('to_count', '?')} rows)"
+        )
+        reason = p.get("reason", "")
+        if reason:
+            lines.append(f"     Reason: {reason}")
+    lines.append("\nUsage: !memreview approve 1,3  |  !memreview reject 2  |  !memreview clear")
+    await push_tok(client_id, "\n".join(lines))
     await conditional_push_done(client_id)
 
 
@@ -1560,6 +1837,8 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
                     await cmd_membackfill(client_id)
                 elif cmd == "memreconcile":
                     await cmd_memreconcile(client_id)
+                elif cmd == "memreview":
+                    await cmd_memreview(client_id, arg)
                 elif cmd == "memage":
                     await cmd_memage(client_id)
                 elif cmd == "memtrim":
@@ -1665,6 +1944,9 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
             return
         if cmd == "memreconcile":
             await cmd_memreconcile(client_id)
+            return
+        if cmd == "memreview":
+            await cmd_memreview(client_id, arg)
             return
         if cmd == "memage":
             await cmd_memage(client_id)

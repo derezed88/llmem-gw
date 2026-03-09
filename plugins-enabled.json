@@ -98,7 +98,8 @@
       "memory_age_minutes_timer": 360,
       "memory_age_entrycount": 50,
       "memory_age_trigger_minutes": 2880,
-      "identity_name": "samaritan"
+      "identity_name": "samaritan",
+      "reviewer_model": "reviewer-gemini"
     },
     "plugin_tmux": {
       "enabled": true,

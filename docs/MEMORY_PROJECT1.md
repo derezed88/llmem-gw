@@ -32,11 +32,10 @@ Session ends (!reset)
         │
         ▼
 samaritan_memory_shortterm  ◄── MySQL source of truth; also indexed in Qdrant (tier="short")
-        │                         Full-detail, never summarized in ST
-        │  aging: oldest unprotected topic chunk → haiku summarizer
+        │
+        │  after 48h (low-importance rows)
         ▼
-samaritan_memory_longterm   ◄── summary rows (1-5 per chunk) + verbatim rows (imp ≥ 8)
-                                 Semantically retrieved alongside ST in load_context_block()
+samaritan_memory_longterm   ◄── on-demand recall via tool call; Qdrant tier updated to "long"
         │
         │  future
         ▼
@@ -117,7 +116,7 @@ MySQL is always written first. Qdrant is updated as a fire-and-forget async side
 | `langchain-openai` | LLM dispatch (OpenAI-compatible) | In `requirements.txt` |
 | `langchain-google-genai` | LLM dispatch (Gemini) | In `requirements.txt` |
 
-### Infrastructure (nuc11 — 192.168.x.x)
+### Infrastructure (nuc11 — 192.168.10.101)
 
 | Service | Port | Purpose |
 |---|---|---|
@@ -181,22 +180,14 @@ CREATE TABLE samaritan_memory_longterm (
   topic         VARCHAR(255) NOT NULL,
   content       TEXT NOT NULL,
   importance    TINYINT DEFAULT 5,
-  source        ENUM('session','user','directive','assistant') DEFAULT 'session',
+  source        ENUM('session','user','directive') DEFAULT 'session',
   session_id    VARCHAR(255),
-  shortterm_id  INT COMMENT 'original shortterm row id (set for verbatim promotions)',
+  shortterm_id  INT COMMENT 'original shortterm row id',
   created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   aged_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  last_accessed TIMESTAMP NULL COMMENT 'updated when row retrieved by semantic search',
   INDEX idx_topic (topic),
   INDEX idx_importance (importance DESC)
 );
-
--- Add last_accessed to existing tables (run once if upgrading):
-ALTER TABLE samaritan_memory_longterm
-  ADD COLUMN last_accessed TIMESTAMP NULL,
-  MODIFY COLUMN source ENUM('session','user','directive','assistant') DEFAULT 'session';
-UPDATE samaritan_memory_longterm
-  SET last_accessed = GREATEST(aged_at, '2026-03-01') WHERE last_accessed IS NULL;
 
 CREATE TABLE samaritan_chat_summaries (
   id            INT AUTO_INCREMENT PRIMARY KEY,
@@ -501,46 +492,39 @@ Removing a topic: delete all rows with that topic from both memory tables.
 Rows age from short-term to long-term via two independent continuous background tasks
 started at server startup inside `llmem-gw.py`. No manual trigger or cron job is needed.
 
-ST rows are always kept full-detail. **No summarization happens in ST.** Summaries are written directly to LT.
-
 ```
 Server starts → asyncio.gather() launches two background loops:
 
 _age_count_task()   (count-pressure, interval: memory_age_count_timer minutes)
   ├── reads _age_cfg() fresh each cycle
   ├── skips if auto_memory_age=false or timer=-1
-  ├── if ST count <= short_hwm: skip
-  └── _age_topic_chunks(trigger="count")
-        ├── get topics in last recent_turns_protect ST rows → protected set
-        ├── waive protection if ALL rows for topic older than staleness_override_minutes
-        ├── build candidate topics ordered by oldest row first
-        └── loop until ST count < short_lwm:
-              pick oldest candidate topic
-              ├── fetch all ST rows for that topic
-              ├── call haiku summarizer → 1-5 summary rows → INSERT INTO longterm
-              ├── promote rows with importance >= chunk_importance_threshold verbatim → longterm
-              └── DELETE all ST rows for topic + vec.delete_memory() fire-and-forget
+  └── age_by_count(max_rows=200)
+        ├── reads entry_limit from config (memory_age_entrycount)
+        ├── if shortterm_count > entry_limit:
+        │     move overflow rows (lowest importance, oldest last_accessed) to longterm
+        └── asyncio.create_task(vec.update_tier(row_id, "long"))  ← Qdrant sync
 
 _age_minutes_task()   (staleness, interval: memory_age_minutes_timer minutes)
   ├── reads _age_cfg() fresh each cycle
   ├── skips if auto_memory_age=false or timer=-1
-  └── _age_topic_chunks(trigger="minutes", trigger_minutes=memory_age_trigger_minutes)
-        ├── same protection logic as count trigger
-        ├── only considers topics with at least one row older than trigger_minutes
-        └── same summarize → promote → delete loop until ST count < short_lwm
+  └── age_by_minutes(trigger_minutes=memory_age_trigger_minutes, max_rows=200)
+        ├── SELECT rows WHERE last_accessed < NOW() - INTERVAL N MINUTE
+        │   ORDER BY importance ASC, last_accessed ASC  LIMIT max_rows
+        ├── for each row:
+        │     ├── INSERT INTO longterm (copying all fields + shortterm_id)
+        │     ├── DELETE FROM shortterm WHERE id = row.id
+        │     └── asyncio.create_task(vec.update_tier(row_id, "long"))  ← Qdrant sync
+        └── returns count of rows moved (logged only)
 ```
 
-Manual overrides:
-- `!memage` — immediately run one count + staleness pass
-- `!memtrim [N]` — hard-delete N oldest/least-important ST rows (no summarization; escape valve for monotopic overflows)
+Manual override: ask Grok to delegate `memory_age(older_than_hours=24)` to age more aggressively.
 
 ---
 
 ## Enabling / Disabling
 
-The memory system is an optional feature. **All memory functionality is gated by `plugins-enabled.json`** under `plugin_config.memory`. When `enabled` is `false` (or the `memory` config block is absent), the system falls back to a single flat in-memory history — no persistence, no injection, no aging.
-
-**All changes take effect immediately — no server restart required.**
+The memory system is an optional feature. Configuration lives in `plugins-enabled.json`
+under `plugin_config.memory`. **All changes take effect immediately — no server restart required.**
 The server re-reads this config on every request and every aging cycle.
 
 ### Via llmemctl
@@ -596,9 +580,8 @@ Both `post_response_scan` (global) and `memory_scan` (per-model) must be `true` 
 ### What is NOT gated
 
 - The `memory_save` / `memory_recall` / `memory_age` **tools** remain registered regardless of these flags — they can still be called via direct tool use or delegation. The flags only suppress the *automatic* behaviors (injection, reset summarize, scan).
-- Memory aging (`_age_count_task` / `_age_minutes_task`) runs as continuous background loops started at server startup; controlled by `auto_memory_age` (not `enabled`). Set `auto_memory_age: false` to pause background aging without disabling memory entirely.
+- Memory aging (`_age_count_task` / `_age_minutes_task`) runs as continuous background loops started at server startup; it is not gated by these flags.
 - The behavior rule 8 mandatory-save instruction lives in the system prompt. To suppress it, edit `system_prompt/004_reasoning/.system_prompt_behavior` and remove rule 8, or set the model's `system_prompt_folder` to a folder without that rule.
-- When `enabled: false`, the only memory is a single flat in-memory history per session — it resets on `!reset` and does not survive server restart.
 
 ---
 
@@ -776,9 +759,9 @@ An infrastructure plugin with no LangChain tools. Loaded by `plugin_loader.py`; 
 ```json
 "plugin_memory_vector_qdrant": {
   "enabled": true,
-  "qdrant_host": "192.168.x.x",
+  "qdrant_host": "192.168.10.101",
   "qdrant_port": 6333,
-  "embed_url": "http://192.168.x.x:8000/v1/embeddings",
+  "embed_url": "http://192.168.10.101:8000/v1/embeddings",
   "embed_model": "nomic-embed-text",
   "collection": "samaritan_memory",
   "vector_dims": 768,
@@ -974,4 +957,5 @@ Priority = functionality gain ÷ implementation complexity. P1 = high value, low
 | P3 | Drive → short-term reload | Not built | Med | Inverse of archival: parse Drive export back into shortterm. Depends on archival being built first; blocked on P3 above. |
 | P3 | Hybrid search (BM25 + vector) | Not built | Low-Med | Add MySQL `FULLTEXT INDEX` on `content` + `topic` columns. In `load_context_block()` and `memory_recall`, run a `MATCH AGAINST` keyword query in parallel with the Qdrant ANN query, merge results, dedupe by `row_id`. Improves recall for exact-match queries (proper nouns, codes, dates, technical strings) where vector similarity may be weak. Scope: primarily benefits `memory_recall` tool calls; auto-injection already benefits from broad semantic matching. Implementation: ~3 lines schema, ~35 lines in `memory.py`. No new infrastructure — MySQL already holds the data. |
 | P4 | Semantic/vector search | **Built (2026-03-01)** | High | `plugin_memory_vector_qdrant.py` — Qdrant + nomic-embed-text on nuc11. Replaces load-all with top-K semantic retrieval per turn. Also solves `last_accessed` staleness: only semantically matched rows get timestamp updated. |
-| P4 | Stale Qdrant orphan cleanup | Not built | Low | If a MySQL row is deleted (e.g. manual dedup), the Qdrant point becomes a stale orphan. Currently harmless (hit returns a non-existent row_id which MySQL ignores). Fix: call `vec.delete_memory(row_id)` alongside any MySQL DELETE. |
+| P4 | Stale Qdrant orphan cleanup | **Built (2026-03-08)** | Low | `!memreconcile` — scrolls all Qdrant point IDs, diffs against MySQL, batch-deletes orphans in groups of 500. Use after manual DB row deletes. |
+| P4 | AI topic hygiene review (HITL) | **Built (2026-03-08)** | Med | `!memreview` — calls `reviewer-gemini` (configurable via `reviewer_model`) to propose topic merges/renames. Human approves/rejects by number. Applies approved changes to MySQL + Qdrant payloads atomically. |

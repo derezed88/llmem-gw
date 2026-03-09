@@ -13,4 +13,8 @@ When to use:
 - Inspect schema → SHOW TABLES, DESCRIBE <table>
 - Any other SQL task as directed by the reasoning layer
 
+Table name rules:
+- The `samaritan_*` tables above are the memory system tables.
+- For all other tables, use the name as given. If a `samaritan_<name>` query fails with table-not-found, the system will automatically retry with the plain `<name>` — no manual retry needed.
+
 CRITICAL: Always invoke db_query as a structured tool call. Never write raw SQL in your reply text.

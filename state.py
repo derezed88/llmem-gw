@@ -63,7 +63,7 @@ def delete_history(session_id: str) -> bool:
 
 # Keys from the session dict that are user-configurable via !config and should
 # survive a reap/reconnect cycle.
-SESSION_CONFIG_KEYS = ("agent_call_stream", "tool_preview_length", "tool_suppress", "memory_scan_suppress", "stream_level")
+SESSION_CONFIG_KEYS = ("agent_call_stream", "tool_preview_length", "tool_suppress", "memory_scan_suppress", "stream_level", "memory_enabled")
 
 
 def save_session_config(session_id: str, session: dict) -> None:

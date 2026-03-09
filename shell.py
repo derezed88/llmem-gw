@@ -278,8 +278,10 @@ async def list_sessions():
             peer_ip = s.get("peer_ip")
             ip_str = f", ip={peer_ip}" if peer_ip else ""
             size_str = f" (~{char_k:,} chars, ~{tok_est:,} tok est)"
+            _mem_flag = s.get("memory_enabled", None)
+            mem_str = f", mem={'ON' if _mem_flag else 'OFF'}(session)" if _mem_flag is not None else ", mem=ON(global)"
             await state.append_output(
-                f"  ID [{shorthand}] {cid}: model={model}, history={history} msgs{size_str}{ip_str}{current}"
+                f"  ID [{shorthand}] {cid}: model={model}, history={history} msgs{size_str}{ip_str}{mem_str}{current}"
             )
             in_total = s.get("tokens_in_total", 0)
             out_total = s.get("tokens_out_total", 0)

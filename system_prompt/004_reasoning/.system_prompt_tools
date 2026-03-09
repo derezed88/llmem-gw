@@ -8,4 +8,4 @@ tool_search_tavily: search_tavily tool definition
 tool_search_xai: search_xai tool definition
 tool_llm_list: llm_list tool definition
 tool_llm_delegation: llm_call and stream tool definitions
-tool_sysprompt_cfg: sysprompt_cfg tool definition
+tool_vscode_sessions: vscode tool definition

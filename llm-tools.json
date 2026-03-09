@@ -19,49 +19,54 @@
     "db": {
       "tools": ["db_query"],
       "always_active": false,
-      "heat_curve": [1, 1, 1],
+      "heat_curve": [2, 5],
       "sp_section": "tool_db_query"
     },
     "search": {
       "tools": ["search_ddgs", "search_google", "search_tavily", "search_xai"],
       "always_active": false,
-      "heat_curve": [1, 1, 1],
+      "heat_curve": [2, 5],
       "sp_section": "tool_search"
     },
     "drive": {
       "tools": ["google_drive"],
       "always_active": false,
-      "heat_curve": [1, 1, 1],
+      "heat_curve": [2, 5],
       "sp_section": "tool_google_drive"
     },
     "vscode": {
       "tools": ["vscode_sessions_list", "vscode_sessions_read"],
       "always_active": false,
-      "heat_curve": [1, 1],
+      "heat_curve": [2, 5],
       "sp_section": "tool_vscode_sessions"
     },
     "extract": {
-      "tools": ["url_extract"],
+      "tools": ["url_extract", "file_extract"],
       "always_active": false,
-      "heat_curve": [1, 1],
-      "sp_section": null
+      "heat_curve": [2, 5],
+      "sp_section": "tool_file_extract"
+    },
+    "extract_files": {
+      "tools": ["url_extract", "file_extract"],
+      "always_active": true,
+      "sp_section": "tool_file_extract"
     },
     "agent": {
       "tools": ["agent_call"],
       "always_active": false,
-      "heat_curve": [1, 1],
+      "heat_curve": [2, 5],
       "sp_section": null
     },
     "tmux": {
       "tools": ["tmux_new", "tmux_exec", "tmux_ls", "tmux_kill_session", "tmux_kill_server", "tmux_history", "tmux_history_limit", "tmux_call_limit"],
       "always_active": false,
-      "heat_curve": [1, 1, 1],
+      "heat_curve": [2, 5],
       "sp_section": null
     },
     "memory": {
       "tools": ["memory_save", "memory_recall", "memory_age", "memory_update"],
       "always_active": false,
-      "heat_curve": [1, 1, 1],
+      "heat_curve": [2, 5],
       "sp_section": null
     }
   },

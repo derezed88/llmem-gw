@@ -24,9 +24,3 @@ llm_call("samaritan-execution",
   "SELECT summary, created_at FROM samaritan_chat_summaries ORDER BY created_at DESC LIMIT 5")
 ```
 
-### What NOT to do on startup
-
-Do not attempt to query dropped tables. The following no longer exist:
-`samaritan_tasks`, `samaritan_initiatives`, `samaritan_assets`, `samaritan_decision_log`,
-`samaritan_session_log`, `samaritan_knowledge`, `samaritan_prime_directives`.
-Querying them will error. Use the memory tables instead.

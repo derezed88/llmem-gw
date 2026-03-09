@@ -59,14 +59,44 @@ def _drive_create_file(name: str, content: str, folder_id: str) -> str:
     return f"Created '{name}' — id: {file.get('id')}"
 
 def _drive_read_file(file_id: str) -> str:
+    data, _mime, _name = _drive_download_bytes(file_id)
+    return data.decode("utf-8")
+
+
+_GOOGLE_APPS_EXPORT = {
+    "application/vnd.google-apps.document":     ("text/plain",  ".txt"),
+    "application/vnd.google-apps.spreadsheet":  ("text/csv",    ".csv"),
+    "application/vnd.google-apps.presentation": ("text/plain",  ".txt"),
+    "application/vnd.google-apps.drawing":      ("image/png",   ".png"),
+}
+
+def _drive_download_bytes(file_id: str) -> tuple[bytes, str, str]:
+    """Download raw bytes from Drive. Returns (bytes, mime_type, file_name).
+
+    Native Google Workspace types (Docs, Sheets, Slides, Drawings) are exported
+    to a compatible format automatically via files().export().
+    """
     svc = _get_drive_service()
+    meta = svc.files().get(fileId=file_id, fields="mimeType,name").execute()
+    mime = meta.get("mimeType", "application/octet-stream")
+    name = meta.get("name", file_id)
+
+    if mime in _GOOGLE_APPS_EXPORT:
+        export_mime, ext = _GOOGLE_APPS_EXPORT[mime]
+        if not name.endswith(ext):
+            name = name + ext
+        data = svc.files().export(fileId=file_id, mimeType=export_mime).execute()
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        return data, export_mime, name
+
     request = svc.files().get_media(fileId=file_id)
     fh = io.BytesIO()
     downloader = MediaIoBaseDownload(fh, request)
     done = False
     while not done:
         _, done = downloader.next_chunk()
-    return fh.getvalue().decode("utf-8")
+    return fh.getvalue(), mime, name
 
 def _drive_append_file(file_id: str, new_text: str) -> str:
     current = _drive_read_file(file_id)

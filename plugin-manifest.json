@@ -184,6 +184,23 @@
         "url_extract"
       ]
     },
+    "plugin_extract_gemini": {
+      "type": "data_tool",
+      "file": "plugin_extract_gemini.py",
+      "description": "File content extraction via Gemini Files API (Drive file_id, URL, or local path)",
+      "dependencies": [
+        "google-genai",
+        "httpx"
+      ],
+      "env_vars": [
+        "GEMINI_API_KEY"
+      ],
+      "config_files": [],
+      "priority": 410,
+      "tools": [
+        "file_extract"
+      ]
+    },
     "plugin_claude_vscode_sessions": {
       "type": "client_interface",
       "file": "plugin_claude_vscode_sessions.py",

@@ -195,6 +195,8 @@ class PluginLoader:
                         importlib.import_module('google.auth')
                     elif 'tavily-python' in dep_name:
                         importlib.import_module('tavily')
+                    elif 'google-genai' in dep_name:
+                        importlib.import_module('google.genai')
                     else:
                         raise
                 except ImportError:

@@ -26,7 +26,7 @@ and gate settings are per-model in llm-models.json:
     "my-model": {
         ...
         "judge_config": {
-            "model":     "qwen35-judge",
+            "model":     "judge-qwen35",
             "gates":     ["prompt", "response", "tool", "memory"],
             "mode":      "block",
             "threshold": 0.7
@@ -147,7 +147,8 @@ def process(history: list[dict], session: dict, model_cfg: dict) -> list[dict]:
         if not is_gate_active("prompt", model_key, session):
             return list(history)
 
-        content = last.get("content", "")
+        from agents import _content_to_str
+        content = _content_to_str(last.get("content", ""))
         cfg = _get_effective_judge_cfg(model_key, session)
         if not cfg:
             return list(history)
@@ -192,7 +193,8 @@ def process(history: list[dict], session: dict, model_cfg: dict) -> list[dict]:
         if not is_gate_active("response", model_key, session):
             return list(history)
 
-        content = last.get("content", "")
+        from agents import _content_to_str
+        content = _content_to_str(last.get("content", ""))
         if not content:
             return list(history)
 

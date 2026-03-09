@@ -146,9 +146,7 @@
         "core",
         "db",
         "search",
-        "drive",
-        "extract",
-        "vscode"
+        "drive"
       ],
       "system_prompt_folder": "system_prompt/000_default",
       "temperature": 1.0,
@@ -157,7 +155,19 @@
       "token_selection_setting": "default",
       "llm_tools_gates": [
         "db_query"
-      ]
+      ],
+      "memory_scan": true,
+      "judge_config": {
+        "model": "judge-gemini",
+        "gates": [
+          "prompt",
+          "response",
+          "tool",
+          "memory"
+        ],
+        "mode": "warn",
+        "threshold": 0.5
+      }
     },
     "gemini25fl": {
       "database": "mymcp",
@@ -209,23 +219,25 @@
       "database": "qwen",
       "model_id": "Qwen3.5-9B-Q4_K_M.gguf",
       "type": "OPENAI",
-      "host": "http://localhost:11434/v1",
+      "host": "http://192.168.10.109:11434/v1",
       "max_context": 1000,
       "enabled": true,
       "description": "Qwen test model",
       "llm_call_timeout": 180,
-      "llm_tools": ["qwen"],
+      "llm_tools": [
+        "qwen"
+      ],
       "system_prompt_folder": "system_prompt/006_local",
       "token_selection_setting": "default"
     },
-    "qwen35-judge": {
+    "judge-qwen35": {
       "database": "qwen",
       "model_id": "Qwen3.5-9B-Q4_K_M.gguf",
       "type": "OPENAI",
-      "host": "http://localhost:11434/v1",
+      "host": "http://192.168.10.109:11434/v1",
       "max_context": 8000,
       "enabled": true,
-      "description": "Qwen3.5 judge role — evaluates prompts, responses, tool calls, and memory entries",
+      "description": "Qwen3.5 judge role \u2014 evaluates prompts, responses, tool calls, and memory entries",
       "llm_call_timeout": 60,
       "temperature": 0.1,
       "llm_tools": [],
@@ -334,7 +346,7 @@
       "llm_call_timeout": 60,
       "llm_tools": [
         "get_system_info",
-        "llm_call", 
+        "llm_call",
         "llm_list",
         "search_tavily",
         "search_xai",
@@ -344,7 +356,7 @@
       "temperature": 0.6,
       "top_p": 0.9,
       "top_k": null,
-      "max_tokens": 2048, 
+      "max_tokens": 2048,
       "token_selection_setting": "custom",
       "tool_suppress": true,
       "memory_scan": false,
@@ -404,6 +416,21 @@
       "token_selection_setting": "custom",
       "llm_tools_gates": [],
       "conv_log": true
+    },
+    "judge-gemini": {
+      "database": "mymcp",
+      "model_id": "gemini-2.5-flash-lite",
+      "type": "GEMINI",
+      "host": null,
+      "env_key": "GEMINI_API_KEY",
+      "max_context": 32000,
+      "enabled": true,
+      "description": "Gemini-2.5-flash-lite judge role \u2014 fast, deterministic verdict model",
+      "llm_call_timeout": 30,
+      "temperature": 0.0,
+      "llm_tools": [],
+      "system_prompt_folder": "system_prompt/007_judge",
+      "token_selection_setting": "custom"
     }
   },
   "limits": {

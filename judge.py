@@ -10,7 +10,7 @@ Per-model judge config in llm-models.json
 Each model can carry a `judge_config` dict:
 
     "judge_config": {
-        "model":     "qwen35-judge",
+        "model":     "judge-qwen35",
         "gates":     ["prompt", "response", "tool", "memory"],
         "mode":      "block",
         "threshold": 0.7

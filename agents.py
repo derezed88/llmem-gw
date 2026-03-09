@@ -1058,7 +1058,9 @@ async def auto_enrich_context(messages: list[dict], client_id: str) -> list[dict
 
     # Inject short-term memory context block
     # Build a query string from the last few turns for semantic retrieval
-    if _memory_feature("context_injection"):
+    _sess_mem_flag = sessions.get(client_id, {}).get("memory_enabled", None)
+    _mem_injection_enabled = (_sess_mem_flag is None or _sess_mem_flag) and _memory_feature("context_injection")
+    if _mem_injection_enabled:
         try:
             from memory import load_context_block, load_topic_list
             # Prefer model-derived current_topic as query seed (set from <<topic>> tag each turn).

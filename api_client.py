@@ -1,65 +1,148 @@
-import requests
+"""
+AgentClient — async HTTP client for llmem-gw API plugin (plugin_client_api).
+
+Protocol (plugin_client_api.py):
+  POST /api/v1/submit  {"text":..., "client_id":..., "wait":true/false, "timeout":N}
+  GET  /api/v1/stream/{client_id}   SSE: event:tok data:{"text":"..."}, event:done, event:error
+  GET  /api/v1/health
+  GET  /api/v1/sessions
+  Auth: Authorization: Bearer <key>
+
+Usage:
+  client = AgentClient("http://localhost:8767", client_id="my-session", api_key="...")
+  result = await client.send("hello", timeout=30)
+  async for chunk in client.stream("hello", timeout=30):
+      print(chunk, end="", flush=True)
+"""
+
+import asyncio
 import json
+import os
 import time
+from typing import AsyncGenerator, Optional
 
-base_url = "http://localhost:8765"
+import httpx
 
-# First, discover what endpoints are available
-def discover_endpoints():
-    """Make a few test calls to discover API"""
-    endpoints_to_test = [
-        "/api/v1/delegate",
-        "/api/v1/execute",
-        "/api/v1/query",
-        "/v1/delegate",
-        "/delegate"
-    ]
-    
-    for endpoint in endpoints_to_test:
-        url = f"{base_url}{endpoint}"
-        try:
-            response = requests.post(url, json={"prompt": "test", "mode": "tool"}, timeout=5)
-            print(f"\n{endpoint}: Status {response.status_code}")
-            if response.status_code == 200:
-                print(f"  Response: {response.text[:100]}")
-        except Exception as e:
-            print(f"{endpoint}: Error - {e}")
 
-def call_api(prompt, mode="reasoning", delegatee="samaritan-execution"):
-    """Make API call to localhost:8765"""
-    # Try multiple endpoints
-    for endpoint in ["/api/v1/delegate", "/api/v1/execute", "/delegate"]:
-        url = f"{base_url}{endpoint}"
-        data = {"delegatee": delegatee, "prompt": prompt, "mode": mode}
-        try:
-            response = requests.post(url, json=data, timeout=30)
-            print(f"\n=== Endpoint: {endpoint} ===")
-            print(f"Status: {response.status_code}")
-            if response.status_code == 200:
-                return response.json()
-            else:
-                return {"error": response.status_code, "message": response.text[:200]}
-        except Exception as e:
-            print(f"Error: {e}")
-    return {"error": "All endpoints failed"}
+class AgentClient:
+    def __init__(
+        self,
+        base_url: str,
+        client_id: str = "",
+        api_key: Optional[str] = None,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.client_id = client_id or f"api-{os.urandom(4).hex()}"
+        self._headers = {}
+        if api_key:
+            self._headers["Authorization"] = f"Bearer {api_key}"
 
-def main():
-    """Loop and call the API"""
-    print("API Client started on localhost:8765")
-    
-    # First discover
-    print("\n=== Discovering endpoints ===")
-    discover_endpoints()
-    
-    # Then test loop
-    print("\n=== Starting test loop ===")
-    for i in range(10):
-        prompt = f"Loop iteration {i}: Get system time, query qwen_base"
-        result = call_api(prompt)
-        print(json.dumps(result, indent=2))
-        time.sleep(2)
-    
-    print("\nTest loop complete")
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-if __name__ == "__main__":
-    main()
+    async def send(self, message: str, timeout: int = 60) -> str:
+        """
+        Submit a message synchronously (wait=true).
+        Returns the full text response as a string.
+        Raises httpx.HTTPError or RuntimeError on failure.
+        """
+        payload = {
+            "text": message,
+            "client_id": self.client_id,
+            "wait": True,
+            "timeout": timeout,
+        }
+        async with httpx.AsyncClient(timeout=timeout + 10) as http:
+            resp = await http.post(
+                f"{self.base_url}/api/v1/submit",
+                json=payload,
+                headers=self._headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        status = data.get("status", "")
+        if status == "error":
+            raise RuntimeError(f"Agent error: {data.get('text', '')}")
+        if status == "timeout":
+            raise asyncio.TimeoutError(f"Agent timed out: {data.get('text', '')}")
+        return data.get("text", "")
+
+    async def stream(self, message: str, timeout: int = 60) -> AsyncGenerator[str, None]:
+        """
+        Submit a message asynchronously, then consume the SSE stream.
+        Yields text chunks as they arrive; raises RuntimeError on error events.
+        """
+        # 1. Fire the request (wait=false)
+        payload = {
+            "text": message,
+            "client_id": self.client_id,
+            "wait": False,
+        }
+        async with httpx.AsyncClient(timeout=30) as http:
+            resp = await http.post(
+                f"{self.base_url}/api/v1/submit",
+                json=payload,
+                headers=self._headers,
+            )
+            resp.raise_for_status()
+
+        # 2. Connect to SSE stream and yield chunks
+        deadline = time.monotonic() + timeout
+        async with httpx.AsyncClient(timeout=timeout + 10) as http:
+            async with http.stream(
+                "GET",
+                f"{self.base_url}/api/v1/stream/{self.client_id}",
+                headers=self._headers,
+            ) as resp:
+                resp.raise_for_status()
+                event_type = "message"
+                async for raw_line in resp.aiter_lines():
+                    if time.monotonic() > deadline:
+                        raise asyncio.TimeoutError("stream timeout")
+                    line = raw_line.strip()
+                    if not line:
+                        event_type = "message"  # reset after blank separator
+                        continue
+                    if line.startswith(":"):
+                        continue  # keepalive comment
+                    if line.startswith("event:"):
+                        event_type = line[6:].strip()
+                        continue
+                    if line.startswith("data:"):
+                        data_str = line[5:].strip()
+                        if event_type == "tok":
+                            try:
+                                yield json.loads(data_str).get("text", "")
+                            except json.JSONDecodeError:
+                                yield data_str
+                        elif event_type == "done":
+                            return
+                        elif event_type == "error":
+                            try:
+                                msg = json.loads(data_str).get("message", data_str)
+                            except json.JSONDecodeError:
+                                msg = data_str
+                            raise RuntimeError(f"Agent error: {msg}")
+                        # flush events: ignore (stream stays open until done)
+
+    async def health(self) -> dict:
+        """GET /api/v1/health → dict (expects {"status": "ok", ...})"""
+        async with httpx.AsyncClient(timeout=10) as http:
+            resp = await http.get(
+                f"{self.base_url}/api/v1/health",
+                headers=self._headers,
+            )
+            resp.raise_for_status()
+            return resp.json()
+
+    async def sessions(self) -> list:
+        """GET /api/v1/sessions → list of session dicts"""
+        async with httpx.AsyncClient(timeout=10) as http:
+            resp = await http.get(
+                f"{self.base_url}/api/v1/sessions",
+                headers=self._headers,
+            )
+            resp.raise_for_status()
+            return resp.json().get("sessions", [])

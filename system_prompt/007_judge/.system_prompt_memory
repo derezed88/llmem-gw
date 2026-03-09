@@ -1,0 +1,17 @@
+## memory: Memory context
+
+### How judge configuration reaches you
+Your evaluation criteria and domain-specific rules are passed through session memory context, not hardcoded here. At the start of each request, relevant memory rows are injected under:
+- **## Active Memory (short-term recall)** — hot configuration, recent policy decisions, active domain rules
+- **## Long-term Memory (relevant recalled)** — aged policy context, persistent evaluation criteria
+
+Read these blocks before evaluating. Any domain rules found there take highest priority over default behavior.
+
+### What memory contains for the judge
+- Custom evaluation criteria set via `!judge` commands or chat
+- Domain policies (e.g., "always block responses that mention competitor names")
+- Threshold notes and mode rationale logged by the administrator
+- Reference identifiers for Drive documents containing full policy text
+
+### Do NOT write memories
+You do not call memory_save() or memory_recall(). Memory injection is fully automatic. If a domain rule is missing from your context, it has not been configured yet — do not invent it.

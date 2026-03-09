@@ -198,6 +198,20 @@ async def cmd_help(client_id: str):
         "    read <key>                               - show one limit\n"
         "    write <key> <value>                      - set a limit\n"
         "\n"
+        "Judge (LLM-as-judge enforcement):\n"
+        "  !judge                                    - show judge config for current model/session\n"
+        "  !judge list                               - list judge configs for all models\n"
+        "  !judge on <gate|all>                      - enable gate (prompt/response/tool/memory/all)\n"
+        "  !judge off <gate|all>                     - disable gate for this session\n"
+        "  !judge model <name>                       - set judge model for this session\n"
+        "  !judge mode block|warn                    - block (deny) or warn (log+allow)\n"
+        "  !judge threshold <0.0-1.0>                - set score threshold\n"
+        "  !judge reset                              - clear all session overrides\n"
+        "  !judge test <text>                        - run ad-hoc evaluation\n"
+        "  !judge set <model> <field> <value>        - persist judge_config to llm-models.json\n"
+        "    fields: model, mode, threshold, gates\n"
+        "  Note: enable plugin_history_judge in chain for tool+memory gates to be active.\n"
+        "\n"
         "AI tools:\n"
         "  get_system_info()                         - show date/time/status\n"
         "  llm_call(model, prompt, ...)              - call a model (mode/sys_prompt/history/tool)\n"
@@ -1674,6 +1688,14 @@ async def cmd_vscode(client_id: str, arg: str):
     await conditional_push_done(client_id)
 
 
+async def cmd_judge(client_id: str, arg: str, session: dict):
+    """!judge — LLM-as-judge configuration and control."""
+    from judge import cmd_judge as _judge_cmd
+    result = await _judge_cmd(client_id, arg, session)
+    await push_tok(client_id, result + "\n")
+    await conditional_push_done(client_id)
+
+
 async def cmd_stream(client_id: str, arg: str, session: dict):
     """!stream [0-3] — show or set response streaming/latency optimization level.
 
@@ -1969,6 +1991,9 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
             return
         if cmd == "stream":
             await cmd_stream(client_id, arg, session)
+            return
+        if cmd == "judge":
+            await cmd_judge(client_id, arg, session)
             return
         if cmd == "stop":
             await cmd_stop(client_id)

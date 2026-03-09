@@ -98,6 +98,9 @@ def load_llm_registry():
                 "agent_call_stream": config.get('agent_call_stream', None),
                 "stream_level": config.get('stream_level', None),
                 "database": config.get('database'),
+                # Judge config: per-model LLM-as-judge enforcement
+                # None = no judging. Dict with keys: model, gates, mode, threshold
+                "judge_config": config.get('judge_config', None),
             }
 
         return registry

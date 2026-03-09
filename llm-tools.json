@@ -12,7 +12,7 @@
       "sp_section": null
     },
     "admin": {
-      "tools": ["model", "llm_tools", "model_cfg", "sysprompt_cfg", "config_cfg", "limits_cfg"],
+      "tools": ["model", "llm_tools", "model_cfg", "sysprompt_cfg", "config_cfg", "limits_cfg", "judge_configure"],
       "always_active": true,
       "sp_section": null
     },
@@ -21,6 +21,23 @@
       "always_active": false,
       "heat_curve": [2, 5],
       "sp_section": "tool_db_query"
+    },
+    "qwen": {
+      "tools": [
+      "db_query", 
+      "get_system_info", 
+      "search_tavily",
+      "tmux_new", 
+      "tmux_exec", 
+      "tmux_ls", 
+      "tmux_kill_session", 
+      "tmux_kill_server", 
+      "tmux_history", 
+      "tmux_history_limit", 
+      "tmux_call_limit"
+    ],
+      "always_active": true,
+      "sp_section": null
     },
     "search": {
       "tools": ["search_ddgs", "search_google", "search_tavily", "search_xai"],

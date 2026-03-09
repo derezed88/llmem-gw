@@ -3,6 +3,7 @@
   "default_model": "samaritan-voice",
   "models": {
     "gpt5m": {
+      "database": "mymcp",
       "model_id": "gpt-5-mini",
       "type": "OPENAI",
       "host": "https://api.openai.com/v1",
@@ -28,6 +29,7 @@
       "token_selection_setting": "default"
     },
     "gpt5n": {
+      "database": "mymcp",
       "model_id": "gpt-5-nano",
       "type": "OPENAI",
       "host": "https://api.openai.com/v1",
@@ -53,6 +55,7 @@
       "token_selection_setting": "default"
     },
     "gpt4om": {
+      "database": "mymcp",
       "model_id": "gpt-4o-mini",
       "type": "OPENAI",
       "host": "https://api.openai.com/v1",
@@ -78,6 +81,7 @@
       "token_selection_setting": "default"
     },
     "grok41fr": {
+      "database": "mymcp",
       "model_id": "grok-4-1-fast-reasoning",
       "type": "OPENAI",
       "host": "https://api.x.ai/v1",
@@ -103,6 +107,7 @@
       "token_selection_setting": "default"
     },
     "grok41fnr": {
+      "database": "mymcp",
       "model_id": "grok-4-1-fast-non-reasoning",
       "type": "OPENAI",
       "host": "https://api.x.ai/v1",
@@ -128,6 +133,7 @@
       "token_selection_setting": "default"
     },
     "gemini25f": {
+      "database": "mymcp",
       "model_id": "gemini-2.5-flash",
       "type": "GEMINI",
       "host": null,
@@ -154,6 +160,7 @@
       ]
     },
     "gemini25fl": {
+      "database": "mymcp",
       "model_id": "gemini-2.5-flash-lite",
       "type": "GEMINI",
       "host": null,
@@ -178,6 +185,7 @@
       "llm_tools_gates": []
     },
     "extractor-gemini": {
+      "database": "mymcp",
       "model_id": "gemini-2.0-flash",
       "type": "GEMINI",
       "host": null,
@@ -197,7 +205,35 @@
       "token_selection_setting": "custom",
       "llm_tools_gates": []
     },
+    "qwen35": {
+      "database": "qwen",
+      "model_id": "Qwen3.5-9B-Q4_K_M.gguf",
+      "type": "OPENAI",
+      "host": "http://localhost:11434/v1",
+      "max_context": 1000,
+      "enabled": true,
+      "description": "Qwen test model",
+      "llm_call_timeout": 180,
+      "llm_tools": ["qwen"],
+      "system_prompt_folder": "system_prompt/006_local",
+      "token_selection_setting": "default"
+    },
+    "qwen35-judge": {
+      "database": "qwen",
+      "model_id": "Qwen3.5-9B-Q4_K_M.gguf",
+      "type": "OPENAI",
+      "host": "http://localhost:11434/v1",
+      "max_context": 8000,
+      "enabled": true,
+      "description": "Qwen3.5 judge role — evaluates prompts, responses, tool calls, and memory entries",
+      "llm_call_timeout": 60,
+      "temperature": 0.1,
+      "llm_tools": [],
+      "system_prompt_folder": "system_prompt/007_judge",
+      "token_selection_setting": "custom"
+    },
     "reviewer-gemini": {
+      "database": "mymcp",
       "model_id": "gemini-2.5-flash",
       "type": "GEMINI",
       "host": null,
@@ -215,8 +251,9 @@
       "llm_tools_gates": []
     },
     "summarizer-gemini": {
+      "database": "mymcp",
       "model_id": "gemini-2.5-flash",
-      "type": "GEMINI",
+      "type": "OPENAI",
       "host": null,
       "env_key": "GEMINI_API_KEY",
       "max_context": 100000,
@@ -236,6 +273,7 @@
       "llm_tools_gates": []
     },
     "summarizer-anthropic": {
+      "database": "mymcp",
       "model_id": "claude-haiku-4-5-20251001",
       "type": "OPENAI",
       "host": "https://api.anthropic.com/v1",
@@ -255,6 +293,7 @@
       "llm_tools_gates": []
     },
     "samaritan-voice": {
+      "database": "mymcp",
       "model_id": "grok-4-1-fast-reasoning",
       "type": "OPENAI",
       "host": "https://api.x.ai/v1",
@@ -284,6 +323,7 @@
       "stream_level": 3
     },
     "samaritan-voice-fast": {
+      "database": "mymcp",
       "model_id": "grok-4-1-fast-non-reasoning",
       "type": "OPENAI",
       "host": "https://api.x.ai/v1",
@@ -313,6 +353,7 @@
       "stream_level": 3
     },
     "samaritan-reasoning": {
+      "database": "mymcp",
       "model_id": "claude-sonnet-4-6",
       "type": "OPENAI",
       "host": "https://api.anthropic.com/v1",
@@ -323,6 +364,7 @@
       "llm_call_timeout": 90,
       "llm_tools": [
         "get_system_info",
+        "agent_call",
         "llm_call",
         "llm_list",
         "search_tavily",
@@ -339,6 +381,7 @@
       "conv_log": true
     },
     "samaritan-execution": {
+      "database": "mymcp",
       "model_id": "gpt-4o-mini",
       "type": "OPENAI",
       "host": "https://api.openai.com/v1",
@@ -366,7 +409,7 @@
   "limits": {
     "max_at_llm_depth": 1,
     "max_agent_call_depth": 1,
-    "max_tool_iterations": 100
+    "max_tool_iterations": -1
   },
   "metadata": {
     "last_modified": "2026-02-25",

@@ -1,0 +1,26 @@
+## tool-file-extract: file_extract tool definition
+
+### file_extract(file_id, url, local_path, prompt) -> str
+Extract or interpret the content of any file using Gemini multimodal AI.
+Handles PDFs, images, audio, video, Google Workspace docs, plain text, CSV, and most file types.
+
+Provide EXACTLY ONE source parameter:
+  file_id    -- Google Drive file ID (use google_drive list first to find it)
+  url        -- HTTP/HTTPS URL pointing directly to the file
+  local_path -- Absolute path to a file on this server's filesystem
+
+Optional:
+  prompt -- Focused extraction instruction. Default: full content as plain text.
+            Examples: "summarize key points", "extract all tables", "transcribe audio",
+            "what are the action items?", "list all names and dates mentioned"
+
+When to use:
+- The user asks to read, summarize, or extract content from a PDF, image, or non-text file.
+- The user references a Drive file that is not plain text (PDF, image, spreadsheet, slides, etc.).
+- A URL points to a downloadable file (not a web page — use url_extract for HTML pages).
+
+Workflow for Drive files:
+  1. Call google_drive(operation="list") to find the file ID by name.
+  2. Call file_extract(file_id="<id>", prompt="<task>").
+
+Note: google_drive(operation="read") only works for plain-text files. Use file_extract for everything else.

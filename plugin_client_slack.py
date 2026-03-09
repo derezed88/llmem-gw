@@ -238,6 +238,11 @@ class SlackClientPlugin(BasePlugin):
         def _channel_repl(m):
             return f"#{m.group(2)}" if m.group(2) else f"#{m.group(1)}"
         text = cls._SLACK_CHANNEL_RE.sub(_channel_repl, text)
+        # Slack encodes &, <, > as HTML entities in event payloads
+        text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        # Slack auto-converts straight quotes to curly/smart quotes — normalize back
+        text = text.replace("\u2018", "'").replace("\u2019", "'")   # left/right single quote
+        text = text.replace("\u201c", '"').replace("\u201d", '"')   # left/right double quote
         return text
 
     # =========================================================================

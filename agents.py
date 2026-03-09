@@ -574,6 +574,19 @@ async def execute_tool(client_id: str, tool_name: str, tool_args: dict) -> str:
         await push_tok(client_id, f"\n[GATE DENIED] {tool_name}\n")
         return gate_err
 
+    # Judge tool gate — LLM-as-judge evaluation (no-op when plugin not loaded)
+    try:
+        import judge as _judge_mod
+        _judge_sess = sessions.get(client_id, {})
+        _judge_ok, _judge_err = await _judge_mod.check_tool_gate(
+            client_id, sess_model, _judge_sess, tool_name, tool_args
+        )
+        if not _judge_ok:
+            await push_tok(client_id, f"\n[JUDGE BLOCKED] {tool_name}\n")
+            return _judge_err
+    except ImportError:
+        pass
+
     # Get executor function dynamically
     executor = get_tool_executor(tool_name)
     if not executor:
@@ -910,6 +923,18 @@ async def _scan_and_save_memories(text: str, client_id: str, model_key: str) -> 
     from tools import _memory_save_exec
     saved = 0
 
+    # Judge memory gate helper — no-op if plugin not loaded
+    async def _judge_memory_ok(topic: str, content: str) -> bool:
+        try:
+            import judge as _jm
+            _sess = sessions.get(client_id, {})
+            allowed, _ = await _jm.check_memory_gate(client_id, model_key, _sess, topic, content)
+            if not allowed:
+                log.info(f"memory_scan: judge blocked topic={topic!r} client={client_id}")
+            return allowed
+        except ImportError:
+            return True
+
     # Pass 1: function-call syntax  memory_save(topic="...", content="...", importance=N)
     for m in _MEMORY_SAVE_RE.finditer(text):
         topic = m.group("topic").strip()
@@ -920,6 +945,8 @@ async def _scan_and_save_memories(text: str, client_id: str, model_key: str) -> 
         raw_source = m.group("source")
         source = raw_source if raw_source in ("user", "session") else "assistant"
         if not topic or not content:
+            continue
+        if not await _judge_memory_ok(topic, content):
             continue
         try:
             result = await _memory_save_exec(
@@ -950,6 +977,8 @@ async def _scan_and_save_memories(text: str, client_id: str, model_key: str) -> 
             source = raw_source if raw_source in ("user", "session") else "assistant"
             if not topic or not content:
                 continue
+            if not await _judge_memory_ok(topic, content):
+                continue
             try:
                 result = await _memory_save_exec(
                     topic=topic, content=content, importance=importance, source=source
@@ -976,6 +1005,8 @@ async def _scan_and_save_memories(text: str, client_id: str, model_key: str) -> 
             raw_source = params.get("source", "")
             source = raw_source if raw_source in ("user", "session") else "assistant"
             if not topic or not content:
+                continue
+            if not await _judge_memory_ok(topic, content):
                 continue
             try:
                 result = await _memory_save_exec(

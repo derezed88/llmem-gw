@@ -1059,6 +1059,116 @@ class PluginManager:
         else:
             print(f"{Colors.RED}✗ Unknown action '{action}'. Valid: list, read, write{Colors.RESET}")
 
+    def judge_cmd(self, args: list):
+        """Handle: llmemctl judge [list|set|enable-plugin|disable-plugin]
+
+        Subcommands
+        -----------
+        list                          - show judge_config for all models
+        set <model> <field> <value>   - persist a judge_config field to llm-models.json
+          fields: model, mode, threshold, gates (comma-separated)
+        enable-plugin                 - add plugin_history_judge to the history chain
+        disable-plugin                - remove plugin_history_judge from the history chain
+        """
+        action = args[0] if args else "list"
+
+        if action == "list":
+            try:
+                with open(self.config_path.replace("plugins-enabled.json", "llm-models.json")) as f:
+                    import json as _json
+                    data = _json.load(f)
+                models = data.get("models", {})
+                found = False
+                print(f"\n{Colors.BOLD}Judge configs:{Colors.RESET}")
+                for mname, mcfg in sorted(models.items()):
+                    jcfg = mcfg.get("judge_config")
+                    if jcfg:
+                        found = True
+                        print(
+                            f"  {Colors.GREEN}{mname}{Colors.RESET}: "
+                            f"judge={jcfg.get('model','?')}  "
+                            f"gates={jcfg.get('gates',[])}  "
+                            f"mode={jcfg.get('mode','block')}  "
+                            f"threshold={jcfg.get('threshold',0.7)}"
+                        )
+                if not found:
+                    print("  (no judge configs set — use: llmemctl judge set <model> model <judge-model>)")
+                print()
+            except Exception as e:
+                print(f"{Colors.RED}✗ Error reading llm-models.json: {e}{Colors.RESET}")
+
+        elif action == "set":
+            # judge set <model> <field> <value>
+            if len(args) < 4:
+                print(f"{Colors.RED}Usage: judge set <model> <field> <value>{Colors.RESET}")
+                print("  fields: model, mode, threshold, gates")
+                return
+            target_model = args[1]
+            field = args[2].lower()
+            value_str = args[3]
+
+            if field not in ("model", "mode", "threshold", "gates"):
+                print(f"{Colors.RED}✗ Unknown field '{field}'. Valid: model, mode, threshold, gates{Colors.RESET}")
+                return
+
+            models_path = self.config_path.replace("plugins-enabled.json", "llm-models.json")
+            try:
+                import json as _json
+                with open(models_path) as f:
+                    data = _json.load(f)
+                models = data.get("models", {})
+                if target_model not in models:
+                    print(f"{Colors.RED}✗ Model '{target_model}' not found in llm-models.json{Colors.RESET}")
+                    return
+
+                if field == "gates":
+                    value = [g.strip() for g in value_str.split(",") if g.strip()]
+                    invalid = [g for g in value if g not in ("prompt", "response", "tool", "memory")]
+                    if invalid:
+                        print(f"{Colors.RED}✗ Invalid gates: {invalid}{Colors.RESET}")
+                        return
+                elif field == "threshold":
+                    try:
+                        value = float(value_str)
+                        if not (0.0 <= value <= 1.0):
+                            raise ValueError()
+                    except ValueError:
+                        print(f"{Colors.RED}✗ threshold must be 0.0–1.0{Colors.RESET}")
+                        return
+                elif field == "mode":
+                    if value_str not in ("block", "warn"):
+                        print(f"{Colors.RED}✗ mode must be 'block' or 'warn'{Colors.RESET}")
+                        return
+                    value = value_str
+                else:
+                    value = value_str  # model name — no server validation here
+
+                existing = dict(models[target_model].get("judge_config") or {})
+                existing[field] = value
+                data["models"][target_model]["judge_config"] = existing
+                with open(models_path, "w") as f:
+                    _json.dump(data, f, indent=2)
+                print(f"{Colors.GREEN}✓{Colors.RESET} judge_config[{field}]={value!r} set for model '{target_model}'.")
+            except Exception as e:
+                print(f"{Colors.RED}✗ Error: {e}{Colors.RESET}")
+
+        elif action == "enable-plugin":
+            if not self.history_chain_add("plugin_history_judge"):
+                print(f"{Colors.YELLOW}Note: plugin may already be in chain.{Colors.RESET}")
+            else:
+                print(f"{Colors.GREEN}✓{Colors.RESET} plugin_history_judge added to history chain.")
+                print("  Restart the server for the change to take effect.")
+
+        elif action == "disable-plugin":
+            if not self.history_chain_remove("plugin_history_judge"):
+                print(f"{Colors.YELLOW}Note: plugin may not be in chain.{Colors.RESET}")
+            else:
+                print(f"{Colors.GREEN}✓{Colors.RESET} plugin_history_judge removed from history chain.")
+                print("  Restart the server for the change to take effect.")
+
+        else:
+            print(f"{Colors.RED}✗ Unknown judge subcommand '{action}'. Valid: list, set, enable-plugin, disable-plugin{Colors.RESET}")
+
     def memory_cmd(self, args: list):
         """Handle: agentctl memory status|enable|disable [feature]
 
@@ -1431,6 +1541,12 @@ class PluginManager:
         print("  memory set memory_age_trigger_minutes <min>   - Staleness threshold in minutes")
         print("  memory set memory_age_minutes_timer <min|-1>  - Staleness check interval (min)")
         print("  memory test                                   - Runtime test: toggle enable/disable vs live server")
+        print(f"\n{Colors.BOLD}Judge Commands:{Colors.RESET}")
+        print("  judge list                                    - Show judge_config for all models")
+        print("  judge set <model> <field> <value>             - Persist judge config field")
+        print("    fields: model, mode (block|warn), threshold (0.0-1.0), gates (comma-sep)")
+        print("  judge enable-plugin                           - Add plugin_history_judge to chain")
+        print("  judge disable-plugin                          - Remove plugin_history_judge from chain")
         print(f"\n{Colors.BOLD}Other:{Colors.RESET}")
         print("  help                              - Show this command list")
         print("  quit                              - Exit plugin manager")
@@ -1536,6 +1652,8 @@ class PluginManager:
                 self.limits_cfg_cmd(arg.split() if arg else [])
             elif action == "memory":
                 self.memory_cmd(arg.split() if arg else [])
+            elif action == "judge":
+                self.judge_cmd(arg.split() if arg else [])
             else:
                 print(f"{Colors.RED}Unknown command: {action}{Colors.RESET}")
 
@@ -1808,6 +1926,8 @@ def main():
             manager.limits_cfg_cmd(sys.argv[2:])
         elif cmd == "memory":
             manager.memory_cmd(sys.argv[2:])
+        elif cmd == "judge":
+            manager.judge_cmd(sys.argv[2:])
 
         else:
             print(f"{Colors.RED}Unknown command: {cmd}{Colors.RESET}")

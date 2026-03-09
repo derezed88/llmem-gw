@@ -1,0 +1,6 @@
+## tools: Available Tool Definitions
+
+[SECTIONS]
+tool-get-system-info: get_system_info tool definition
+tool-google-drive: google_drive tool definition
+tool_file_extract: file_extract tool definition

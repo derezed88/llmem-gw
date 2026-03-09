@@ -270,6 +270,7 @@ _CORE_TOOL_TYPES: dict[str, str] = {
     "sysprompt_cfg":         "system",
     "config_cfg":            "system",
     "limits_cfg":            "system",
+    "judge_configure":       "system",
 }
 
 
@@ -303,6 +304,7 @@ def get_tool_executor(tool_name: str):
         'sysprompt_cfg':         _sysprompt_cfg_exec,
         'config_cfg':            _config_cfg_exec,
         'limits_cfg':            _limits_cfg_exec,
+        'judge_configure':       _judge_configure_exec,
         'memory_save':           _memory_save_exec,
         'memory_recall':         _memory_recall_exec,
         'memory_update':         _memory_update_exec,
@@ -578,6 +580,105 @@ class _MemoryUpdateArgs(BaseModel):
 class _MemoryAgeArgs(BaseModel):
     older_than_hours: int = Field(default=48, description="Move rows older than this many hours to long-term.")
     max_rows: int = Field(default=100, description="Max rows to age per call.")
+
+
+# ---------------------------------------------------------------------------
+# Judge configure tool
+# ---------------------------------------------------------------------------
+
+class _JudgeConfigureArgs(BaseModel):
+    action: str = Field(
+        description=(
+            "Action to perform. One of: "
+            "status (show current config), "
+            "list (all models), "
+            "on (enable gate), "
+            "off (disable gate), "
+            "set_model (set judge model for session), "
+            "set_mode (block or warn), "
+            "set_threshold (0.0-1.0), "
+            "reset (clear session overrides), "
+            "test (evaluate text), "
+            "persist (save field to llm-models.json)."
+        )
+    )
+    gate: str = Field(default="", description="Gate name: prompt, response, tool, memory, or all. Used with on/off.")
+    model: str = Field(default="", description="Judge model name. Used with set_model or persist action.")
+    mode: str = Field(default="", description="block or warn. Used with set_mode or persist.")
+    threshold: float = Field(default=-1.0, description="Score threshold 0.0-1.0. Used with set_threshold or persist.")
+    text: str = Field(default="", description="Text to evaluate. Used with test action.")
+    target_model: str = Field(default="", description="Model to persist config to. Used with persist action.")
+    field: str = Field(default="", description="Field to persist: model, mode, threshold, gates. Used with persist.")
+    gates: str = Field(default="", description="Comma-separated gates list. Used with persist when field=gates.")
+
+
+async def _judge_configure_exec(
+    action: str,
+    gate: str = "",
+    model: str = "",
+    mode: str = "",
+    threshold: float = -1.0,
+    text: str = "",
+    target_model: str = "",
+    field: str = "",
+    gates: str = "",
+) -> str:
+    from state import current_client_id, sessions
+    from judge import cmd_judge as _judge_cmd
+    client_id = current_client_id.get("") or ""
+    session = sessions.get(client_id, {})
+
+    # Map structured args to the !judge command string format
+    if action == "status":
+        arg = "status"
+    elif action == "list":
+        arg = "list"
+    elif action == "on":
+        if not gate:
+            return "ERROR: gate required for action='on'."
+        arg = f"on {gate}"
+    elif action == "off":
+        if not gate:
+            return "ERROR: gate required for action='off'."
+        arg = f"off {gate}"
+    elif action == "set_model":
+        if not model:
+            return "ERROR: model required for action='set_model'."
+        arg = f"model {model}"
+    elif action == "set_mode":
+        if mode not in ("block", "warn"):
+            return "ERROR: mode must be 'block' or 'warn'."
+        arg = f"mode {mode}"
+    elif action == "set_threshold":
+        if threshold < 0.0 or threshold > 1.0:
+            return "ERROR: threshold must be between 0.0 and 1.0."
+        arg = f"threshold {threshold}"
+    elif action == "reset":
+        arg = "reset"
+    elif action == "test":
+        if not text:
+            return "ERROR: text required for action='test'."
+        arg = f"test {text}"
+    elif action == "persist":
+        if not target_model or not field:
+            return "ERROR: target_model and field required for action='persist'."
+        if field == "gates":
+            value = gates
+        elif field == "model":
+            value = model
+        elif field == "mode":
+            value = mode
+        elif field == "threshold":
+            value = str(threshold) if threshold >= 0 else ""
+        else:
+            return f"ERROR: unknown field '{field}'."
+        if not value:
+            return f"ERROR: value required for field='{field}'."
+        arg = f"set {target_model} {field} {value}"
+    else:
+        return f"ERROR: unknown action '{action}'."
+
+    return await _judge_cmd(client_id, arg, session)
 
 
 async def _memory_save_exec(topic: str, content: str, importance: int = 5, source: str = "assistant") -> str:
@@ -1368,6 +1469,23 @@ def _make_core_lc_tools() -> list:
                 "Changes persist to JSON."
             ),
             args_schema=_LimitsCfgArgs,
+        ),
+        StructuredTool.from_function(
+            coroutine=_judge_configure_exec,
+            name="judge_configure",
+            description=(
+                "Configure and control the LLM-as-judge enforcement layer. "
+                "Actions: status (show current config), list (all models), "
+                "on/off (enable/disable a gate: prompt, response, tool, memory, all), "
+                "set_model (set judge model for this session), "
+                "set_mode (block=deny on fail, warn=log+allow), "
+                "set_threshold (score floor 0.0–1.0), "
+                "reset (clear session overrides), "
+                "test (evaluate text with the judge), "
+                "persist (save a judge_config field to llm-models.json permanently). "
+                "Session changes are temporary; use persist to make them permanent."
+            ),
+            args_schema=_JudgeConfigureArgs,
         ),
         # --- Memory tools ---
         StructuredTool.from_function(

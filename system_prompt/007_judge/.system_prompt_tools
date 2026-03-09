@@ -1,0 +1,5 @@
+## tools: Available Tool Definitions
+
+[SECTIONS]
+tool-search-tavily: search_tavily tool definition
+tool-google-drive: google_drive tool definition

@@ -77,6 +77,7 @@ The combination of persistent memory, writable system prompt, and LLM access to 
 The pieces that make this possible:
 
 - **Tiered persistent memory** — facts, preferences, and outcomes are stored in a three-tier hierarchy: short-term (hot context, injected every request), long-term (aged-out summaries, retrieved on demand), and cold archive (Google Drive). Memory ages automatically — short-term rows are summarised by the LLM and promoted to long-term without operator involvement.
+- **Context auto-enrichment** — before each LLM call, `auto-enrich.json` rules are evaluated against the user's message. Matching rules execute SQL queries and inject the results as grounded context — no tool call required from the LLM. Useful for identity tables, deployment config, or any data that should be available without asking. Individual rules can be disabled with `"enabled": false`; the entire feature can be suppressed for a session with `!config write auto_enrich false`.
 - **Semantic retrieval via vector search** — each turn, the agent embeds the current topic and queries a local Qdrant vector store to pull the most relevant long-term memories into context. Retrieval is score-gated and tier-aware: only memories that match the current topic surface, regardless of when they were stored.
 - **Topic-aware memory routing** — the agent tags every response with a `<<topic-slug>>` label. The system extracts this tag, uses it as the topic key for memory storage, and feeds it as the Qdrant query seed next turn. Memory stays coherent across long sessions without manual tagging.
 - **Writable, modular system prompt** — the LLM can append, replace, or delete sections of its own operating rules. A rule learned in one conversation becomes part of how it behaves in all future conversations.
@@ -552,3 +553,4 @@ python llmemctl.py disable <plugin_name>
 | `plugins-enabled.json` | Active plugins, rate limits, per-plugin config |
 | `gate-defaults.json` | Gate auto-allow defaults loaded at startup (managed via `llmemctl.py llm-allow`) |
 | `system_prompt/<folder>/` | Modular system prompt sections; `000_default/` ships with the repo |
+| `auto-enrich.json` | Context auto-enrichment rules (gitignored — instance-specific) |

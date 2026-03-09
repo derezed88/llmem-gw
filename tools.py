@@ -970,6 +970,7 @@ async def _config_cfg_exec(action: str, key: str = "", value: str = "") -> str:
         "tool_preview_length":  ("tool_preview_length", "int",  500),
         "tool_suppress":        ("tool_suppress",        "bool", False),
         "memory_scan_suppress": ("memory_scan_suppress", "bool", False),
+        "auto_enrich":          ("auto_enrich",          "bool", True),
     }
 
     if action == "list":

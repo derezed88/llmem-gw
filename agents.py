@@ -998,7 +998,7 @@ def _load_enrich_rules() -> list[dict]:
     try:
         with open(path) as f:
             rules = _json.load(f)
-        return rules if isinstance(rules, list) else []
+        return [r for r in rules if isinstance(r, dict) and r.get("enabled", True)] if isinstance(rules, list) else []
     except FileNotFoundError:
         return []
     except Exception as e:
@@ -1041,7 +1041,9 @@ async def auto_enrich_context(messages: list[dict], client_id: str) -> list[dict
     enrichments = []
 
     # Instance-specific enrichment rules from auto-enrich.json
-    for rule in _load_enrich_rules():
+    # Session flag auto_enrich=False suppresses all rules for this session.
+    _auto_enrich_enabled = sessions.get(client_id, {}).get("auto_enrich", True)
+    for rule in (_load_enrich_rules() if _auto_enrich_enabled else []):
         pattern = rule.get("pattern", "")
         sql = rule.get("sql", "")
         label = rule.get("label", sql)

@@ -1087,14 +1087,15 @@ when the user's message suggests they are relevant.
 
 ### Format
 
-`auto-enrich.json` is a JSON array. Each rule has three fields:
+`auto-enrich.json` is a JSON array. Each rule has four fields:
 
 ```json
 [
   {
     "pattern": "\\b(?:my\\s+(?:details?|info|profile)|who\\s+am\\s+i)\\b",
     "sql": "SELECT * FROM person",
-    "label": "person table"
+    "label": "person table",
+    "enabled": true
   }
 ]
 ```
@@ -1104,8 +1105,23 @@ when the user's message suggests they are relevant.
 | `pattern` | Yes | Python regex (case-insensitive) tested against the last user message. If it matches, the SQL is executed. |
 | `sql` | Yes | SQL query to run against your MySQL database when the pattern matches. |
 | `label` | No | Human-readable label shown in the `[context] Auto-queried: <label>` status message. Defaults to the SQL string if omitted. |
+| `enabled` | No | Set to `false` to disable this rule without removing it. Defaults to `true` if omitted. |
 
 Multiple rules are evaluated independently — all matching rules fire for a given message.
+Rules with `"enabled": false` are skipped at load time.
+
+### Runtime controls
+
+Auto-enrichment can be suppressed at the session level without editing the JSON file:
+
+```
+!config write auto_enrich false    # disable all auto-enrich rules for this session
+!config write auto_enrich true     # re-enable (default)
+!config list                       # shows current auto_enrich state
+```
+
+This is a per-session flag — it does not affect other connected clients and resets when
+the session ends. Use `"enabled": false` in the JSON to disable a rule permanently.
 
 ### Setup
 

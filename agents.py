@@ -218,7 +218,8 @@ def _to_lc_messages(system_prompt: str, messages: list[dict]) -> list[BaseMessag
     lc_msgs: list[BaseMessage] = [SystemMessage(content=system_prompt)]
     for m in messages:
         role = m.get("role", "user")
-        content = m.get("content") or ""
+        # Normalize content: Gemini returns list-of-parts; flatten to str for history replay
+        content = _content_to_str(m.get("content") or "")
         if role == "system":
             lc_msgs.append(SystemMessage(content=content))
         elif role == "user":
@@ -1091,7 +1092,15 @@ async def auto_enrich_context(messages: list[dict], client_id: str) -> list[dict
     # Inject short-term memory context block
     # Build a query string from the last few turns for semantic retrieval
     _sess_mem_flag = sessions.get(client_id, {}).get("memory_enabled", None)
-    _mem_injection_enabled = (_sess_mem_flag is None or _sess_mem_flag) and _memory_feature("context_injection")
+    _model_key = sessions.get(client_id, {}).get("model", "")
+    _model_mem_flag = LLM_REGISTRY.get(_model_key, {}).get("memory_enabled", None)
+    # Disabled if any of: model-level=False, session-level=False, global feature off
+    # (None means "not set at that level" → defer to next level)
+    _mem_injection_enabled = (
+        (_model_mem_flag is None or _model_mem_flag)
+        and (_sess_mem_flag is None or _sess_mem_flag)
+        and _memory_feature("context_injection")
+    )
     if _mem_injection_enabled:
         try:
             from memory import load_context_block, load_topic_list
@@ -1108,15 +1117,17 @@ async def auto_enrich_context(messages: list[dict], client_id: str) -> list[dict
                     m for m in messages
                     if m.get("role") in ("user", "assistant")
                     and m.get("content")
-                    and not m.get("content", "").startswith("[Session start")
-                    and not m.get("content", "").startswith("[context]")
+                    and not _content_to_str(m.get("content", "")).startswith("[Session start")
+                    and not _content_to_str(m.get("content", "")).startswith("[context]")
                 ]
                 recent = _genuine[-6:] if len(_genuine) >= 6 else _genuine
                 query_text = " ".join(
-                    m.get("content", "")[:300] for m in recent
+                    _content_to_str(m.get("content", ""))[:300] for m in recent
                 ).strip()
+            _identity_name = LLM_REGISTRY.get(_model_key, {}).get("identity_name", "")
             mem_block = await load_context_block(
-                min_importance=3, query=query_text, user_text=text
+                min_importance=3, query=query_text, user_text=text,
+                identity_name=_identity_name,
             )
             if mem_block:
                 enrichments.append(mem_block)

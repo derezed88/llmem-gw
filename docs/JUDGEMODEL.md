@@ -36,7 +36,7 @@ verdict with a score and reason. This enables:
 |------|------|
 | `judge.py` | Core engine: `judge_eval()`, `judge_gate()`, hook registry, `cmd_judge()` |
 | `plugin_history_judge.py` | History chain plugin; handles prompt + response gates; registers tool + memory hooks |
-| `system_prompt/007_judge/.system_prompt` | Default judge system prompt (JSON-only rubric) |
+| `system_prompt/007_judge/` | Section-assembled judge system prompt (manifest + behavior + tools + memory) |
 | `llm-models.json` | Per-model `judge_config` blocks + `judge-qwen35` model entry |
 | `llm-tools.json` | `judge_configure` in the `admin` toolset |
 | `agents.py` | Two optional hook call points: `execute_tool()` and `_scan_and_save_memories()` |
@@ -181,9 +181,10 @@ existing model in the registry. Key settings for a judge model:
 ```
 
 - `temperature`: keep low (0.0–0.1) for deterministic verdicts
-- `llm_tools`: leave empty — the judge has no tools
-- `system_prompt_folder`: the default `system_prompt/007_judge/` folder contains
-  the JSON-only rubric; point to a custom folder for domain-specific criteria
+- `llm_tools`: the default `007_judge` system prompt includes `search_tavily` and
+  `google_drive` tool definitions; set to `[]` only if you want a tools-free judge
+- `system_prompt_folder`: the default `system_prompt/007_judge/` folder assembles
+  the full rubric from section files; point to a custom folder for domain-specific criteria
 - `max_context`: the judge receives the full content being evaluated, so this
   must be large enough to hold the longest expected input
 
@@ -358,27 +359,50 @@ python llmemctl.py judge disable-plugin   # removes plugin_history_judge from ch
 
 ## Judge system prompt
 
-The default system prompt at `system_prompt/007_judge/.system_prompt` instructs
-the judge to return only JSON:
+The `system_prompt/007_judge/` folder is a section-assembled system prompt.
+`load_prompt_for_folder()` concatenates all section files in order, producing
+the full prompt that the judge model receives. The folder contains:
+
+| File | Content |
+|------|---------|
+| `.system_prompt` | Section manifest — declares identity and lists `[SECTIONS]` to include |
+| `.system_prompt_behavior` | **JSON output format rule** + evaluation criteria + tool-use guidance |
+| `.system_prompt_memory` | Memory context injection (retrieval results) |
+| `.system_prompt_tools` | Available tool definitions index |
+| `.system_prompt_tool-search-tavily` | `search_tavily` tool definition |
+| `.system_prompt_tool-google-drive` | `google_drive` tool definition |
+
+The JSON-only output instruction lives in `.system_prompt_behavior`:
 
 ```
 {"passed": true|false, "score": 0.0–1.0, "reason": "one sentence"}
 ```
 
-Key rules:
+Key rules (from `.system_prompt_behavior`):
 - No markdown, no prose outside JSON
 - When in doubt, default to pass (`passed: true, score: 0.8`)
 - `passed` is `false` only when content clearly violates the criteria
 - `score` below `threshold` overrides `passed: true`
 
+The judge also has `search_tavily` and `google_drive` tools available and
+can use them when evaluation genuinely requires external reference (e.g.
+verifying a factual claim, checking a URL). Evaluation criteria at highest
+priority come from memory context — so per-deployment rules injected via
+memory override the general rubric in `.system_prompt_behavior`.
+
 ### Custom criteria per judge model
 
-Create a new system prompt folder and point the judge model at it:
+Create a new system prompt folder with all required section files:
 
 ```bash
 mkdir system_prompt/007_judge-strict
-cp system_prompt/007_judge/.system_prompt system_prompt/007_judge-strict/.system_prompt
-# Edit the new file to add domain-specific criteria
+cp system_prompt/007_judge/.system_prompt system_prompt/007_judge-strict/
+cp system_prompt/007_judge/.system_prompt_behavior system_prompt/007_judge-strict/
+cp system_prompt/007_judge/.system_prompt_memory system_prompt/007_judge-strict/
+cp system_prompt/007_judge/.system_prompt_tools system_prompt/007_judge-strict/
+cp system_prompt/007_judge/.system_prompt_tool-search-tavily system_prompt/007_judge-strict/
+cp system_prompt/007_judge/.system_prompt_tool-google-drive system_prompt/007_judge-strict/
+# Edit .system_prompt_behavior in the new folder to add domain-specific criteria
 ```
 
 Then point a judge model at it via `system_prompt_folder` in `llm-models.json`:

@@ -157,6 +157,7 @@
         "db_query"
       ],
       "memory_scan": true,
+      "conv_log": true,
       "judge_config": {
         "model": "judge-gemini",
         "gates": [

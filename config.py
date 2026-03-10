@@ -91,6 +91,8 @@ def load_llm_registry():
                 "llm_tools_gates": config.get('llm_tools_gates', []),
                 "memory_scan": config.get('memory_scan', False),
                 "memory_scan_suppress": config.get('memory_scan_suppress', False),
+                "memory_enabled": config.get('memory_enabled', None),  # None = inherit global/session; False = always off
+                "identity_name": config.get('identity_name', ""),  # vocative name to strip from queries (e.g. "samaritan")
                 "conv_log": config.get('conv_log', False),
                 "conv_log_tools": config.get('conv_log_tools', None),  # None = use TOOL_CALL_LOG_DEFAULT
                 "max_tokens": config.get('max_tokens'),

@@ -978,6 +978,7 @@ async def load_context_block(
     min_importance: int = 3,
     query: str = "",
     user_text: str = "",
+    identity_name: str = "",
 ) -> str:
     """
     Return a formatted string of memories for prompt injection (short-term + relevant long-term).
@@ -1007,7 +1008,9 @@ async def load_context_block(
 
     # Strip vocative address of identity name from queries
     # ("Samaritan, tell me about X" → "tell me about X")
-    _identity = cfg.get("identity_name", "")
+    # identity_name comes from the model config (per-model), falling back to the
+    # global memory plugin config for models that don't set it.
+    _identity = identity_name or cfg.get("identity_name", "")
     if _identity:
         _voc_re = re.compile(rf'^\s*{re.escape(_identity)}[\s,;:!.—–-]+', re.IGNORECASE)
         query = (_voc_re.sub('', query).strip() or query)

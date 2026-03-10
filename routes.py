@@ -2101,10 +2101,14 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
             session["history"] = _run_history_chain(session["history"], session, model_cfg)
             # Verbatim conversation logging — save user prompt + assistant response as paired
             # memory rows when the model has conv_log enabled.
-            # session["memory_enabled"] overrides the global plugin config (per-session toggle).
+            # memory_enabled is checked at three levels (all must allow):
+            #   model cfg (memory_enabled: false → always off for this model)
+            #   session   (memory_enabled: false → off for this session)
+            #   global    (plugins-enabled.json memory.enabled)
             _sess_mem = session.get("memory_enabled", None)
-            log.debug(f"conv_log gate: conv_log={model_cfg.get('conv_log')} sess_mem={_sess_mem} model={session['model']}")
-            if model_cfg.get("conv_log") and (_sess_mem is None or _sess_mem):
+            _model_mem = model_cfg.get("memory_enabled", None)
+            log.debug(f"conv_log gate: conv_log={model_cfg.get('conv_log')} sess_mem={_sess_mem} model_mem={_model_mem} model={session['model']}")
+            if model_cfg.get("conv_log") and (_model_mem is None or _model_mem) and (_sess_mem is None or _sess_mem):
                 try:
                     from memory import save_conversation_turn
                     set_model_context(session.get("model", ""))

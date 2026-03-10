@@ -731,6 +731,8 @@ async def _age_topic_chunks(
     current = await _st_count()
     if trigger == "count" and current <= hwm:
         return totals
+    if trigger == "minutes" and current <= hwm:
+        return totals
 
     # --- Step 1: identify protected topics ---
     # Protected = topics that appear in the last `protect_n` ST rows by id DESC
@@ -1008,9 +1010,8 @@ async def load_context_block(
 
     # Strip vocative address of identity name from queries
     # ("Samaritan, tell me about X" → "tell me about X")
-    # identity_name comes from the model config (per-model), falling back to the
-    # global memory plugin config for models that don't set it.
-    _identity = identity_name or cfg.get("identity_name", "")
+    # identity_name comes from the model config (per-model) via llm-models.json.
+    _identity = identity_name
     if _identity:
         _voc_re = re.compile(rf'^\s*{re.escape(_identity)}[\s,;:!.—–-]+', re.IGNORECASE)
         query = (_voc_re.sub('', query).strip() or query)

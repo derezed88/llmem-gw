@@ -276,12 +276,14 @@ async def save_memory(
             f"WHERE topic = '{topic}' AND content = '{content}' LIMIT 1"
         )
         if "1" in (await execute_sql(dup_check)).strip():
+            log.info(f"save_memory exact-dedup ST: skipped source={source} topic={topic!r} content={content[:60]!r}")
             return 0
         dup_check_lt = (
             f"SELECT 1 FROM {_LT()} "
             f"WHERE topic = '{topic}' AND content = '{content}' LIMIT 1"
         )
         if "1" in (await execute_sql(dup_check_lt)).strip():
+            log.info(f"save_memory exact-dedup LT: skipped source={source} topic={topic!r} content={content[:60]!r}")
             return 0
     except Exception as e:
         log.warning(f"save_memory exact-dedup check failed: {e}")
@@ -339,6 +341,18 @@ async def save_memory(
                 ))
         except Exception as e:
             log.warning(f"save_memory vector upsert skipped: {e}")
+
+        # Notify on belief save
+        if mem_type == "belief":
+            try:
+                import notifier as _notifier
+                asyncio.ensure_future(_notifier.fire_event(
+                    "belief_saved",
+                    f"topic={topic!r}",
+                    content[:200],
+                ))
+            except Exception:
+                pass
 
     return row_id
 
@@ -783,8 +797,13 @@ async def _summarize_chunk_to_lt(
         except (json.JSONDecodeError, ValueError) as e:
             log.warning(f"_summarize_chunk_to_lt JSON parse failed: {e}. Raw: {result_text[:200]}")
 
-    # Build row index for verbatim promotion
-    row_by_id = {int(r["id"]): r for r in rows if r.get("id")}
+    # Build row index for verbatim promotion (guard against corrupted non-integer ids)
+    row_by_id = {}
+    for r in rows:
+        try:
+            row_by_id[int(r["id"])] = r
+        except (KeyError, ValueError, TypeError):
+            pass
 
     # Promote preserved rows verbatim to LT with LLM-assigned importance
     for rid, new_imp in preserve_ids.items():
@@ -928,40 +947,95 @@ async def _age_topic_chunks(
         log.error(f"_age_topic_chunks: candidate query failed: {e}")
         return totals
 
+    # --- Step 2b: if no candidates but ST > HWM, force-unprotect the topic
+    # with the most rows (skip prefix-protected).  This prevents a single
+    # dominant topic from blocking aging entirely.
+    if not candidate_topics and current > hwm:
+        _protected_prefixes = cfg.get("protected_topic_prefixes", [])
+        forced: list[tuple[str, int]] = []
+        for topic in truly_protected:
+            if any(topic.startswith(p) for p in _protected_prefixes):
+                continue
+            t_escaped = topic.replace("'", "''")
+            try:
+                cnt_raw = await execute_sql(
+                    f"SELECT COUNT(*) FROM {_ST()} WHERE topic = '{t_escaped}'"
+                )
+                cnt = 0
+                for line in cnt_raw.strip().splitlines():
+                    line = line.strip()
+                    if line.isdigit():
+                        cnt = int(line)
+                        break
+                    parts = line.split()
+                    if parts and parts[-1].isdigit():
+                        cnt = int(parts[-1])
+                        break
+                forced.append((topic, cnt))
+            except Exception:
+                pass
+        if forced:
+            forced.sort(key=lambda x: x[1], reverse=True)
+            candidate_topics.append(forced[0][0])
+            log.info(
+                f"_age_topic_chunks [{trigger}]: force-unprotected topic "
+                f"{forced[0][0]!r} ({forced[0][1]} rows) — single dominant topic"
+            )
+
     # --- Step 3: process one topic at a time until ST < lwm ---
+    # Large topics are sub-chunked to keep summarizer prompt manageable.
+    _CHUNK_SIZE = 50
+
     for topic in candidate_topics:
         current = await _st_count()
         if current < lwm:
             break
 
         t_escaped = topic.replace("'", "''")
-        try:
-            rows_raw = await execute_sql(
-                f"SELECT * FROM {_ST()} WHERE topic = '{t_escaped}' ORDER BY created_at ASC"
+
+        # Loop: fetch oldest _CHUNK_SIZE rows, summarize, repeat until
+        # the topic is exhausted or ST drops below LWM.
+        while True:
+            current = await _st_count()
+            if current < lwm:
+                break
+
+            try:
+                from database import fetch_dicts as _fd_age
+                rows = await _fd_age(
+                    f"SELECT * FROM {_ST()} WHERE topic = '{t_escaped}' "
+                    f"ORDER BY created_at ASC LIMIT {_CHUNK_SIZE}"
+                )
+            except Exception as e:
+                log.warning(f"_age_topic_chunks: row fetch failed for topic={topic!r}: {e}")
+                break
+
+            if not rows:
+                break
+
+            result = await _summarize_chunk_to_lt(
+                rows=rows,
+                session_id="",
+                model_key=model_key,
+                imp_threshold=imp_threshold,
             )
-            rows = _parse_table(rows_raw)
-        except Exception as e:
-            log.warning(f"_age_topic_chunks: row fetch failed for topic={topic!r}: {e}")
-            continue
+            totals["chunks"]     += 1
+            totals["summarized"] += result["summarized"]
+            totals["promoted"]   += result["promoted"]
+            totals["deleted"]    += result["deleted"]
+            log.info(
+                f"_age_topic_chunks [{trigger}]: topic={topic!r} chunk "
+                f"summarized={result['summarized']} promoted={result['promoted']} "
+                f"deleted={result['deleted']}"
+            )
 
-        if not rows:
-            continue
-
-        result = await _summarize_chunk_to_lt(
-            rows=rows,
-            session_id="",
-            model_key=model_key,
-            imp_threshold=imp_threshold,
-        )
-        totals["chunks"]     += 1
-        totals["summarized"] += result["summarized"]
-        totals["promoted"]   += result["promoted"]
-        totals["deleted"]    += result["deleted"]
-        log.info(
-            f"_age_topic_chunks [{trigger}]: topic={topic!r} "
-            f"summarized={result['summarized']} promoted={result['promoted']} "
-            f"deleted={result['deleted']}"
-        )
+            # If nothing was deleted this pass, bail to avoid infinite loop
+            if result["deleted"] == 0:
+                log.warning(
+                    f"_age_topic_chunks [{trigger}]: topic={topic!r} chunk "
+                    f"deleted 0 rows — breaking to avoid loop"
+                )
+                break
 
     return totals
 
@@ -1035,6 +1109,55 @@ async def trim_st_to_lwm() -> int:
 
     log.info(f"trim_st_to_lwm: deleted {deleted} rows (target lwm={lwm})")
     return deleted
+
+
+# ---------------------------------------------------------------------------
+# Temporal cache aging
+# ---------------------------------------------------------------------------
+
+def _temporal_table() -> str:
+    return get_tables_for_model().get("temporal", "samaritan_temporal")
+
+
+def _temporal_age_cfg() -> dict:
+    """Return temporal cache aging config with defaults.
+    Higher watermarks than memory since temporal rows are not auto-injected.
+    """
+    cfg = _mem_plugin_cfg()
+    tcfg = cfg.get("temporal", {}) if isinstance(cfg.get("temporal"), dict) else {}
+    return {
+        "temporal_hwm":        _safe_int(tcfg.get("hwm", 500), 500),
+        "temporal_lwm":        _safe_int(tcfg.get("lwm", 300), 300),
+        "temporal_age_timer":  _safe_int(tcfg.get("age_timer_minutes", 360), 360),
+    }
+
+
+async def age_temporal_cache() -> int:
+    """Age the temporal cache table using HWM/LWM.
+    Deletes oldest, lowest-hit rows until count <= LWM.
+    Returns number of rows deleted.
+    """
+    tcfg = _temporal_age_cfg()
+    hwm = tcfg["temporal_hwm"]
+    lwm = tcfg["temporal_lwm"]
+    tbl = _temporal_table()
+
+    count_raw = await execute_sql(f"SELECT COUNT(*) AS cnt FROM {tbl}")
+    lines = count_raw.strip().split("\n")
+    current = int(lines[2].strip()) if len(lines) >= 3 and lines[2].strip().isdigit() else 0
+
+    if current <= hwm:
+        return 0
+
+    n_to_delete = current - lwm
+    # Delete oldest with fewest hits first
+    await execute_sql(
+        f"DELETE FROM {tbl} "
+        f"ORDER BY hit_count ASC, created_at ASC "
+        f"LIMIT {n_to_delete}"
+    )
+    log.info(f"age_temporal_cache: deleted {n_to_delete} rows (hwm={hwm}, lwm={lwm}, was={current})")
+    return n_to_delete
 
 
 # ---------------------------------------------------------------------------
@@ -1159,29 +1282,73 @@ async def load_typed_context_block() -> str:
         log.debug(f"load_typed_context_block: beliefs failed: {e}")
 
     try:
-        plans = await fetch_dicts(
-            f"SELECT p.id, p.goal_id, p.step_order, p.description, p.status, g.title as goal_title "
+        # Load concept steps (top-level plan entries)
+        concepts = await fetch_dicts(
+            f"SELECT p.id, p.goal_id, p.step_order, p.description, p.status, "
+            f"p.step_type, p.target, p.approval, g.title as goal_title "
             f"FROM {_PLANS()} p "
             f"LEFT JOIN {_GOALS()} g ON g.id = p.goal_id "
-            f"WHERE p.status IN ('pending','in_progress') "
+            f"WHERE p.status IN ('pending','in_progress') AND p.step_type = 'concept' "
             f"ORDER BY p.goal_id, p.step_order"
         )
-        if plans:
-            _typed_metric_read(_PLANS(), len(plans))
+        if concepts:
+            _typed_metric_read(_PLANS(), len(concepts))
             lines.append("## Active Plans\n")
             by_goal: dict = {}
-            for p in plans:
+            for p in concepts:
                 gid = p.get("goal_id", "?")
-                by_goal.setdefault(gid, {"title": p.get("goal_title", f"goal {gid}"), "steps": []})
+                by_goal.setdefault(gid, {"title": p.get("goal_title") or f"(ad-hoc)", "steps": []})
                 by_goal[gid]["steps"].append(p)
             for gid, gdata in by_goal.items():
                 lines.append(f"  **{gdata['title']}**")
                 for step in gdata["steps"]:
                     status_mark = "▶" if step.get("status") == "in_progress" else "○"
+                    target_tag = f" →{step.get('target')}" if step.get("target") != "model" else ""
+                    approval_tag = f" [{step.get('approval')}]" if step.get("approval") not in ("approved", "auto") else ""
                     lines.append(
-                        f"    {status_mark} [{step.get('step_order','?')}] {step.get('description','')}"
+                        f"    {status_mark} [id={step.get('id','?')} step={step.get('step_order','?')}] "
+                        f"{step.get('description','')}{target_tag}{approval_tag}"
                     )
+                    # Load child task steps for this concept
+                    tasks = await fetch_dicts(
+                        f"SELECT id, description, status, target, tool_call, approval "
+                        f"FROM {_PLANS()} WHERE parent_id = {step['id']} "
+                        f"AND status IN ('pending','in_progress') ORDER BY step_order"
+                    )
+                    if tasks:
+                        for t in tasks:
+                            t_mark = "▸" if t.get("status") == "in_progress" else "·"
+                            t_target = f" →{t.get('target')}" if t.get("target") != "model" else ""
+                            t_approval = f" [{t.get('approval')}]" if t.get("approval") not in ("approved", "auto") else ""
+                            lines.append(
+                                f"      {t_mark} [{t.get('id','?')}] {t.get('description','')}{t_target}{t_approval}"
+                            )
             lines.append("")
+        else:
+            # Fallback: check for legacy plan rows (no step_type column yet, or all concept)
+            plans = await fetch_dicts(
+                f"SELECT p.id, p.goal_id, p.step_order, p.description, p.status, g.title as goal_title "
+                f"FROM {_PLANS()} p "
+                f"LEFT JOIN {_GOALS()} g ON g.id = p.goal_id "
+                f"WHERE p.status IN ('pending','in_progress') "
+                f"ORDER BY p.goal_id, p.step_order"
+            )
+            if plans:
+                _typed_metric_read(_PLANS(), len(plans))
+                lines.append("## Active Plans\n")
+                by_goal2: dict = {}
+                for p in plans:
+                    gid = p.get("goal_id", "?")
+                    by_goal2.setdefault(gid, {"title": p.get("goal_title", f"goal {gid}"), "steps": []})
+                    by_goal2[gid]["steps"].append(p)
+                for gid, gdata in by_goal2.items():
+                    lines.append(f"  **{gdata['title']}**")
+                    for step in gdata["steps"]:
+                        status_mark = "▶" if step.get("status") == "in_progress" else "○"
+                        lines.append(
+                            f"    {status_mark} [id={step.get('id','?')} step={step.get('step_order','?')}] {step.get('description','')}"
+                        )
+                lines.append("")
     except Exception as e:
         log.debug(f"load_typed_context_block: plans failed: {e}")
 
@@ -1265,6 +1432,51 @@ async def load_typed_context_block() -> str:
             lines.append(self_rows[0]["content"].strip() + "\n")
     except Exception as e:
         log.debug(f"load_typed_context_block: self-summary failed: {e}")
+
+    # Cognitive state summary: sparse table counts and drive gaps for goal selection grounding
+    try:
+        from database import fetch_dicts as _fd_cs
+        counts = {}
+        for tbl_key, tbl_fn in [
+            ("episodic", _EPISODIC), ("autobiographical", _AUTOBIOGRAPHICAL),
+            ("prospective_active", None), ("procedural", _PROCEDURES),
+        ]:
+            try:
+                if tbl_key == "prospective_active":
+                    rows = await _fd_cs(f"SELECT COUNT(*) as n FROM {_PROSPECTIVE()} WHERE status='active'")
+                elif tbl_key == "procedural":
+                    rows = await _fd_cs(f"SELECT COUNT(*) as n FROM {tbl_fn()}")
+                else:
+                    rows = await _fd_cs(f"SELECT COUNT(*) as n FROM {tbl_fn()}")
+                counts[tbl_key] = rows[0]["n"] if rows else 0
+            except Exception:
+                counts[tbl_key] = "?"
+
+        # Drive gaps: drives below 75% of baseline
+        drive_gaps = []
+        try:
+            drive_rows = await _fd_cs(
+                f"SELECT name, value, baseline FROM {_DRIVES()} "
+                f"WHERE baseline > 0 AND value < baseline * 0.75 ORDER BY (baseline - value) DESC"
+            )
+            drive_gaps = [f"{r['name']}({r['value']:.2f} vs baseline {r['baseline']:.2f})" for r in (drive_rows or [])]
+        except Exception:
+            pass
+
+        state_lines = [
+            f"  episodic: {counts.get('episodic','?')} entries  |  "
+            f"autobiographical: {counts.get('autobiographical','?')} entries  |  "
+            f"prospective (active): {counts.get('prospective_active','?')}  |  "
+            f"procedural: {counts.get('procedural','?')} entries"
+        ]
+        if drive_gaps:
+            state_lines.append(f"  Drives below baseline: {', '.join(drive_gaps)}")
+
+        lines.append("## Cognitive State\n")
+        lines.extend(state_lines)
+        lines.append("")
+    except Exception as e:
+        log.debug(f"load_typed_context_block: cognitive state failed: {e}")
 
     return "\n".join(lines)
 
@@ -2054,6 +2266,147 @@ async def load_context_block(
         lines.append("")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Temporal context: proactive time-of-day routine injection
+# ---------------------------------------------------------------------------
+
+async def load_temporal_context() -> str:
+    """Return a block of recurring routines/patterns around the current time of day.
+
+    Queries ST for topics that appear on 2+ distinct dates within a ±90-minute
+    window of the current display time (last 30 days), then pulls matching LT
+    summaries for those topics.  Returns a formatted markdown block, or "" if
+    nothing relevant is found.
+
+    Config toggle: plugins-enabled.json → plugin_config.memory.temporal.context_injection
+    (default True when temporal section exists, False otherwise).
+    """
+    cfg = _mem_plugin_cfg()
+    tcfg = cfg.get("temporal", {})
+    if not isinstance(tcfg, dict) or not tcfg.get("context_injection", True):
+        return ""
+
+    import datetime as _dt
+    from config import now_display
+
+    now = now_display()
+    t_start = (now - _dt.timedelta(minutes=90)).strftime("%H:%M")
+    t_end   = (now + _dt.timedelta(minutes=90)).strftime("%H:%M")
+
+    st_table = _ST()
+    lt_table = _LT()
+
+    # Handle midnight wraparound
+    if t_start <= t_end:
+        time_filter = f"TIME(created_at) BETWEEN '{t_start}' AND '{t_end}'"
+    else:
+        time_filter = f"(TIME(created_at) >= '{t_start}' OR TIME(created_at) <= '{t_end}')"
+
+    # Find recurring ST topics in this time window across multiple dates
+    topic_sql = (
+        f"SELECT topic, COUNT(DISTINCT DATE(created_at)) AS days_seen, "
+        f"GROUP_CONCAT(DISTINCT LEFT(content, 120) ORDER BY created_at DESC SEPARATOR ' | ') AS samples "
+        f"FROM {st_table} "
+        f"WHERE {time_filter} "
+        f"AND created_at >= DATE_SUB(NOW(), INTERVAL 30 DAY) "
+        f"AND source IN ('user', 'assistant') "
+        f"AND topic IS NOT NULL AND topic != '' "
+        f"GROUP BY topic "
+        f"HAVING days_seen >= 2 "
+        f"ORDER BY days_seen DESC "
+        f"LIMIT 5"
+    )
+    try:
+        topic_result = await execute_sql(topic_sql)
+    except Exception as e:
+        log.debug(f"load_temporal_context: ST topic query failed: {e}")
+        return ""
+
+    # Parse topics from result
+    topics: list[str] = []
+    lines = topic_result.strip().split("\n") if topic_result else []
+    if len(lines) >= 3 and "(no rows)" not in topic_result:
+        for line in lines[2:]:
+            parts = [p.strip() for p in line.split("|")]
+            if parts and parts[0]:
+                topics.append(parts[0])
+
+    if not topics:
+        # Fall back: check LT directly for content mentioning times near now
+        hour = now.hour
+        # Search for common time patterns in LT content
+        time_strs = [f"{hour}:", f"{hour:02d}:"]
+        if hour > 12:
+            ampm_h = hour - 12
+            time_strs.extend([f"{ampm_h}:", f"{ampm_h} pm", f"{ampm_h}pm"])
+        time_filter_lt = " OR ".join(f"content LIKE '%{t}%'" for t in time_strs)
+        # Also check for time-of-day keywords
+        _period_kw = []
+        if 5 <= hour < 12:
+            _period_kw = ["morning"]
+        elif 12 <= hour < 17:
+            _period_kw = ["afternoon", "lunch"]
+        elif 17 <= hour < 21:
+            _period_kw = ["evening", "pick up", "pickup", "dinner"]
+        elif 21 <= hour or hour < 5:
+            _period_kw = ["night", "bedtime"]
+        if _period_kw:
+            kw_filter = " OR ".join(f"content LIKE '%{kw}%'" for kw in _period_kw)
+            time_filter_lt = f"({time_filter_lt}) OR ({kw_filter})"
+
+        lt_sql = (
+            f"SELECT LEFT(content, 200) AS content FROM {lt_table} "
+            f"WHERE ({time_filter_lt}) "
+            f"AND importance >= 5 "
+            f"ORDER BY importance DESC, created_at DESC "
+            f"LIMIT 5"
+        )
+        try:
+            lt_result = await execute_sql(lt_sql)
+        except Exception as e:
+            log.debug(f"load_temporal_context: LT direct query failed: {e}")
+            return ""
+
+        if not lt_result or "(no rows)" in lt_result:
+            return ""
+
+        block = (
+            f"## Temporal Context (routines around {t_start}–{t_end})\n"
+            f"{lt_result}"
+        )
+        log.debug(f"load_temporal_context: LT direct hit, block={len(block)} chars")
+        return block
+
+    # We found recurring ST topics — now pull matching LT summaries
+    esc_topics = [t.replace("'", "''").replace("\\", "\\\\") for t in topics]
+    topic_like = " OR ".join(
+        f"content LIKE '%{t}%' OR topic LIKE '%{t}%'" for t in esc_topics
+    )
+    lt_sql = (
+        f"SELECT LEFT(content, 200) AS content FROM {lt_table} "
+        f"WHERE ({topic_like}) "
+        f"AND importance >= 4 "
+        f"ORDER BY importance DESC, created_at DESC "
+        f"LIMIT 5"
+    )
+    try:
+        lt_result = await execute_sql(lt_sql)
+    except Exception as e:
+        log.debug(f"load_temporal_context: LT topic query failed: {e}")
+        lt_result = ""
+
+    parts = [f"## Temporal Context (routines around {t_start}–{t_end})"]
+    if lt_result and "(no rows)" not in lt_result:
+        parts.append(lt_result)
+    else:
+        # Fall back to ST samples
+        parts.append(topic_result)
+
+    block = "\n".join(parts)
+    log.debug(f"load_temporal_context: {len(topics)} recurring topics, block={len(block)} chars")
+    return block
 
 
 # ---------------------------------------------------------------------------

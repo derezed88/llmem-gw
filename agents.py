@@ -1,6 +1,8 @@
 import asyncio
+import datetime as _dt
 import json
 import os
+import platform as _plat
 import re
 import uuid
 
@@ -24,6 +26,15 @@ from tools import (
     get_all_lc_tools, get_all_openai_tools, get_tool_executor,
     get_tool_type,
 )
+
+def _sysinfo_stamp() -> str:
+    """Return a fresh [system-info] timestamp line in configured display timezone."""
+    from config import now_display, display_tz_label
+    now = now_display()
+    return (
+        f"[system-info] {now.strftime('%Y-%m-%d %H:%M:%S')} "
+        f"{_plat.system()} {display_tz_label()}"
+    )
 
 # ---------------------------------------------------------------------------
 # Outbound agent message filters
@@ -145,7 +156,12 @@ def _build_lc_llm(model_key: str, use_cache: bool = False):
         )
         if use_custom:
             kwargs["temperature"] = cfg.get("temperature", 1.0)
-            kwargs["top_p"]       = cfg.get("top_p", 1.0)
+            # Anthropic API rejects temperature + top_p together; skip top_p for Anthropic hosts
+            _host = cfg.get("host", "")
+            _is_anthropic = "anthropic.com" in (_host or "")
+            _top_p = cfg.get("top_p")
+            if _top_p is not None and not _is_anthropic:
+                kwargs["top_p"] = _top_p
             top_k = cfg.get("top_k")
             if top_k is not None:
                 # extra_body forwards top_k as a top-level JSON field in the request.
@@ -551,6 +567,29 @@ async def check_gate(client_id: str, model_key: str, tool_name: str, tool_args: 
         return False, reason
 
 
+# --- Tool Execution Stats ---
+
+def _tool_stats_table() -> str:
+    from database import get_tables_for_model
+    return get_tables_for_model().get("tool_stats", "samaritan_tool_stats")
+
+
+async def _record_tool_stat(model: str, tool_name: str, success: bool = True):
+    """Fire-and-forget upsert of aggregate tool execution stats."""
+    try:
+        tbl = _tool_stats_table()
+        col = "success_count" if success else "error_count"
+        sql = (
+            f"INSERT INTO {tbl} (model, tool_name, call_count, success_count, error_count) "
+            f"VALUES ('{model}', '{tool_name}', 1, {1 if success else 0}, {0 if not success else 0}) "
+            f"ON DUPLICATE KEY UPDATE call_count = call_count + 1, "
+            f"{col} = {col} + 1, last_called = CURRENT_TIMESTAMP"
+        )
+        await execute_sql(sql)
+    except Exception as e:
+        log.debug(f"tool_stats upsert failed: {e}")
+
+
 # --- Tool Execution ---
 
 async def execute_tool(client_id: str, tool_name: str, tool_args: dict) -> str:
@@ -632,6 +671,18 @@ async def execute_tool(client_id: str, tool_name: str, tool_args: dict) -> str:
 
         # Execute the tool
         result = await executor(**tool_args)
+
+        # Fire tool_called notification (fire-and-forget, fail-silent)
+        try:
+            import notifier as _notifier
+            _compact_args = {k: v for k, v in tool_args.items()
+                             if isinstance(v, (str, int, float, bool)) and len(str(v)) <= 80}
+            _args_str = " ".join(f"{k}={v!r}" for k, v in list(_compact_args.items())[:3])
+            asyncio.ensure_future(_notifier.fire_event(
+                "tool_called", f"{tool_name}({_args_str})"
+            ))
+        except Exception:
+            pass
 
         # Heat management: subscribe/increment heat for this toolset in the caller's session.
         # This covers delegation paths (llm_call → execute_tool) where agentic_lc's own
@@ -769,12 +820,17 @@ async def execute_tool(client_id: str, tool_name: str, tool_args: dict) -> str:
                     await push_tok(client_id, f"[{tool_name} ◀]\n")
         elif tool_name == "get_system_info":
             # get_system_info needs the return even when suppressed
+            asyncio.ensure_future(_record_tool_stat(_et_model or "unknown", tool_name, success=True))
             return json.dumps(result) if isinstance(result, dict) else str(result)
+
+        # Record success stat (fire-and-forget)
+        asyncio.ensure_future(_record_tool_stat(_et_model or "unknown", tool_name, success=True))
 
         return str(result)
 
     except Exception as exc:
         error_msg = f"{tool_name} error: {exc}"
+        asyncio.ensure_future(_record_tool_stat(_et_model or "unknown", tool_name, success=False))
         await push_tok(client_id, f"[{tool_name} error] {exc}\n")
         # Record tool failure as a self-model memory row (fire-and-forget)
         try:
@@ -1085,6 +1141,14 @@ async def auto_enrich_context(messages: list[dict], client_id: str) -> list[dict
     text = last_user.get("content", "")
     enrichments = []
 
+    # Ensure DB context is set for all SQL queries in this function
+    _enrich_model = sessions.get(client_id, {}).get("model", "")
+    if _enrich_model:
+        set_model_context(_enrich_model)
+
+    # Auto-inject sysinfo so models never need to call get_system_info
+    enrichments.append(_sysinfo_stamp())
+
     # Instance-specific enrichment rules from auto-enrich.json
     # Session flag auto_enrich=False suppresses all rules for this session.
     _auto_enrich_enabled = sessions.get(client_id, {}).get("auto_enrich", True)
@@ -1173,6 +1237,16 @@ async def auto_enrich_context(messages: list[dict], client_id: str) -> list[dict
                     )
             except Exception as _tl_err:
                 log.debug(f"auto_enrich_context: topic list load failed: {_tl_err}")
+            # Inject temporal context — recurring routines around the current time of day
+            try:
+                from memory import load_temporal_context
+                temporal_block = await load_temporal_context()
+                if temporal_block:
+                    enrichments.append(temporal_block)
+                    if not sessions.get(client_id, {}).get("tool_suppress", False):
+                        await push_tok(client_id, "\n[context] Temporal routines loaded\n")
+            except Exception as _tc_err:
+                log.debug(f"auto_enrich_context: temporal context load failed: {_tc_err}")
         except Exception as _mem_err:
             log.warning(f"auto_enrich_context: memory load failed: {_mem_err}")
 
@@ -1270,6 +1344,14 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
             _iter_count += 1
             if not _suppress:
                 await push_tok(client_id, "\n[thinking…]\n")
+            # Inject fresh sysinfo right before each LLM invocation so the
+            # model always has current date/time in the last context position.
+            # On iter 1 this supplements auto_enrich; on later iters it adds
+            # a timestamp after tool results for the pre-response window.
+            if _iter_count > 1:
+                # After tool results, inject as a system-level context note.
+                # Use HumanMessage to avoid breaking tool-call/result pairing.
+                ctx.append(HumanMessage(content=_sysinfo_stamp()))
             log.info(
                 f"agentic_lc: LLM call iter={_iter_count} model={model_key} "
                 f"client={client_id} ctx_len={len(ctx)}"
@@ -1577,7 +1659,12 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
                 if tc["name"] != "agent_call":
                     has_non_agent_call_output = True
                 result = await execute_tool(client_id, tc["name"], tc["args"])
-                ctx.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+                # Append fresh sysinfo after every tool result so the model
+                # always has current date/time context mid-chain.
+                ctx.append(ToolMessage(
+                    content=f"{result}\n{_sysinfo_stamp()}",
+                    tool_call_id=tc["id"],
+                ))
                 _tools_used_this_turn.add(tc["name"])
                 # Flush immediately after each streaming agent_call so Slack posts
                 # per-turn progress as it arrives rather than batching all turns.
@@ -1642,6 +1729,8 @@ async def llm_call(
     # ---- Validate mode ----
     if mode not in ("text", "tool"):
         return f"ERROR: mode must be 'text' or 'tool', got '{mode}'."
+    if mode == "text" and not cfg.get("allow_text_mode", True):
+        return f"ERROR: model '{model}' does not allow mode='text'. Use mode='tool' with a specific tool= argument."
     if sys_prompt not in ("none", "caller", "target"):
         return f"ERROR: sys_prompt must be 'none', 'caller', or 'target', got '{sys_prompt}'."
     if history not in ("none", "caller"):

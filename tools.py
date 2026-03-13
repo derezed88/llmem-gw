@@ -22,9 +22,11 @@ async def db_query(sql: str) -> str:
 async def get_system_info() -> dict:
     """Return current date/time and status."""
     from state import current_client_id, sessions, estimate_history_size
+    from config import now_display, display_tz_label
+    _now = now_display()
     result: dict = {
-        "local_time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "timezone": "PST",
+        "local_time": _now.strftime("%Y-%m-%d %H:%M:%S"),
+        "timezone": display_tz_label(),
         "status": "connected",
         "platform": platform.system(),
     }
@@ -309,6 +311,7 @@ def get_tool_executor(tool_name: str):
         'memory_recall':         _memory_recall_exec,
         'memory_update':         _memory_update_exec,
         'memory_age':            _memory_age_exec,
+        'recall_temporal':       _recall_temporal_exec,
         'set_goal':              _set_goal_exec,
         'set_plan':              _set_plan_exec,
         'assert_belief':         _assert_belief_exec,
@@ -539,7 +542,7 @@ async def _help_exec() -> str:
         "  search_ddgs/search_tavily/search_xai/search_google(query) - web search\n"
         "  url_extract(method, url)      - extract web page content\n"
         "  google_drive(operation, ...) - Google Drive CRUD\n"
-        "  get_system_info()             - date/time/status\n"
+        "  (system info auto-injected — no tool call needed)\n"
         "  llm_list()                    - list LLM models\n"
         "  llm_call(model, prompt, ...)  - call LLM (mode/sys_prompt/history/tool params)\n"
         "  agent_call(agent_url, message) - call remote agent\n"
@@ -588,6 +591,15 @@ class _MemoryAgeArgs(BaseModel):
     older_than_hours: int = Field(default=48, description="Move rows older than this many hours to long-term.")
     max_rows: int = Field(default=100, description="Max rows to age per call.")
 
+class _RecallTemporalArgs(BaseModel):
+    query: str = Field(default="", description="Free-text keyword to filter memories by content or topic (e.g. 'Lee', 'walk', 'gym'). Empty = all memories.")
+    group_by: str = Field(default="day_of_week", description="How to aggregate: 'hour' (time-of-day buckets), 'day_of_week' (Mon-Sun), 'date' (calendar date), 'week', 'month'.")
+    day_of_week: str = Field(default="", description="Optional day filter: 'Monday', 'Tuesday', etc. Comma-separated for multiple.")
+    time_range: str = Field(default="", description="Optional time filter: 'HH:MM-HH:MM' (e.g. '09:00-12:00'), or 'morning' (06-12), 'afternoon' (12-17), 'evening' (17-22), 'now' (±90 min from current time).")
+    lookback_days: int = Field(default=30, description="How many days back to search. Default 30.")
+    limit: int = Field(default=50, description="Max raw rows to return alongside the aggregated pattern summary.")
+    new: bool = Field(default=False, description="Force a fresh query, bypassing the temporal cache. Default False = return cached result if available.")
+
 
 # ---------------------------------------------------------------------------
 # Typed memory tools: set_goal, set_plan, assert_belief
@@ -597,19 +609,22 @@ class _SetGoalArgs(BaseModel):
     title: str = Field(default="", description="Short title for the goal.")
     description: str = Field(default="", description="Full description of the objective.")
     importance: int = Field(default=9, description="Importance 1-10. Goals default to 9.")
-    status: str = Field(default="active", description="'active', 'done', 'blocked', or 'abandoned'.")
+    status: str = Field(default="", description="Set goal status: 'active', 'done', 'blocked', or 'abandoned'. Omit to leave status unchanged.")
     id: int = Field(default=0, description="Existing goal id to update. 0 = create new.")
     childof: str = Field(default="", description="JSON array of parent goal IDs, e.g. '[1,2]'. Empty = none.")
     parentof: str = Field(default="", description="JSON array of child goal IDs. Empty = none.")
     memory_link: str = Field(default="", description="JSON array of ST/LT memory row IDs that support this goal.")
 
 class _SetPlanArgs(BaseModel):
-    goal_id: int = Field(description="ID of the parent goal this step belongs to.")
+    goal_id: int = Field(description="ID of the parent goal this step belongs to. 0 = ad-hoc plan (no goal).")
     step_order: int = Field(default=1, description="Step number (ascending order).")
     description: str = Field(description="What this step involves.")
     status: str = Field(default="pending", description="'pending', 'in_progress', 'done', or 'skipped'.")
     id: int = Field(default=0, description="Existing plan step id to update. 0 = create new.")
     memory_link: str = Field(default="", description="JSON array of memory row IDs related to this step.")
+    step_type: str = Field(default="concept", description="'concept' (human-readable intent) or 'task' (executable atom).")
+    target: str = Field(default="model", description="'model' (auto-executable), 'human' (requires person), or 'investigate' (needs analysis).")
+    approval: str = Field(default="proposed", description="'proposed' (needs review), 'approved', 'rejected', or 'auto'.")
 
 class _AssertBeliefArgs(BaseModel):
     topic: str = Field(description="Short topic label for this belief.")
@@ -813,22 +828,27 @@ async def _save_memory_typed_exec(
 
 async def _set_goal_exec(
     title: str = "", description: str = "", importance: int = 9,
-    status: str = "active", id: int = 0, childof: str = "",
+    status: str = "", id: int = 0, childof: str = "",
     parentof: str = "", memory_link: str = "",
 ) -> str:
     from memory import _GOALS, _typed_metric_write
-    from database import execute_sql, execute_insert
+    from database import execute_sql, execute_insert, fetch_dicts
     from state import current_client_id
     session_id = current_client_id.get("") or ""
-    status = status if status in ("active", "done", "blocked", "abandoned") else "active"
+    # Empty string = caller did not pass status; treat as "leave unchanged" on updates
+    status_explicit = status.strip().lower() if status.strip() else None
+    if status_explicit and status_explicit not in ("active", "done", "blocked", "abandoned"):
+        status_explicit = None
     importance = max(1, min(10, int(importance)))
     childof_val = childof.replace("'", "''") if childof else "NULL"
     parentof_val = parentof.replace("'", "''") if parentof else "NULL"
     ml_val = memory_link.replace("'", "''") if memory_link else "NULL"
 
     if id and id > 0:
-        # Update existing
-        parts = [f"status = '{status}'", f"importance = {importance}"]
+        # Update existing — only touch status when explicitly provided
+        parts = [f"importance = {importance}"]
+        if status_explicit:
+            parts.insert(0, f"status = '{status_explicit}'")
         if title:
             parts.append(f"title = '{title.replace(chr(39), chr(39)*2)}'")
         if description:
@@ -843,41 +863,115 @@ async def _set_goal_exec(
         try:
             await execute_sql(sql)
             _typed_metric_write(_GOALS())
-            return f"Goal id={id} updated: status={status}"
+            # Read back actual DB state — prevents hallucination on partial updates
+            rows = await fetch_dicts(f"SELECT status FROM {_GOALS()} WHERE id = {id} LIMIT 1")
+            actual_status = rows[0]["status"] if rows else (status_explicit or "unknown")
+            msg = f"Goal id={id} updated: status={actual_status}"
+            if status_explicit and actual_status != status_explicit:
+                msg += f" (WARNING: requested {status_explicit} but DB shows {actual_status})"
+            # Fire notification
+            import asyncio as _asyncio
+            try:
+                import notifier as _notifier
+                _evt = {"done": "goal_completed", "blocked": "goal_blocked",
+                        "abandoned": "goal_abandoned"}.get(actual_status, "goal_updated")
+                _asyncio.ensure_future(_notifier.fire_event(_evt, msg))
+            except Exception:
+                pass
+            return msg
         except Exception as e:
             return f"set_goal update failed: {e}"
     else:
         # Insert new
         if not title:
             return "set_goal: title is required for new goals."
+        # Block goals that require unavailable infrastructure
+        _blocked_keywords = [
+            "timer", "cron", "scheduled", "swarm", "multi-prompt",
+            "multi_prompt", "DDL", "schema migration", "create table",
+            "alter table", "add column",
+        ]
+        _combined = (title + " " + description).lower()
+        for _kw in _blocked_keywords:
+            if _kw.lower() in _combined:
+                return (
+                    f"set_goal BLOCKED: goal title/description contains '{_kw}' which requires "
+                    f"infrastructure marked NOT AVAILABLE (timers, swarms, DDL). "
+                    f"Do not retry this goal. Consult the capability map and select a goal "
+                    f"that is fully executable with current tools."
+                )
+        # Abandon guard: reject goals that resemble previously abandoned ones
+        try:
+            _abandoned = await fetch_dicts(
+                f"SELECT id, title, description, abandon_reason FROM {_GOALS()} "
+                f"WHERE status='abandoned' ORDER BY updated_at DESC LIMIT 20"
+            ) or []
+            if _abandoned:
+                _prop_words = set(
+                    w.lower() for w in (title + " " + description).split() if len(w) > 3
+                )
+                for _ab in _abandoned:
+                    _ab_words = set(
+                        w.lower() for w in
+                        (_ab.get("title", "") + " " + _ab.get("description", "")).split()
+                        if len(w) > 3
+                    )
+                    if _prop_words and _ab_words:
+                        _overlap = len(_prop_words & _ab_words)
+                        _ratio = _overlap / min(len(_prop_words), len(_ab_words))
+                        if _ratio >= 0.5:
+                            return (
+                                f"set_goal BLOCKED: this goal resembles abandoned goal "
+                                f"id={_ab['id']} ('{_ab.get('title', '')}') which was abandoned "
+                                f"because: {_ab.get('abandon_reason', 'persistent failure')}. "
+                                f"Do not retry abandoned goals."
+                            )
+        except Exception:
+            pass  # fail-open: if abandon check fails, allow creation
+
         t = title.replace("'", "''")
         d = description.replace("'", "''")
         _co = "NULL" if not childof else f"'{childof_val}'"
         _po = "NULL" if not parentof else f"'{parentof_val}'"
         _ml = "NULL" if not memory_link else f"'{ml_val}'"
+        insert_status = status_explicit or "active"
         sql = (
             f"INSERT INTO {_GOALS()} "
             f"(title, description, status, importance, source, session_id, childof, parentof, memory_link) "
-            f"VALUES ('{t}', '{d}', '{status}', {importance}, 'assistant', '{session_id}', "
+            f"VALUES ('{t}', '{d}', '{insert_status}', {importance}, 'assistant', '{session_id}', "
             f"{_co}, {_po}, {_ml})"
         )
         try:
             row_id = await execute_insert(sql)
             _typed_metric_write(_GOALS())
-            return f"Goal created (id={row_id}): {title} [status={status} imp={importance}]"
+            _created_msg = f"Goal created (id={row_id}): {title} [status={insert_status} imp={importance}]"
+            # Fire notification
+            import asyncio as _asyncio
+            try:
+                import notifier as _notifier
+                _asyncio.ensure_future(_notifier.fire_event(
+                    "goal_created", _created_msg
+                ))
+            except Exception:
+                pass
+            return _created_msg
         except Exception as e:
             return f"set_goal insert failed: {e}"
 
 
 async def _set_plan_exec(
-    goal_id: int, step_order: int = 1, description: str = "",
+    goal_id: int = 0, step_order: int = 1, description: str = "",
     status: str = "pending", id: int = 0, memory_link: str = "",
+    step_type: str = "concept", target: str = "model", approval: str = "proposed",
 ) -> str:
     from memory import _PLANS, _typed_metric_write
     from database import execute_sql, execute_insert
     from state import current_client_id
     session_id = current_client_id.get("") or ""
     status = status if status in ("pending", "in_progress", "done", "skipped") else "pending"
+    step_type = step_type if step_type in ("concept", "task") else "concept"
+    target = target if target in ("model", "human", "investigate") else "model"
+    approval = approval if approval in ("proposed", "approved", "rejected", "auto") else "proposed"
     ml_val = memory_link.replace("'", "''") if memory_link else "NULL"
 
     if id and id > 0:
@@ -886,11 +980,29 @@ async def _set_plan_exec(
             parts.append(f"description = '{description.replace(chr(39), chr(39)*2)}'")
         if memory_link:
             parts.append(f"memory_link = '{ml_val}'")
+        # Allow updating target and approval on existing steps
+        parts.append(f"target = '{target}'")
+        parts.append(f"approval = '{approval}'")
         sql = f"UPDATE {_PLANS()} SET {', '.join(parts)} WHERE id = {id}"
         try:
+            from database import fetch_dicts as _fd
             await execute_sql(sql)
             _typed_metric_write(_PLANS())
-            return f"Plan step id={id} updated: status={status}"
+            rows = await _fd(f"SELECT status, step_type, target, approval FROM {_PLANS()} WHERE id = {id} LIMIT 1")
+            actual_status = rows[0]["status"] if rows else status
+            actual_type = rows[0].get("step_type", "?") if rows else step_type
+            msg = f"Plan step id={id} updated: status={actual_status} type={actual_type} target={target} approval={approval}"
+            if actual_status != status:
+                msg += f" (WARNING: requested {status} but DB shows {actual_status})"
+            # Fire notification
+            import asyncio as _asyncio
+            try:
+                import notifier as _notifier
+                _tevt = "task_completed" if actual_status == "done" else "task_updated"
+                _asyncio.ensure_future(_notifier.fire_event(_tevt, msg))
+            except Exception:
+                pass
+            return msg
         except Exception as e:
             return f"set_plan update failed: {e}"
     else:
@@ -900,13 +1012,24 @@ async def _set_plan_exec(
         _ml = "NULL" if not memory_link else f"'{ml_val}'"
         sql = (
             f"INSERT INTO {_PLANS()} "
-            f"(goal_id, step_order, description, status, source, session_id, memory_link) "
-            f"VALUES ({goal_id}, {step_order}, '{d}', '{status}', 'assistant', '{session_id}', {_ml})"
+            f"(goal_id, step_order, description, status, step_type, target, approval, source, session_id, memory_link) "
+            f"VALUES ({goal_id}, {step_order}, '{d}', '{status}', '{step_type}', '{target}', '{approval}', 'assistant', '{session_id}', {_ml})"
         )
         try:
             row_id = await execute_insert(sql)
             _typed_metric_write(_PLANS())
-            return f"Plan step created (id={row_id}): goal={goal_id} step={step_order} [{status}] {description}"
+            _plan_msg = (
+                f"Plan step created (id={row_id}): goal={goal_id} step={step_order} "
+                f"[{status}] type={step_type} target={target} approval={approval} {description}"
+            )
+            # Fire notification
+            import asyncio as _asyncio
+            try:
+                import notifier as _notifier
+                _asyncio.ensure_future(_notifier.fire_event("task_created", _plan_msg))
+            except Exception:
+                pass
+            return _plan_msg
         except Exception as e:
             return f"set_plan insert failed: {e}"
 
@@ -1138,6 +1261,224 @@ async def _memory_age_exec(older_than_hours: int = 48, max_rows: int = 100) -> s
     from memory import age_to_longterm
     moved = await age_to_longterm(older_than_hours=older_than_hours, max_rows=max_rows)
     return f"Aged {moved} memories from short-term to long-term (threshold: {older_than_hours}h)."
+
+
+def _temporal_query_key(query: str, group_by: str, day_of_week: str, time_range: str) -> str:
+    """Build a normalized cache key for temporal queries.
+    Excludes lookback_days and limit since those don't change the semantic query.
+    'now' time_range is normalized to the current hour bucket for reasonable cache hits.
+    """
+    import datetime as _dt
+    tr = time_range.lower().strip() if time_range else ""
+    if tr == "now":
+        # Normalize 'now' to current hour bucket in display timezone
+        from config import now_display
+        tr = f"now-h{now_display().hour}"
+    return f"{query.lower().strip()}|{group_by}|{day_of_week.lower().strip()}|{tr}"
+
+
+def _temporal_table() -> str:
+    """Return the temporal cache table name for the active model context."""
+    from database import get_tables_for_model
+    return get_tables_for_model().get("temporal", "samaritan_temporal")
+
+
+async def _temporal_cache_lookup(query_key: str) -> str | None:
+    """Check samaritan_temporal for a cached result matching this query_key.
+    Returns the cached result string, or None if no match.
+    """
+    from database import execute_sql
+    tbl = _temporal_table()
+    escaped_key = query_key.replace("'", "''").replace("\\", "\\\\")
+    # Look for a cache entry from the last 24 hours
+    row = await execute_sql(
+        f"SELECT id, result FROM {tbl} "
+        f"WHERE query_key = '{escaped_key}' "
+        f"AND created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR) "
+        f"ORDER BY created_at DESC LIMIT 1"
+    )
+    if row and "(no rows)" not in row:
+        # Bump hit count
+        # Extract id from the formatted result (first data line, first column)
+        lines = row.strip().split("\n")
+        if len(lines) >= 3:  # header + sep + data
+            row_id = lines[2].split("|")[0].strip()
+            if row_id.isdigit():
+                await execute_sql(
+                    f"UPDATE {tbl} SET hit_count = hit_count + 1 WHERE id = {row_id}"
+                )
+                # Result is the second column
+                result_text = "|".join(lines[2].split("|")[1:]).strip()
+                return result_text
+    return None
+
+
+async def _temporal_cache_store(
+    query_key: str, query_params: dict, result: str, source: str = "explicit"
+) -> int:
+    """Store a temporal query result in the cache table. Returns the new row id."""
+    from database import execute_sql
+    import json as _json
+    tbl = _temporal_table()
+    esc_key = query_key.replace("'", "''").replace("\\", "\\\\")
+    esc_result = result.replace("'", "''").replace("\\", "\\\\")
+    esc_params = _json.dumps(query_params).replace("'", "''").replace("\\", "\\\\")
+    insert_sql = (
+        f"INSERT INTO {tbl} (source, query_key, query_params, result) "
+        f"VALUES ('{source}', '{esc_key}', '{esc_params}', '{esc_result}')"
+    )
+    await execute_sql(insert_sql)
+    # Get inserted id
+    id_result = await execute_sql(f"SELECT LAST_INSERT_ID() AS id")
+    lines = id_result.strip().split("\n")
+    if len(lines) >= 3:
+        row_id = lines[2].strip()
+        return int(row_id) if row_id.isdigit() else 0
+    return 0
+
+
+async def _recall_temporal_exec(
+    query: str = "", group_by: str = "day_of_week", day_of_week: str = "",
+    time_range: str = "", lookback_days: int = 30, limit: int = 50,
+    new: bool = False, source: str = "explicit",
+) -> str:
+    """Search memories by temporal patterns across both short-term and long-term.
+    Checks the temporal cache first; use new=True to force a fresh query.
+    """
+    from database import execute_sql
+    from memory import _ST, _LT
+    import datetime as _dt
+
+    # --- Cache lookup (unless new=True) ---
+    qkey = _temporal_query_key(query, group_by, day_of_week, time_range)
+    if not new:
+        cached = await _temporal_cache_lookup(qkey)
+        if cached:
+            return f"[cached result — use new=True to refresh]\n{cached}"
+
+    st_table = _ST()
+    lt_table = _LT()
+
+    # --- Build WHERE clauses ---
+    where_parts = [f"created_at >= DATE_SUB(NOW(), INTERVAL {int(lookback_days)} DAY)"]
+
+    # Content/topic keyword filter
+    if query:
+        escaped = query.replace("'", "''").replace("\\", "\\\\")
+        where_parts.append(
+            f"(content LIKE '%{escaped}%' OR topic LIKE '%{escaped}%')"
+        )
+
+    # Day-of-week filter
+    if day_of_week:
+        days = [d.strip().capitalize() for d in day_of_week.split(",")]
+        valid_days = {"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
+        days = [d for d in days if d in valid_days]
+        if days:
+            day_list = ", ".join(f"'{d}'" for d in days)
+            where_parts.append(f"DAYNAME(created_at) IN ({day_list})")
+
+    # Time range filter
+    if time_range:
+        _named = {
+            "morning": ("06:00", "12:00"),
+            "afternoon": ("12:00", "17:00"),
+            "evening": ("17:00", "22:00"),
+            "night": ("22:00", "06:00"),
+        }
+        if time_range.lower() in _named:
+            t_start, t_end = _named[time_range.lower()]
+        elif time_range.lower() == "now":
+            from config import now_display
+            now = now_display()
+            t_start = (now - _dt.timedelta(minutes=90)).strftime("%H:%M")
+            t_end = (now + _dt.timedelta(minutes=90)).strftime("%H:%M")
+        elif "-" in time_range:
+            parts = time_range.split("-", 1)
+            t_start, t_end = parts[0].strip(), parts[1].strip()
+        else:
+            t_start, t_end = None, None
+
+        if t_start and t_end:
+            if t_start <= t_end:
+                where_parts.append(f"TIME(created_at) BETWEEN '{t_start}' AND '{t_end}'")
+            else:
+                # Wraps midnight (e.g. 22:00-06:00)
+                where_parts.append(
+                    f"(TIME(created_at) >= '{t_start}' OR TIME(created_at) <= '{t_end}')"
+                )
+
+    where_clause = " AND ".join(where_parts)
+
+    # --- Aggregation SQL ---
+    _group_expr = {
+        "hour": "HOUR(created_at)",
+        "day_of_week": "DAYNAME(created_at)",
+        "date": "DATE(created_at)",
+        "week": "YEARWEEK(created_at, 1)",
+        "month": "DATE_FORMAT(created_at, '%Y-%m')",
+    }
+    group_col = _group_expr.get(group_by, "DAYNAME(created_at)")
+    group_label = group_by
+
+    # Source filter: only user/assistant content (skip session/tool-call noise)
+    content_filter = "source IN ('user', 'assistant')"
+
+    # Run aggregation query across both tiers
+    agg_sql = (
+        f"SELECT {group_col} AS `{group_label}`, "
+        f"COUNT(*) AS occurrences, "
+        f"GROUP_CONCAT(DISTINCT topic ORDER BY topic SEPARATOR ', ') AS topics, "
+        f"MIN(created_at) AS earliest, MAX(created_at) AS latest "
+        f"FROM ("
+        f"  SELECT topic, content, created_at, source FROM {st_table} WHERE {where_clause} AND {content_filter}"
+        f"  UNION ALL"
+        f"  SELECT topic, content, created_at, 'assistant' AS source FROM {lt_table} WHERE {where_clause}"
+        f") combined "
+        f"GROUP BY {group_col} "
+        f"ORDER BY occurrences DESC"
+    )
+
+    # Run raw sample query (most recent matches)
+    raw_sql = (
+        f"SELECT tier, topic, LEFT(content, 150) AS content, "
+        f"DATE(created_at) AS date, TIME(created_at) AS time, "
+        f"DAYNAME(created_at) AS day_of_week "
+        f"FROM ("
+        f"  SELECT 'short' AS tier, topic, content, created_at, source FROM {st_table} WHERE {where_clause} AND {content_filter}"
+        f"  UNION ALL"
+        f"  SELECT 'long' AS tier, topic, content, created_at, 'assistant' AS source FROM {lt_table} WHERE {where_clause}"
+        f") combined "
+        f"ORDER BY created_at DESC "
+        f"LIMIT {int(limit)}"
+    )
+
+    agg_result = await execute_sql(agg_sql)
+    raw_result = await execute_sql(raw_sql)
+
+    # Full result returned to caller includes raw samples for immediate use
+    result = (
+        f"## Temporal Pattern Summary (group_by={group_by}, lookback={lookback_days}d)\n"
+        f"{agg_result}\n\n"
+        f"## Recent Matching Memories ({limit} max)\n"
+        f"{raw_result}"
+    )
+
+    # Cache only the aggregation summary — raw samples are bulky and can be
+    # re-queried live; caching them wastes storage with ASCII table formatting.
+    cache_result = (
+        f"## Temporal Pattern Summary (group_by={group_by}, lookback={lookback_days}d)\n"
+        f"{agg_result}"
+    )
+
+    # --- Store in cache ---
+    query_params = {
+        "query": query, "group_by": group_by, "day_of_week": day_of_week,
+        "time_range": time_range, "lookback_days": lookback_days,
+    }
+    await _temporal_cache_store(qkey, query_params, cache_result, source=source)
+
+    return result
 
 
 async def _memory_update_exec(id: int, tier: str = "short", importance: int = 0,
@@ -1729,12 +2070,9 @@ def _make_core_lc_tools() -> list:
             ),
             args_schema=_ToolListArgs,
         ),
-        StructuredTool.from_function(
-            coroutine=get_system_info,
-            name="get_system_info",
-            description="Returns current local date, time, and system status.",
-            args_schema=_GetSystemInfoArgs,
-        ),
+        # get_system_info removed as LLM-callable tool — now auto-injected
+        # via auto_enrich_context() system-info line. Models no longer need to
+        # call a tool for date/time.
         StructuredTool.from_function(
             coroutine=_agents.llm_call,
             name="llm_call",
@@ -1950,6 +2288,24 @@ def _make_core_lc_tools() -> list:
                 "Run periodically to keep short-term context lean."
             ),
             args_schema=_MemoryAgeArgs,
+        ),
+        StructuredTool.from_function(
+            coroutine=_recall_temporal_exec,
+            name="recall_temporal",
+            description=(
+                "Discover time-based patterns in memory. Checks the temporal cache first; "
+                "returns cached result if available (use new=True to force a fresh query). "
+                "Searches BOTH short-term and long-term memory "
+                "and returns an aggregated pattern summary plus recent matching rows. "
+                "Use for questions like 'what do I usually do at this time?', 'what happens on Tuesdays?', "
+                "'what patterns exist around Lee?', 'what happens monthly?'. "
+                "query: keyword filter (e.g. 'Lee', 'walk'). "
+                "group_by: 'hour', 'day_of_week', 'date', 'week', 'month'. "
+                "day_of_week: optional day filter. time_range: 'HH:MM-HH:MM', 'morning', 'afternoon', 'evening', 'now'. "
+                "lookback_days: how far back (default 30). "
+                "new: True to bypass cache and run a fresh query."
+            ),
+            args_schema=_RecallTemporalArgs,
         ),
         # --- Typed memory tools ---
         StructuredTool.from_function(

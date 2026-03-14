@@ -48,16 +48,15 @@ Switch the active model at runtime: `!model gemini25f` — persisted to disk imm
 
 #### Control What the LLM Can Touch
 
-Gates are per-tool, per-table read/write permissions. The pattern is `!<toolname>_gate_read` / `!<toolname>_gate_write`. Set defaults in `gate-defaults.json` or change live in chat:
+Tool call gates require human approval before the LLM can execute specific tools. Gates are configured per-model using the `llm_tools_gates` field in `llm-models.json`, and can be changed at runtime:
 
 ```
-!google_drive_gate_read false      # auto-allow Drive reads (gate off)
-!db_query_gate_write * false       # auto-allow DB writes for all tables
-!sysprompt_gate_write false        # auto-allow system prompt updates
-!search_ddgs_gate_read false       # auto-allow DuckDuckGo searches
+!model_cfg write gemini25f llm_tools_gates db_query
+!model_cfg write gemini25f llm_tools_gates db_query,model_cfg write,google_drive
+!model_cfg write gemini25f llm_tools_gates          # empty = clear all gates
 ```
 
-`true` = gated (human must approve each call), `false` = auto-allow. Non-interactive clients (open-webui, Slack) auto-reject gated calls rather than hanging — the LLM is told why and asks for alternatives. Use `!gate_list` to see live status of every gate.
+Gate entries can be tool-wide (`db_query`) or action-specific (`model_cfg write`). Non-interactive clients (open-webui, Slack) auto-reject gated calls rather than hanging — the LLM is told why and asks for alternatives.
 
 #### Tune Agent Behavior via Text Files
 
@@ -121,7 +120,7 @@ All configuration is JSON + commands. Nothing requires a restart:
 
 ```
 !model gemini25f                       # switch LLM
-!search_ddgs_gate_read false           # auto-allow DuckDuckGo searches
+!model_cfg write gemini25f llm_tools_gates db_query   # gate a tool
 !maxctx 50                             # set history window
 !session                               # list active sessions with shorthand IDs
 !session 102 delete                    # drop a session
@@ -134,7 +133,7 @@ Rate limits, session timeouts, tool permissions, model timeouts — all configur
 
 #### llmemctl.py — Offline System Configuration
 
-`llmemctl.py` is the operator's configuration tool, run while the server is stopped (or to set persistent defaults before first start). It edits `plugins-enabled.json`, `llm-models.json`, and `gate-defaults.json` directly. It also has an interactive menu mode (`python llmemctl.py` with no arguments).
+`llmemctl.py` is the operator's configuration tool, run while the server is stopped (or to set persistent defaults before first start). It edits `plugins-enabled.json` and `llm-models.json` directly. It also has an interactive menu mode (`python llmemctl.py` with no arguments).
 
 **Plugins:**
 ```bash
@@ -156,12 +155,11 @@ python llmemctl.py model-llmcall gemini25f true  # allow model to call other LLM
 python llmemctl.py model-timeout gemini25f 120   # set LLM delegation timeout (s)
 ```
 
-**Gate defaults** (persisted to `gate-defaults.json`, loaded at every startup):
+**Tool call gates** (per-model, persisted to `llm-models.json`):
 ```bash
-python llmemctl.py gate-list                          # show all gate defaults
-python llmemctl.py llm-allow google_drive read false   # auto-allow Drive reads by default
-python llmemctl.py llm-allow db * write false          # auto-allow all DB writes by default
-python llmemctl.py gate-reset                         # restore factory defaults
+python llmemctl.py model-cfg write gemini25f llm_tools_gates db_query              # gate db_query
+python llmemctl.py model-cfg write gemini25f llm_tools_gates db_query,google_drive # gate multiple
+python llmemctl.py model-cfg write gemini25f llm_tools_gates                       # clear all gates
 ```
 
 **Rate limits:**
@@ -381,18 +379,15 @@ The llama proxy auto-detects client format from User-Agent and path prefix, then
 
 ### Human Approval Gate System
 
-Every tool call passes through `check_human_gate()` before execution. Gates are registered per tool type by plugins at startup — no hardcoded tool names in gate logic.
+Every tool call passes through `check_human_gate()` before execution. Gates are configured per-model via the `llm_tools_gates` field in `llm-models.json`.
 
-| Gate type | Command | Granularity |
+| Entry format | Example | Effect |
 |---|---|---|
-| `search` tools | `!search_ddgs_gate_read true/false` | Per search engine |
-| `url_extract` | `!url_extract_gate_read true/false` | Read gate |
-| `google_drive` | `!google_drive_gate_read/write true/false` | Separate read and write |
-| `db_query` | `!db_query_gate_read/write [table\|*] true/false` | Per-table, per-operation |
-| `sysprompt_write` | `!sysprompt_gate_write true/false` | System prompt writes |
-| `session` / `model` / `reset` | `!session_gate_read/write true/false` etc. | Per operation |
+| Tool name | `db_query` | Gate **all** calls to that tool |
+| Tool + action | `model_cfg write` | Gate only calls where `action == "write"` |
+| Multiple entries | `db_query,google_drive` | Comma-separated list |
 
-Gate defaults persist across restarts via `gate-defaults.json` (managed with `llmemctl.py llm-allow`).
+Configure at runtime with `!model_cfg write <model> llm_tools_gates <entries>`, or via `llmemctl.py model-cfg write`. An empty value clears all gates.
 
 Non-interactive clients (llama proxy, Slack) auto-reject gated calls immediately with an instructive message to the LLM. API clients get a 2-second window for programmatic approval.
 
@@ -482,8 +477,7 @@ Type `!help` to see all commands. Some useful ones to start:
 ```
 !model                          list available LLMs (* = current)
 !model <name>                   switch active model
-!search_ddgs_gate_read true     auto-allow DuckDuckGo searches (no gate pop-ups)
-!db_query_gate_read * true      auto-allow all DB reads
+!model_cfg write <model> llm_tools_gates db_query   gate a specific tool
 !reset                          clear conversation history
 !session                        list all active sessions
 ```
@@ -586,6 +580,5 @@ python llmemctl.py disable <plugin_name>
 | `.env` | API keys and credentials (never commit) |
 | `llm-models.json` | Model registry — `type`, `host`, `env_key`, `enabled`, `tool_call_available`, `system_prompt_folder` |
 | `plugins-enabled.json` | Active plugins, rate limits, per-plugin config |
-| `gate-defaults.json` | Gate auto-allow defaults loaded at startup (managed via `llmemctl.py llm-allow`) |
 | `system_prompt/<folder>/` | Modular system prompt sections; `000_default/` ships with the repo |
 | `auto-enrich.json` | Context auto-enrichment rules (gitignored — instance-specific) |

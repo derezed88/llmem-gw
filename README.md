@@ -474,8 +474,8 @@ Clients                 Server                          Backends
 shell.py     ──SSE──►  llmem-gw.py                     OpenAI API
 open-webui   ─HTTP──►  ┌──────────────────────────┐    Gemini API
 LM Studio    ─HTTP──►  │ routes.py                │    xAI API
-Slack ─Socket Mode──►  │ agents.py (agentic_lc)   │    llama.cpp / Ollama
-api_client   ─HTTP──►  │   LangChain bind_tools() │
+Slack ─Socket Mode──►  │ agents.py (agentic_lc)   │    FriendliAI serverless
+api_client   ─HTTP──►  │   LangChain bind_tools() │    llama.cpp / Ollama
 Agent B ──────HTTP──►  │   ChatOpenAI             │──► MySQL
                        │   ChatGoogleGenerativeAI │──► Google Drive
                        │ plugin_*.py              │──► Web search APIs

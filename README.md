@@ -471,15 +471,15 @@ Type `!help` to see all commands. Some useful ones to start:
 ```
 Clients                 Server                          Backends
 ───────                 ──────                          ────────
-shell.py     ──SSE──►  llmem-gw.py                     OpenAI API
-open-webui   ─HTTP──►  ┌──────────────────────────┐    Gemini API
-LM Studio    ─HTTP──►  │ routes.py                │    xAI API
-Slack ─Socket Mode──►  │ agents.py (agentic_lc)   │    FriendliAI serverless
-api_client   ─HTTP──►  │   LangChain bind_tools() │    llama.cpp / Ollama
+shell.py     ──SSE──►  llmem-gw.py                     Claude, OpenAI, Gemini, xAI API
+open-webui   ─HTTP──►  ┌──────────────────────────┐    FriendliAI serverless
+LM Studio    ─HTTP──►  │ routes.py                │    llama.cpp / Ollama
+Slack ─Socket Mode──►  │ agents.py (agentic_lc)   │
+api_client   ─HTTP──►  │   LangChain bind_tools() │
 Agent B ──────HTTP──►  │   ChatOpenAI             │──► MySQL
                        │   ChatGoogleGenerativeAI │──► Google Drive
                        │ plugin_*.py              │──► Web search APIs
-                       └──────────────────────────┘
+                       └──────────────────────────┘──► Qdrant + nomic-embed-text
                                     │ agent_call tool
                                     ▼
                              Agent B / Agent C  (other llmem-gw instances)

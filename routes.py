@@ -111,7 +111,8 @@ async def cmd_help(client_id: str):
     help_text = (
         "Available commands:\n"
         "  !model                                    - list available models (current marked)\n"
-        "  !model <key>                              - switch active LLM\n"
+        "  !model <key> [sys_prompt=none|caller|target] [history=none|caller] [database=caller|target|none]\n"
+        "                                            - switch active LLM with optional context carry-over\n"
         "  @<model> <prompt>                         - one-turn model switch (e.g. @gpt5m explain this)\n"
         "  !stop                                     - interrupt the running LLM job\n"
         "  !reset                                    - clear conversation history\n"
@@ -200,6 +201,7 @@ async def cmd_help(client_id: str):
         "Database Instances:\n"
         "  !db                                       - list available databases\n"
         "  !db current                               - show current session's database\n"
+        "  !db sessions                              - list user-created databases (!db switch only)\n"
         "  !db switch <name>                         - switch to database (creates if needed)\n"
         "  !db delete <name>                         - delete a database (with confirmation)\n"
         "  !db delete <name> confirm                 - delete without confirmation prompt\n"
@@ -416,10 +418,11 @@ async def cmd_memstats(client_id: str, model_key: str = ""):
     summarizer runs, dedup config, and last activity timestamps.
     """
     set_model_context(model_key)
-    from database import execute_sql
-    from memory import _ST, _LT, _SUM, _COLLECTION, _age_cfg, _mem_plugin_cfg, get_retrieval_stats, get_typed_metrics, _GOALS, _PLANS, _BELIEFS
+    from database import execute_sql, get_database_for_model
+    from memory import _ST, _LT, _SUM, _COLLECTION, _age_cfg, _mem_plugin_cfg, get_retrieval_stats, get_typed_metrics, _GOALS, _PLANS, _BELIEFS, _DRIVES, _COGNITION, _TEMPORAL
 
-    lines = ["## Memory System Stats\n"]
+    _active_db = get_database_for_model(model_key)
+    lines = [f"## Memory System Stats  (db: **{_active_db}**)\n"]
 
     async def q(sql: str) -> str:
         try:
@@ -450,10 +453,16 @@ async def cmd_memstats(client_id: str, model_key: str = ""):
     st_count = _int_from(await q(f"SELECT COUNT(*) FROM {_ST()}"))
     lt_count = _int_from(await q(f"SELECT COUNT(*) FROM {_LT()}"))
     sum_count = _int_from(await q(f"SELECT COUNT(*) FROM {_SUM()}"))
+    drives_count = _int_from(await q(f"SELECT COUNT(*) FROM {_DRIVES()}"))
+    temporal_count = _int_from(await q(f"SELECT COUNT(*) FROM {_TEMPORAL()}"))
+    cognition_count = _int_from(await q(f"SELECT COUNT(*) FROM {_COGNITION()}"))
     lines.append(f"**Tier counts**")
     lines.append(f"  short-term : {st_count} rows")
     lines.append(f"  long-term  : {lt_count} rows")
-    lines.append(f"  summaries  : {sum_count} rows\n")
+    lines.append(f"  summaries  : {sum_count} rows")
+    lines.append(f"  drives     : {drives_count} rows")
+    lines.append(f"  temporal   : {temporal_count} rows")
+    lines.append(f"  cognition  : {cognition_count} rows\n")
 
     # ── Short-term: topic breakdown ───────────────────────────────────────────
     st_topics_raw = await q(
@@ -606,7 +615,7 @@ async def cmd_memstats(client_id: str, model_key: str = ""):
                 lines.append(f"  indexed_vectors      : {qd.get('indexed_vectors_count', '?')}")
                 lines.append(f"  segments             : {qd.get('segments_count', '?')}")
                 lines.append(f"  optimizer            : {qd.get('optimizer_status', '?')}")
-                lines.append(f"  collection           : {vcfg.get('collection')}  @{vcfg.get('qdrant_host')}:{vcfg.get('qdrant_port')}")
+                lines.append(f"  collection           : {_COLLECTION()}  @{vcfg.get('qdrant_host')}:{vcfg.get('qdrant_port')}")
                 lines.append(f"  top_k / min_score    : {vcfg.get('top_k')} / {vcfg.get('min_score')}")
                 lines.append(f"  always_inject_imp>=  : {vcfg.get('min_importance_always')}")
             lines.append("")
@@ -2339,6 +2348,222 @@ async def cmd_memtrim(client_id: str, arg: str, model_key: str = ""):
 
 
 # ---------------------------------------------------------------------------
+# !ged — GED course progress dashboard
+# ---------------------------------------------------------------------------
+
+# Maps GED model keys to their database names and subject labels
+_GED_SUBJECTS = {
+    "ged-math":        ("gedmath",    "Mathematical Reasoning"),
+    "ged-rla-reading": ("gedreading", "RLA Reading"),
+    "ged-rla-writing": ("gedwriting", "RLA Writing"),
+    "ged-science":     ("gedscience", "Science"),
+    "ged-social":      ("gedsocial",  "Social Studies"),
+}
+
+_GED_TOPIC_LABELS = {
+    # Math
+    "number_ops":            "Number Operations",
+    "ratio_proportion":      "Ratio & Proportion",
+    "expressions_equations": "Expressions & Equations",
+    "inequalities":          "Inequalities",
+    "functions":             "Functions",
+    "geometry":              "Geometry",
+    "statistics":            "Statistics",
+    "data_analysis":         "Data Analysis",
+    # RLA Reading
+    "informational_text":    "Informational Text",
+    "literary_text":         "Literary Text",
+    "main_idea":             "Main Idea",
+    "evidence_inference":    "Evidence & Inference",
+    "vocab_context":         "Vocabulary in Context",
+    "text_structure":        "Text Structure",
+    "compare_texts":         "Comparing Texts",
+    "authors_purpose":       "Author's Purpose",
+    # RLA Writing
+    "extended_response":     "Extended Response",
+    "grammar_usage":         "Grammar & Usage",
+    "sentence_structure":    "Sentence Structure",
+    "punctuation":           "Punctuation",
+    "capitalization":        "Capitalization",
+    "organization":          "Organization",
+    "evidence_use":          "Evidence Use",
+    "revision_editing":      "Revision & Editing",
+    # Science
+    "life_science":          "Life Science",
+    "physical_science":      "Physical Science",
+    "earth_space_science":   "Earth & Space Science",
+    "scientific_reasoning":  "Scientific Reasoning",
+    "data_interpretation":   "Data Interpretation",
+    "experimental_design":   "Experimental Design",
+    "scientific_vocabulary": "Scientific Vocabulary",
+    "environmental_science": "Environmental Science",
+    # Social Studies
+    "us_history":            "US History",
+    "civics_government":     "Civics & Government",
+    "economics":             "Economics",
+    "geography_world":       "Geography",
+    "reading_maps_charts":   "Maps & Charts",
+    "historical_documents":  "Historical Documents",
+    "current_events":        "Current Events",
+    "critical_thinking":     "Critical Thinking",
+}
+
+
+def _ged_bar(score: float, width: int = 10) -> str:
+    """Render a Unicode progress bar for a 0.0–1.0 score."""
+    filled = round(score * width)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _ged_label(score: float) -> str:
+    if score >= 0.75:
+        return "✓ Strong"
+    elif score >= 0.5:
+        return "→ Building"
+    else:
+        return "✗ Focus area"
+
+
+async def _ged_subject_readiness(db_name: str) -> float | None:
+    """Return overall readiness (0.0–1.0) for a GED subject DB, or None if no data."""
+    from database import fetch_dicts, get_tables_for_model
+    try:
+        set_db_override(db_name)
+        tables = get_tables_for_model()
+        tbl = tables.get("ged_topic_scores", f"{db_name}_ged_topic_scores")
+        rows = await fetch_dicts(f"SELECT score FROM `{tbl}`")
+        if not rows:
+            return None
+        return sum(r["score"] for r in rows) / len(rows)
+    except Exception:
+        return None
+    finally:
+        set_db_override(None)
+
+
+async def cmd_ged(client_id: str, arg: str, session: dict):
+    """
+    !ged            — progress dashboard for current GED subject (or all subjects if not in a GED model)
+    !ged all        — cross-subject readiness summary
+    !ged scores     — raw topic scores table for current subject
+    """
+    from database import fetch_dicts, get_tables_for_model
+
+    parts = arg.strip().split(maxsplit=1) if arg.strip() else []
+    subcmd = parts[0].lower() if parts else ""
+
+    current_model = session.get("model", "")
+    in_ged = current_model in _GED_SUBJECTS
+
+    # !ged all — cross-subject summary (works from any model)
+    if subcmd == "all" or (not subcmd and not in_ged):
+        lines_out = ["## GED Progress — All Subjects\n\n"]
+        lines_out.append(f"  {'Subject':<28} {'Readiness':<12} {'Status'}\n")
+        lines_out.append(f"  {'─' * 28} {'─' * 12} {'─' * 15}\n")
+
+        total_scores = []
+        for model_key, (db_name, label) in _GED_SUBJECTS.items():
+            readiness = await _ged_subject_readiness(db_name)
+            if readiness is None:
+                bar = "░" * 10
+                pct = "0%"
+                status = "Not started"
+            else:
+                bar = _ged_bar(readiness)
+                pct = f"{int(readiness * 100)}%"
+                status = "Ready for exam" if readiness >= 0.75 else "In progress"
+                total_scores.append(readiness)
+            lines_out.append(f"  {label:<28} {bar}  {pct:<6} {status}\n")
+
+        overall = sum(total_scores) / len(total_scores) if total_scores else 0.0
+        overall_bar = _ged_bar(overall)
+        lines_out.append(f"\n  {'Overall GED Readiness:':<28} {overall_bar}  {int(overall * 100)}%\n")
+
+        subject_cmds = " | ".join(f"!model {k}" for k in _GED_SUBJECTS)
+        lines_out.append(f"\n_Switch subject: {subject_cmds}_\n")
+
+        await push_tok(client_id, "".join(lines_out))
+        await conditional_push_done(client_id)
+        return
+
+    # Must be in a GED model for per-subject commands
+    if not in_ged:
+        await push_tok(client_id, "Switch to a GED subject first: !model ged-math | ged-rla-reading | ged-rla-writing | ged-science | ged-social\n")
+        await conditional_push_done(client_id)
+        return
+
+    db_name, subject_label = _GED_SUBJECTS[current_model]
+
+    try:
+        set_db_override(db_name)
+        tables = get_tables_for_model()
+        scores_tbl = tables.get("ged_topic_scores", f"{db_name}_ged_topic_scores")
+        results_tbl = tables.get("ged_quiz_results", f"{db_name}_ged_quiz_results")
+        state_tbl = tables.get("ged_session_state", f"{db_name}_ged_session_state")
+
+        rows = await fetch_dicts(f"SELECT topic, score, attempts, correct FROM `{scores_tbl}` ORDER BY score ASC")
+
+        if subcmd == "scores":
+            # Raw table view
+            if not rows:
+                await push_tok(client_id, f"## GED {subject_label} — No scores yet\nStart a session to record your first assessment.\n")
+            else:
+                lines_out = [f"## GED {subject_label} — Topic Scores\n\n"]
+                lines_out.append(f"  {'Topic':<28} {'Score':>6}  {'Correct':>7}  {'Attempts':>8}\n")
+                lines_out.append(f"  {'─' * 28} {'─' * 6}  {'─' * 7}  {'─' * 8}\n")
+                for r in rows:
+                    label = _GED_TOPIC_LABELS.get(r["topic"], r["topic"])
+                    lines_out.append(f"  {label:<28} {r['score']:>6.2f}  {r['correct']:>7}  {r['attempts']:>8}\n")
+                await push_tok(client_id, "".join(lines_out))
+            await conditional_push_done(client_id)
+            return
+
+        # Default: visual dashboard
+        lines_out = [f"## GED {subject_label} Progress — Lee\n\n"]
+
+        if not rows:
+            lines_out.append("No progress recorded yet. Start a session to begin the assessment.\n")
+            lines_out.append(f"\n_!ged all — view all subjects_\n")
+            await push_tok(client_id, "".join(lines_out))
+            await conditional_push_done(client_id)
+            return
+
+        lines_out.append("**Topic Scores**\n")
+        total_score = 0.0
+        for r in rows:
+            label = _GED_TOPIC_LABELS.get(r["topic"], r["topic"])
+            bar = _ged_bar(r["score"])
+            lbl = _ged_label(r["score"])
+            lines_out.append(f"  {label:<28} {bar}  {r['score']:.2f}  {lbl}\n")
+            total_score += r["score"]
+
+        overall = total_score / len(rows) if rows else 0.0
+        overall_bar = _ged_bar(overall)
+        need = " (Need 75% to attempt exam)" if overall < 0.75 else " ✓ Ready for exam!"
+        lines_out.append(f"\n**Overall Readiness:  {int(overall * 100)}%**   {overall_bar}{need}\n")
+
+        # Session stats
+        try:
+            result_count = await fetch_dicts(f"SELECT COUNT(*) as cnt FROM `{results_tbl}`")
+            quiz_count = await fetch_dicts(f"SELECT COUNT(DISTINCT session_id) as cnt FROM `{results_tbl}` WHERE phase='quiz'")
+            total_q = result_count[0]["cnt"] if result_count else 0
+            total_sessions = quiz_count[0]["cnt"] if quiz_count else 0
+            lines_out.append(f"\nQuizzes taken: {total_sessions}  |  Questions answered: {total_q}\n")
+        except Exception:
+            pass
+
+        lines_out.append(f"\n_!ged all — all subjects  |  !ged scores — raw data_\n")
+        await push_tok(client_id, "".join(lines_out))
+
+    except Exception as e:
+        await push_tok(client_id, f"Error reading GED progress: {e}\n")
+    finally:
+        set_db_override(None)
+
+    await conditional_push_done(client_id)
+
+
+# ---------------------------------------------------------------------------
 # !toolstats — aggregate tool execution stats
 # ---------------------------------------------------------------------------
 
@@ -3139,7 +3364,7 @@ async def cmd_timers(client_id: str, arg: str = ""):
             "run_count": ps["checks_run"],
             "last_run_at": ps["last_check_at"],
             "next_run_at": None,
-            "last_duration_s": None,
+            "last_duration_s": ps.get("last_check_duration_s"),
             "last_error": ps.get("last_error"),
         }
     except ImportError:
@@ -3991,40 +4216,118 @@ async def cmd_stop(client_id: str):
 
 
 async def cmd_set_model(client_id: str, key: str, session: dict):
-    """Set the active LLM model for this session."""
+    """Set the active LLM model for this session.
+
+    Syntax: !model <key> [sys_prompt=none|caller|target] [history=none|caller] [database=caller|target|none]
+
+    sys_prompt : "none"   — no bridging system message (default).
+                 "caller" — inject the current model's assembled system prompt into history.
+                 "target" — inject the new model's own system_prompt_folder into history.
+    history    : "caller" — keep existing history, trim to new model's window (default).
+                 "none"   — clear history on switch.
+    database   : "caller" — keep the current session database (default).
+                 "target" — switch to the new model's configured database.
+                 "none"   — clear any database override (fall back to model-key routing).
+    """
     if not key or not key.strip():
         await push_tok(client_id,
             "ERROR: Model name required\n"
-            "Usage: !model <model_name>\n"
+            "Usage: !model <key> [sys_prompt=none|caller|target] [history=none|caller] [database=caller|target|none]\n"
             "Use !model to list available models")
         await conditional_push_done(client_id)
         return
 
-    key = key.strip()
-    if key in LLM_REGISTRY:
-        await cancel_active_task(client_id)
-        old_model = session["model"]
-        old_cfg = LLM_REGISTRY.get(old_model, {})
-        new_cfg = LLM_REGISTRY.get(key, {})
-        session["model"] = key
-        from state import save_session_config
-        save_session_config(client_id, session)
-        # Recompute effective window and trim history immediately
-        trimmed = _notify_chain_model_switch(session, old_model, key, old_cfg, new_cfg)
-        prev_len = len(session.get("history", []))
-        session["history"] = trimmed
-        dropped = prev_len - len(trimmed)
-        await push_model(client_id, key)
-        msg = f"Model set to '{key}'."
-        if dropped > 0:
-            msg += f" History trimmed: {dropped} message(s) removed ({len(trimmed)} kept)."
-        await push_tok(client_id, msg)
-    else:
+    # ---- Parse key and keyword options ----
+    tokens = key.strip().split()
+    model_key = tokens[0]
+    opts = {}
+    for tok in tokens[1:]:
+        if "=" in tok:
+            k, _, v = tok.partition("=")
+            opts[k.lower()] = v.lower()
+
+    opt_sys_prompt = opts.get("sys_prompt", "none")
+    opt_history    = opts.get("history",    "caller")
+    opt_database   = opts.get("database",   "caller")
+
+    # Validate options
+    errors = []
+    if opt_sys_prompt not in ("none", "caller", "target"):
+        errors.append(f"sys_prompt must be none/caller/target, got '{opt_sys_prompt}'")
+    if opt_history not in ("none", "caller"):
+        errors.append(f"history must be none/caller, got '{opt_history}'")
+    if opt_database not in ("caller", "target", "none"):
+        errors.append(f"database must be caller/target/none, got '{opt_database}'")
+    if errors:
+        await push_tok(client_id, "ERROR: " + "; ".join(errors))
+        await conditional_push_done(client_id)
+        return
+
+    if model_key not in LLM_REGISTRY:
         available = ", ".join(LLM_REGISTRY.keys())
         await push_tok(client_id,
-            f"ERROR: Unknown model '{key}'\n"
+            f"ERROR: Unknown model '{model_key}'\n"
             f"Available models: {available}\n"
             f"Use !model to list all models")
+        await conditional_push_done(client_id)
+        return
+
+    await cancel_active_task(client_id)
+    old_model = session["model"]
+    old_cfg = LLM_REGISTRY.get(old_model, {})
+    new_cfg = LLM_REGISTRY.get(model_key, {})
+    session["model"] = model_key
+
+    # ---- sys_prompt: inject bridging system message into history ----
+    if opt_sys_prompt != "none":
+        from prompt import load_prompt_for_folder
+        if opt_sys_prompt == "caller":
+            sp_rel = old_cfg.get("system_prompt_folder", "")
+        else:  # "target"
+            sp_rel = new_cfg.get("system_prompt_folder", "")
+        if sp_rel and sp_rel.lower() != "none":
+            sp_abs = os.path.join(os.path.dirname(os.path.abspath(__file__)), sp_rel)
+            sp_text = load_prompt_for_folder(sp_abs)
+            if sp_text:
+                history = list(session.get("history", []))
+                history.append({"role": "system", "content": sp_text})
+                session["history"] = history
+
+    # ---- history: clear if requested ----
+    if opt_history == "none":
+        session["history"] = []
+
+    # ---- Recompute effective window and trim via chain plugins ----
+    trimmed = _notify_chain_model_switch(session, old_model, model_key, old_cfg, new_cfg)
+    prev_len = len(session.get("history", []))
+    session["history"] = trimmed
+    dropped = prev_len - len(trimmed)
+
+    # ---- database: set override ----
+    if opt_database == "target":
+        target_db = new_cfg.get("database", "")
+        session["database"] = target_db
+        set_db_override(target_db)
+    elif opt_database == "none":
+        session["database"] = ""
+        set_db_override("")
+    # "caller" — no change to session["database"] or override
+
+    from state import save_session_config
+    save_session_config(client_id, session)
+
+    await push_model(client_id, model_key)
+    parts_msg = [f"Model set to '{model_key}'."]
+    if opt_sys_prompt != "none":
+        parts_msg.append(f"sys_prompt={opt_sys_prompt} injected.")
+    if opt_history == "none":
+        parts_msg.append("History cleared.")
+    elif dropped > 0:
+        parts_msg.append(f"History trimmed: {dropped} message(s) removed ({len(trimmed)} kept).")
+    if opt_database != "caller":
+        db_now = session.get("database") or "(model default)"
+        parts_msg.append(f"Database: {db_now}.")
+    await push_tok(client_id, " ".join(parts_msg))
     await conditional_push_done(client_id)
 
 
@@ -4199,6 +4502,7 @@ async def cmd_db(client_id: str, arg: str):
     Usage:
       !db                    - list available databases
       !db current            - show current session's database
+      !db sessions           - list user-created databases (!db switch only)
       !db switch <name>      - switch to database (creates if needed)
       !db delete <name>      - delete a database (with confirmation)
       !db delete <name> confirm - delete without confirmation prompt
@@ -4209,6 +4513,7 @@ async def cmd_db(client_id: str, arg: str):
         list_databases, get_protected_databases, get_database_for_model,
         create_database, delete_database, database_exists,
         set_db_override, _DB_TABLES, _generate_table_map,
+        list_user_databases, get_db_meta, get_model_databases,
     )
 
     session = sessions.get(client_id, {})
@@ -4241,6 +4546,31 @@ async def cmd_db(client_id: str, arg: str):
         current_db = session.get("database") or get_database_for_model(session.get("model", ""))
         source = "session override" if session.get("database") else "model default"
         await push_tok(client_id, f"Current database: {current_db} ({source})")
+
+    elif parts[0].lower() == "sessions":
+        user_dbs = list_user_databases()
+        model_dbs = get_model_databases()
+        protected = get_protected_databases()
+        current_db = session.get("database") or get_database_for_model(session.get("model", ""))
+        if not user_dbs:
+            await push_tok(client_id, "No user-created databases (none created via !db switch).")
+        else:
+            lines = [f"User-created databases ({len(user_dbs)})  [created via !db switch, not defined in llm-models.json]:"]
+            for db in sorted(user_dbs):
+                meta = get_db_meta(db)
+                markers = []
+                if db == current_db:
+                    markers.append("current")
+                if db in protected:
+                    markers.append("protected")
+                if db in model_dbs:
+                    markers.append("also in llm-models.json")
+                tmap = _DB_TABLES.get(db, {})
+                table_count = sum(1 for k, v in tmap.items() if isinstance(v, str))
+                created_at = meta.get("created_at", "unknown")
+                marker_str = f"  ({', '.join(markers)})" if markers else ""
+                lines.append(f"  {db}  tables={table_count}  created={created_at}{marker_str}")
+            await push_tok(client_id, "\n".join(lines))
 
     elif parts[0].lower() == "switch" and len(parts) >= 2:
         db_name = parts[1].lower()
@@ -4733,9 +5063,10 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
         sessions[client_id]["peer_ip"] = peer_ip
     session = sessions[client_id]
 
-    # Apply session-level database override (persisted across reconnects)
-    from database import set_db_override
+    # Apply session-level database override and model context for DB routing
+    from database import set_db_override, set_model_context
     set_db_override(session.get("database", "") or "")
+    set_model_context(session.get("model", "") or "")
 
     # Reject requests from sessions flagged by AIRS async violation
     if session.get("airs_blocked"):
@@ -4842,6 +5173,8 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
                     await cmd_plan(client_id, arg, session.get("model", ""))
                 elif cmd == "drives":
                     await cmd_drives(client_id, arg, session.get("model", ""))
+                elif cmd == "ged":
+                    await cmd_ged(client_id, arg, session)
                 elif cmd == "toolstats":
                     await cmd_toolstats(client_id, arg, session.get("model", ""))
                 elif cmd == "stream":

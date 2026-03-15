@@ -45,6 +45,7 @@ _stats: dict = {
     "rows_fired":       0,
     "reminders_written":0,
     "last_check_at":    None,
+    "last_check_duration_s": None,
     "last_error":       None,
     "last_feedback":    None,
 }
@@ -261,54 +262,56 @@ async def run_check() -> dict:
             model_key = "summarizer-gemini"
     reminder_imp = cfg["prospective_reminder_imp"]
 
-    from database import set_model_context
-    from config import DEFAULT_MODEL
-    set_model_context(DEFAULT_MODEL)
+    from database import set_db_override, list_managed_databases
 
+    t_start = time.monotonic()
     summary = {"evaluated": 0, "fired": 0, "reminders": 0, "error": None}
 
-    try:
-        rows = await _fetch_pending()
-        summary["evaluated"] = len(rows)
-        _stats["rows_evaluated"] += len(rows)
+    for db_name in list_managed_databases():
+        set_db_override(db_name)
+        try:
+            rows = await _fetch_pending()
+            summary["evaluated"] += len(rows)
+            _stats["rows_evaluated"] += len(rows)
 
-        for row in rows:
-            overdue = await _is_overdue(row, model_key)
-            if not overdue:
-                continue
+            for row in rows:
+                overdue = await _is_overdue(row, model_key)
+                if not overdue:
+                    continue
 
-            _stats["rows_fired"] += 1
-            summary["fired"] += 1
+                _stats["rows_fired"] += 1
+                summary["fired"] += 1
 
-            wrote = await _inject_reminder(row, reminder_imp)
-            if wrote:
-                _stats["reminders_written"] += 1
-                summary["reminders"] += 1
-                # Notify
-                import asyncio as _asyncio
-                try:
-                    import notifier as _notifier
-                    _asyncio.ensure_future(_notifier.fire_event(
-                        "prospective_reminder",
-                        f"topic={row.get('topic')!r}  due_at={row.get('due_at') or 'now'}",
-                        (row.get("content") or "")[:200],
-                    ))
-                except Exception:
-                    pass
+                wrote = await _inject_reminder(row, reminder_imp)
+                if wrote:
+                    _stats["reminders_written"] += 1
+                    summary["reminders"] += 1
+                    import asyncio as _asyncio
+                    try:
+                        import notifier as _notifier
+                        _asyncio.ensure_future(_notifier.fire_event(
+                            "prospective_reminder",
+                            f"topic={row.get('topic')!r}  due_at={row.get('due_at') or 'now'}",
+                            (row.get("content") or "")[:200],
+                        ))
+                    except Exception:
+                        pass
 
-            await _mark_done(row["id"])
-            log.info(
-                f"prospective: fired id={row['id']} topic={row.get('topic')!r} "
-                f"due_at={row.get('due_at')!r}"
-            )
+                await _mark_done(row["id"])
+                log.info(
+                    f"prospective[{db_name}]: fired id={row['id']} topic={row.get('topic')!r} "
+                    f"due_at={row.get('due_at')!r}"
+                )
 
-    except Exception as e:
-        log.error(f"prospective: check error: {e}")
-        summary["error"] = str(e)
-        _stats["last_error"] = str(e)
+        except Exception as e:
+            log.error(f"prospective[{db_name}]: check error: {e}")
+            summary["error"] = str(e)
+            _stats["last_error"] = str(e)
+    set_db_override("")
 
     _stats["checks_run"] += 1
     _stats["last_check_at"] = datetime.now(timezone.utc).isoformat()
+    _stats["last_check_duration_s"] = round(time.monotonic() - t_start, 2)
 
     # Feedback evaluation — run every Nth check to avoid thrashing on 5-min cycles
     # Only evaluate when at least one reminder has been written (something to judge)

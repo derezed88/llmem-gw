@@ -20,7 +20,7 @@ import time
 from config import log, MAX_TOOL_ITERATIONS, LLM_REGISTRY, RATE_LIMITS, LIVE_LIMITS, LLM_TOOLSETS, LLM_TOOLSET_META, TOOL_CALL_LOG_DEFAULT, save_llm_model_field
 from state import push_tok, push_done, push_flush, push_err, current_client_id, sessions, wait_for_gate, resolve_gate, has_pending_gate, update_session_token_stats
 from prompt import load_prompt_for_folder
-from database import execute_sql, set_model_context
+from database import execute_sql, set_model_context, set_db_override, get_db_override
 from tools import (
     get_system_info,
     get_all_lc_tools, get_all_openai_tools, get_tool_executor,
@@ -1783,6 +1783,7 @@ async def llm_call(
     sys_prompt: str = "none",
     history: str = "none",
     tool: str = "",
+    database: str = "caller",
 ) -> str:
     """
     Unified LLM-to-LLM call.
@@ -1799,6 +1800,9 @@ async def llm_call(
     history    : "none"   — no history; clean single-turn call.
                  "caller" — prepend the calling session's full chat history.
     tool       : Tool name (required when mode="tool").
+    database   : "caller" — use the calling session's database (default).
+                 "target" — use the target model's configured database.
+                 "none"   — clear any override; fall back to model-key routing.
 
     client_id is read from the current_client_id ContextVar (set by execute_tool).
     """
@@ -1820,6 +1824,8 @@ async def llm_call(
         return f"ERROR: sys_prompt must be 'none', 'caller', or 'target', got '{sys_prompt}'."
     if history not in ("none", "caller"):
         return f"ERROR: history must be 'none' or 'caller', got '{history}'."
+    if database not in ("caller", "target", "none"):
+        return f"ERROR: database must be 'caller', 'target', or 'none', got '{database}'."
 
     session = sessions.get(client_id, {})
     timeout = cfg.get("llm_call_timeout", 60)
@@ -1879,10 +1885,11 @@ async def llm_call(
     tag_mode = f"{mode}/{tool}" if mode == "tool" and tool else mode
     tag_sp = f"sp={sys_prompt}"
     tag_h = f"hist={history}"
+    tag_db = f"db={database}"
     if not session.get("tool_suppress", False):
         await push_tok(
             client_id,
-            f"\n[llm_call ▶] {model} [{tag_mode} {tag_sp} {tag_h}]:"
+            f"\n[llm_call ▶] {model} [{tag_mode} {tag_sp} {tag_h} {tag_db}]:"
             f" {prompt[:80]}{'…' if len(prompt) > 80 else ''}\n"
         )
 
@@ -1959,6 +1966,17 @@ async def llm_call(
             if not tool_schema:
                 return f"ERROR: No schema found for tool '{tool}'. Cannot delegate."
 
+            # ---- Resolve database context for tool execution ----
+            _prev_db_override = get_db_override()
+            if database == "caller":
+                # Explicit: keep current caller override (no change)
+                pass
+            elif database == "target":
+                _target_db = cfg.get("database", "")
+                set_db_override(_target_db)
+            else:  # "none"
+                set_db_override("")
+
             try:
                 async def _run_tool():
                     from langchain_core.tools import StructuredTool as _ST
@@ -2007,6 +2025,8 @@ async def llm_call(
                 await push_tok(client_id, f"[llm_call ✗] {model}/{tool}: {exc}\n")
                 log.error(f"llm_call error: model={model} tool={tool} client={client_id} exc={exc}")
                 return msg
+            finally:
+                set_db_override(_prev_db_override)
 
     finally:
         if history == "caller":
@@ -2198,4 +2218,7 @@ async def dispatch_llm(model_key: str, messages: list[dict], client_id: str) -> 
     n = _enrich_stats["total"]
     _enrich_stats["avg_ms"] += (_enrich_ms - _enrich_stats["avg_ms"]) / n
 
+    from agents_xai import is_responses_api, agentic_responses_api
+    if is_responses_api(model_key):
+        return await agentic_responses_api(model_key, messages, client_id)
     return await agentic_lc(model_key, messages, client_id)

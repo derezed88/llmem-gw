@@ -354,9 +354,7 @@ async def run_goal_processor() -> dict:
         except KeyError:
             model_key = "plan-decomposer"
 
-    from database import set_model_context
-    from config import DEFAULT_MODEL
-    set_model_context(DEFAULT_MODEL)
+    from database import set_db_override, list_managed_databases
 
     t_start = time.monotonic()
     summary = {
@@ -364,55 +362,58 @@ async def run_goal_processor() -> dict:
         "deferred_requeued": 0, "error": None,
     }
 
-    try:
-        # Phase 1: Scan for unplanned goals and propose
-        unplanned = await _scan_unplanned_goals(max_goals)
-        summary["scanned"] = len(unplanned)
-        _stats["goals_scanned"] += len(unplanned)
+    for db_name in list_managed_databases():
+        set_db_override(db_name)
+        try:
+            # Phase 1: Scan for unplanned goals and propose
+            unplanned = await _scan_unplanned_goals(max_goals)
+            summary["scanned"] += len(unplanned)
+            _stats["goals_scanned"] += len(unplanned)
 
-        for goal in unplanned:
-            ok = await _propose_plan(goal, model_key)
-            if ok:
-                summary["proposed"] += 1
-                _stats["plans_proposed"] += 1
+            for goal in unplanned:
+                ok = await _propose_plan(goal, model_key)
+                if ok:
+                    summary["proposed"] += 1
+                    _stats["plans_proposed"] += 1
 
-        # Phase 2: Check deferred goals whose cooldown expired
-        deferred = await _scan_deferred_goals()
-        for goal in deferred:
-            from database import execute_sql
-            await execute_sql(
-                f"UPDATE {_GOALS()} SET auto_process_status = NULL, defer_until = NULL "
-                f"WHERE id = {goal['id']}"
-            )
-            summary["deferred_requeued"] += 1
-            log.info(f"goal_processor: re-queued deferred goal {goal['id']}")
+            # Phase 2: Check deferred goals whose cooldown expired
+            deferred = await _scan_deferred_goals()
+            for goal in deferred:
+                from database import execute_sql
+                await execute_sql(
+                    f"UPDATE {_GOALS()} SET auto_process_status = NULL, defer_until = NULL "
+                    f"WHERE id = {goal['id']}"
+                )
+                summary["deferred_requeued"] += 1
+                log.info(f"goal_processor[{db_name}]: re-queued deferred goal {goal['id']}")
 
-        # Phase 3: Execute steps for approved/executing goals
-        from database import fetch_dicts
-        exec_goals = await fetch_dicts(
-            f"SELECT * FROM {_GOALS()} "
-            f"WHERE status = 'active' "
-            f"AND auto_process_status IN ('approved', 'executing') "
-            f"ORDER BY importance DESC"
-        ) or []
+            # Phase 3: Execute steps for approved/executing goals
+            from database import fetch_dicts
+            exec_goals = await fetch_dicts(
+                f"SELECT * FROM {_GOALS()} "
+                f"WHERE status = 'active' "
+                f"AND auto_process_status IN ('approved', 'executing') "
+                f"ORDER BY importance DESC"
+            ) or []
 
-        exec_budget = max_exec
-        for goal in exec_goals:
-            if exec_budget <= 0:
-                break
-            from database import execute_sql
-            await execute_sql(
-                f"UPDATE {_GOALS()} SET auto_process_status = 'executing' "
-                f"WHERE id = {goal['id']}"
-            )
-            result = await _execute_goal_serial(goal["id"], exec_budget)
-            summary["executed_goals"] += 1
-            exec_budget -= result.get("executed", 0)
+            exec_budget = max_exec
+            for goal in exec_goals:
+                if exec_budget <= 0:
+                    break
+                from database import execute_sql
+                await execute_sql(
+                    f"UPDATE {_GOALS()} SET auto_process_status = 'executing' "
+                    f"WHERE id = {goal['id']}"
+                )
+                result = await _execute_goal_serial(goal["id"], exec_budget)
+                summary["executed_goals"] += 1
+                exec_budget -= result.get("executed", 0)
 
-    except Exception as e:
-        log.error(f"goal_processor: run error: {e}")
-        summary["error"] = str(e)
-        _stats["last_error"] = str(e)
+        except Exception as e:
+            log.error(f"goal_processor[{db_name}]: run error: {e}")
+            summary["error"] = str(e)
+            _stats["last_error"] = str(e)
+    set_db_override("")
 
     duration = time.monotonic() - t_start
     _stats["runs"] += 1

@@ -205,6 +205,8 @@ async def cmd_help(client_id: str):
         "  !db switch <name>                         - switch to database (creates if needed)\n"
         "  !db delete <name>                         - delete a database (with confirmation)\n"
         "  !db delete <name> confirm                 - delete without confirmation prompt\n"
+        "  !db reset                                 - preview data wipe for current database\n"
+        "  !db reset confirm                         - wipe all data in current database (MySQL + Qdrant)\n"
         "\n"
         "Session & History:\n"
         "  !session                                  - list all active sessions\n"
@@ -2347,220 +2349,8 @@ async def cmd_memtrim(client_id: str, arg: str, model_key: str = ""):
     await conditional_push_done(client_id)
 
 
-# ---------------------------------------------------------------------------
-# !ged — GED course progress dashboard
-# ---------------------------------------------------------------------------
-
-# Maps GED model keys to their database names and subject labels
-_GED_SUBJECTS = {
-    "ged-math":        ("gedmath",    "Mathematical Reasoning"),
-    "ged-rla-reading": ("gedreading", "RLA Reading"),
-    "ged-rla-writing": ("gedwriting", "RLA Writing"),
-    "ged-science":     ("gedscience", "Science"),
-    "ged-social":      ("gedsocial",  "Social Studies"),
-}
-
-_GED_TOPIC_LABELS = {
-    # Math
-    "number_ops":            "Number Operations",
-    "ratio_proportion":      "Ratio & Proportion",
-    "expressions_equations": "Expressions & Equations",
-    "inequalities":          "Inequalities",
-    "functions":             "Functions",
-    "geometry":              "Geometry",
-    "statistics":            "Statistics",
-    "data_analysis":         "Data Analysis",
-    # RLA Reading
-    "informational_text":    "Informational Text",
-    "literary_text":         "Literary Text",
-    "main_idea":             "Main Idea",
-    "evidence_inference":    "Evidence & Inference",
-    "vocab_context":         "Vocabulary in Context",
-    "text_structure":        "Text Structure",
-    "compare_texts":         "Comparing Texts",
-    "authors_purpose":       "Author's Purpose",
-    # RLA Writing
-    "extended_response":     "Extended Response",
-    "grammar_usage":         "Grammar & Usage",
-    "sentence_structure":    "Sentence Structure",
-    "punctuation":           "Punctuation",
-    "capitalization":        "Capitalization",
-    "organization":          "Organization",
-    "evidence_use":          "Evidence Use",
-    "revision_editing":      "Revision & Editing",
-    # Science
-    "life_science":          "Life Science",
-    "physical_science":      "Physical Science",
-    "earth_space_science":   "Earth & Space Science",
-    "scientific_reasoning":  "Scientific Reasoning",
-    "data_interpretation":   "Data Interpretation",
-    "experimental_design":   "Experimental Design",
-    "scientific_vocabulary": "Scientific Vocabulary",
-    "environmental_science": "Environmental Science",
-    # Social Studies
-    "us_history":            "US History",
-    "civics_government":     "Civics & Government",
-    "economics":             "Economics",
-    "geography_world":       "Geography",
-    "reading_maps_charts":   "Maps & Charts",
-    "historical_documents":  "Historical Documents",
-    "current_events":        "Current Events",
-    "critical_thinking":     "Critical Thinking",
-}
 
 
-def _ged_bar(score: float, width: int = 10) -> str:
-    """Render a Unicode progress bar for a 0.0–1.0 score."""
-    filled = round(score * width)
-    return "█" * filled + "░" * (width - filled)
-
-
-def _ged_label(score: float) -> str:
-    if score >= 0.75:
-        return "✓ Strong"
-    elif score >= 0.5:
-        return "→ Building"
-    else:
-        return "✗ Focus area"
-
-
-async def _ged_subject_readiness(db_name: str) -> float | None:
-    """Return overall readiness (0.0–1.0) for a GED subject DB, or None if no data."""
-    from database import fetch_dicts, get_tables_for_model
-    try:
-        set_db_override(db_name)
-        tables = get_tables_for_model()
-        tbl = tables.get("ged_topic_scores", f"{db_name}_ged_topic_scores")
-        rows = await fetch_dicts(f"SELECT score FROM `{tbl}`")
-        if not rows:
-            return None
-        return sum(r["score"] for r in rows) / len(rows)
-    except Exception:
-        return None
-    finally:
-        set_db_override(None)
-
-
-async def cmd_ged(client_id: str, arg: str, session: dict):
-    """
-    !ged            — progress dashboard for current GED subject (or all subjects if not in a GED model)
-    !ged all        — cross-subject readiness summary
-    !ged scores     — raw topic scores table for current subject
-    """
-    from database import fetch_dicts, get_tables_for_model
-
-    parts = arg.strip().split(maxsplit=1) if arg.strip() else []
-    subcmd = parts[0].lower() if parts else ""
-
-    current_model = session.get("model", "")
-    in_ged = current_model in _GED_SUBJECTS
-
-    # !ged all — cross-subject summary (works from any model)
-    if subcmd == "all" or (not subcmd and not in_ged):
-        lines_out = ["## GED Progress — All Subjects\n\n"]
-        lines_out.append(f"  {'Subject':<28} {'Readiness':<12} {'Status'}\n")
-        lines_out.append(f"  {'─' * 28} {'─' * 12} {'─' * 15}\n")
-
-        total_scores = []
-        for model_key, (db_name, label) in _GED_SUBJECTS.items():
-            readiness = await _ged_subject_readiness(db_name)
-            if readiness is None:
-                bar = "░" * 10
-                pct = "0%"
-                status = "Not started"
-            else:
-                bar = _ged_bar(readiness)
-                pct = f"{int(readiness * 100)}%"
-                status = "Ready for exam" if readiness >= 0.75 else "In progress"
-                total_scores.append(readiness)
-            lines_out.append(f"  {label:<28} {bar}  {pct:<6} {status}\n")
-
-        overall = sum(total_scores) / len(total_scores) if total_scores else 0.0
-        overall_bar = _ged_bar(overall)
-        lines_out.append(f"\n  {'Overall GED Readiness:':<28} {overall_bar}  {int(overall * 100)}%\n")
-
-        subject_cmds = " | ".join(f"!model {k}" for k in _GED_SUBJECTS)
-        lines_out.append(f"\n_Switch subject: {subject_cmds}_\n")
-
-        await push_tok(client_id, "".join(lines_out))
-        await conditional_push_done(client_id)
-        return
-
-    # Must be in a GED model for per-subject commands
-    if not in_ged:
-        await push_tok(client_id, "Switch to a GED subject first: !model ged-math | ged-rla-reading | ged-rla-writing | ged-science | ged-social\n")
-        await conditional_push_done(client_id)
-        return
-
-    db_name, subject_label = _GED_SUBJECTS[current_model]
-
-    try:
-        set_db_override(db_name)
-        tables = get_tables_for_model()
-        scores_tbl = tables.get("ged_topic_scores", f"{db_name}_ged_topic_scores")
-        results_tbl = tables.get("ged_quiz_results", f"{db_name}_ged_quiz_results")
-        state_tbl = tables.get("ged_session_state", f"{db_name}_ged_session_state")
-
-        rows = await fetch_dicts(f"SELECT topic, score, attempts, correct FROM `{scores_tbl}` ORDER BY score ASC")
-
-        if subcmd == "scores":
-            # Raw table view
-            if not rows:
-                await push_tok(client_id, f"## GED {subject_label} — No scores yet\nStart a session to record your first assessment.\n")
-            else:
-                lines_out = [f"## GED {subject_label} — Topic Scores\n\n"]
-                lines_out.append(f"  {'Topic':<28} {'Score':>6}  {'Correct':>7}  {'Attempts':>8}\n")
-                lines_out.append(f"  {'─' * 28} {'─' * 6}  {'─' * 7}  {'─' * 8}\n")
-                for r in rows:
-                    label = _GED_TOPIC_LABELS.get(r["topic"], r["topic"])
-                    lines_out.append(f"  {label:<28} {r['score']:>6.2f}  {r['correct']:>7}  {r['attempts']:>8}\n")
-                await push_tok(client_id, "".join(lines_out))
-            await conditional_push_done(client_id)
-            return
-
-        # Default: visual dashboard
-        lines_out = [f"## GED {subject_label} Progress — Lee\n\n"]
-
-        if not rows:
-            lines_out.append("No progress recorded yet. Start a session to begin the assessment.\n")
-            lines_out.append(f"\n_!ged all — view all subjects_\n")
-            await push_tok(client_id, "".join(lines_out))
-            await conditional_push_done(client_id)
-            return
-
-        lines_out.append("**Topic Scores**\n")
-        total_score = 0.0
-        for r in rows:
-            label = _GED_TOPIC_LABELS.get(r["topic"], r["topic"])
-            bar = _ged_bar(r["score"])
-            lbl = _ged_label(r["score"])
-            lines_out.append(f"  {label:<28} {bar}  {r['score']:.2f}  {lbl}\n")
-            total_score += r["score"]
-
-        overall = total_score / len(rows) if rows else 0.0
-        overall_bar = _ged_bar(overall)
-        need = " (Need 75% to attempt exam)" if overall < 0.75 else " ✓ Ready for exam!"
-        lines_out.append(f"\n**Overall Readiness:  {int(overall * 100)}%**   {overall_bar}{need}\n")
-
-        # Session stats
-        try:
-            result_count = await fetch_dicts(f"SELECT COUNT(*) as cnt FROM `{results_tbl}`")
-            quiz_count = await fetch_dicts(f"SELECT COUNT(DISTINCT session_id) as cnt FROM `{results_tbl}` WHERE phase='quiz'")
-            total_q = result_count[0]["cnt"] if result_count else 0
-            total_sessions = quiz_count[0]["cnt"] if quiz_count else 0
-            lines_out.append(f"\nQuizzes taken: {total_sessions}  |  Questions answered: {total_q}\n")
-        except Exception:
-            pass
-
-        lines_out.append(f"\n_!ged all — all subjects  |  !ged scores — raw data_\n")
-        await push_tok(client_id, "".join(lines_out))
-
-    except Exception as e:
-        await push_tok(client_id, f"Error reading GED progress: {e}\n")
-    finally:
-        set_db_override(None)
-
-    await conditional_push_done(client_id)
 
 
 # ---------------------------------------------------------------------------
@@ -3630,7 +3420,6 @@ async def cmd_plan(client_id: str, arg: str, model_key: str = ""):
     except Exception as e:
         await push_err(client_id, f"!plan error: {e}")
 
-    from state import conditional_push_done
     await conditional_push_done(client_id)
 
 
@@ -4277,6 +4066,7 @@ async def cmd_set_model(client_id: str, key: str, session: dict):
     old_cfg = LLM_REGISTRY.get(old_model, {})
     new_cfg = LLM_REGISTRY.get(model_key, {})
     session["model"] = model_key
+    session["responses_api_id"] = None  # xAI Responses API chain is model-specific
 
     # ---- sys_prompt: inject bridging system message into history ----
     if opt_sys_prompt != "none":
@@ -4363,6 +4153,7 @@ async def cmd_reset(client_id: str, session: dict):
     session["history"] = []
     session["tool_subscriptions"] = {}
     session["tool_list_injected"] = False
+    session["responses_api_id"] = None  # break xAI Responses API chain
     model_cfg = LLM_REGISTRY.get(session.get("model", ""), {})
     import plugin_history_default as _phd
     session["history_max_ctx"] = _phd.compute_effective_max_ctx(model_cfg)
@@ -4506,6 +4297,8 @@ async def cmd_db(client_id: str, arg: str):
       !db switch <name>      - switch to database (creates if needed)
       !db delete <name>      - delete a database (with confirmation)
       !db delete <name> confirm - delete without confirmation prompt
+      !db reset              - preview: show all tables and row counts that will be wiped
+      !db reset confirm      - wipe all data in current database (MySQL + Qdrant + session)
     """
     import re as _re
     from state import sessions, save_session_config
@@ -4648,8 +4441,97 @@ async def cmd_db(client_id: str, arg: str):
         if session.get("database") == db_name:
             set_db_override("")
 
+    elif parts[0].lower() == "reset":
+        # !db reset [confirm] — truncate all tables + Qdrant for the active database
+        from database import fetch_dicts, execute_sql as _exec_sql
+        current_db = session.get("database") or get_database_for_model(session.get("model", ""))
+        if not current_db:
+            await push_tok(client_id, "ERROR: No active database. Switch to a model or use !db switch first.")
+            await conditional_push_done(client_id)
+            return
+
+        protected = get_protected_databases()
+        if current_db in protected:
+            await push_tok(client_id, f"ERROR: Database '{current_db}' is protected. Cannot reset.\nProtected databases: {', '.join(protected)}")
+            await conditional_push_done(client_id)
+            return
+
+        if current_db not in _DB_TABLES:
+            await push_tok(client_id, f"ERROR: Database '{current_db}' has no table map in db-config.json.")
+            await conditional_push_done(client_id)
+            return
+
+        tmap = _DB_TABLES[current_db]
+        # Collect all string-valued table names (skip list/dict entries like auto_enrich)
+        target_tables = [v for k, v in tmap.items() if isinstance(v, str)]
+        qdrant_collection = tmap.get("collection", f"{current_db}_memory")
+        confirmed = len(parts) >= 2 and parts[1].lower() == "confirm"
+
+        if not confirmed:
+            # Preview
+            set_db_override(current_db)
+            try:
+                lines = [f"## !db reset — {current_db}\n\nThis will permanently delete all data:\n"]
+                for tbl in sorted(target_tables):
+                    try:
+                        result = await fetch_dicts(f"SELECT COUNT(*) as cnt FROM `{tbl}`")
+                        cnt = result[0]["cnt"] if result else 0
+                    except Exception:
+                        cnt = "?"
+                    lines.append(f"  {tbl}: {cnt} rows\n")
+                lines.append(f"\nQdrant collection: {qdrant_collection} (all points)\n")
+                lines.append(f"Session history: will be cleared\n")
+                lines.append(f"\nType `!db reset confirm` to proceed.")
+                await push_tok(client_id, "".join(lines))
+            finally:
+                set_db_override(None)
+            await conditional_push_done(client_id)
+            return
+
+        # Execute the wipe
+        set_db_override(current_db)
+        try:
+            cleared = []
+            for tbl in target_tables:
+                try:
+                    await _exec_sql(f"DELETE FROM `{tbl}`")
+                    cleared.append(tbl)
+                except Exception as e:
+                    log.warning(f"!db reset: failed to clear {tbl}: {e}")
+
+            # Clear Qdrant collection
+            qdrant_cleared = False
+            try:
+                from plugin_memory_vector_qdrant import get_vector_api
+                vec = get_vector_api()
+                if vec and vec._qc:
+                    from qdrant_client.models import FilterSelector, Filter
+                    vec._qc.delete(
+                        collection_name=qdrant_collection,
+                        points_selector=FilterSelector(filter=Filter()),
+                    )
+                    qdrant_cleared = True
+            except Exception as e:
+                log.warning(f"!db reset: Qdrant clear failed for {qdrant_collection}: {e}")
+
+            # Clear session state
+            session["history"] = []
+            session.pop("current_topic", None)
+            session["tool_subscriptions"] = {}
+            session["tool_list_injected"] = False
+            from state import delete_history
+            delete_history(client_id)
+
+            lines = [f"## Database Reset — {current_db}\n\n"]
+            lines.append(f"MySQL tables cleared: {len(cleared)}/{len(target_tables)}\n")
+            lines.append(f"Qdrant {qdrant_collection}: {'cleared' if qdrant_cleared else 'failed/skipped'}\n")
+            lines.append(f"Session history: cleared\n")
+            await push_tok(client_id, "".join(lines))
+        finally:
+            set_db_override(None)
+
     else:
-        await push_tok(client_id, "Usage: !db [list|current|switch <name>|delete <name> [confirm]]")
+        await push_tok(client_id, "Usage: !db [list|current|sessions|switch <name>|delete <name> [confirm]|reset [confirm]]")
 
     await conditional_push_done(client_id)
 
@@ -5173,8 +5055,6 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
                     await cmd_plan(client_id, arg, session.get("model", ""))
                 elif cmd == "drives":
                     await cmd_drives(client_id, arg, session.get("model", ""))
-                elif cmd == "ged":
-                    await cmd_ged(client_id, arg, session)
                 elif cmd == "toolstats":
                     await cmd_toolstats(client_id, arg, session.get("model", ""))
                 elif cmd == "stream":
@@ -5520,7 +5400,11 @@ async def endpoint_stream(request: Request):
                 continue
             
             t = item.get("t")
-            if t == "tok": yield {"data": item["d"]}
+            if t == "close":
+                # Session was reaped or explicitly deleted — terminate SSE.
+                yield {"event": "close", "data": "session_reaped"}
+                break
+            elif t == "tok": yield {"data": item["d"]}
             elif t == "done": yield {"event": "done", "data": ""}
             elif t == "err": yield {"event": "error", "data": json.dumps({"error": item["d"]})}
             elif t == "model": yield {"event": "model", "data": item["d"]}
@@ -5606,15 +5490,16 @@ async def endpoint_list_sessions(request: Request) -> JSONResponse:
 
 async def endpoint_delete_session(request: Request) -> JSONResponse:
     """Delete a specific session by ID."""
-    from state import sessions, sse_queues
+    from state import sessions, push_close, save_history, remove_shorthand_mapping
 
     sid = request.path_params.get("sid")
 
     if sid in sessions:
-        del sessions[sid]
-        # Also clean up associated queue
-        if sid in sse_queues:
-            del sse_queues[sid]
+        await push_close(sid)              # signal SSE generator to terminate
+        data = sessions.pop(sid, None)
+        if data:
+            save_history(sid, data.get("history", []))
+        remove_shorthand_mapping(sid)
         return JSONResponse({"status": "OK", "deleted": sid})
 
     return JSONResponse({"error": "session not found"}, 404)

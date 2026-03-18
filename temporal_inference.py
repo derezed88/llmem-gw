@@ -176,24 +176,12 @@ async def run_temporal_inference() -> dict:
     Single inference cycle. Returns stats dict:
     {proposed: N, skipped_cached: N, executed: N, errors: N}
     """
-    from database import set_model_context
-    from config import DEFAULT_MODEL
+    from database import set_db_override, list_managed_databases
     from tools import _recall_temporal_exec, _temporal_query_key
 
-    set_model_context(DEFAULT_MODEL)
     cfg = _ti_cfg()
     stats = {"proposed": 0, "skipped_cached": 0, "executed": 0, "errors": 0}
 
-    # 1. Load recent topics
-    topics = await _load_recent_topics()
-    if len(topics) < cfg["min_st_rows"]:
-        log.debug(f"temporal_inference: only {len(topics)} topics, below min {cfg['min_st_rows']}")
-        return stats
-
-    # 2. Get existing cached keys
-    existing = await _existing_temporal_keys(cfg["cache_ttl_hours"])
-
-    # 3. Propose queries via LLM
     model_key = cfg["model"]
     if not model_key:
         from config import get_model_role
@@ -201,46 +189,64 @@ async def run_temporal_inference() -> dict:
             model_key = get_model_role("temporal_inference")
         except KeyError:
             model_key = "summarizer-gemini"
-    proposals = await _propose_queries(topics, model_key, cfg["max_queries"])
-    stats["proposed"] = len(proposals)
-    log.info(f"temporal_inference: {len(proposals)} queries proposed from {len(topics)} topics")
 
-    # 4. Execute missing queries
-    for p in proposals:
-        q = p.get("query", "")
-        gb = p.get("group_by", "day_of_week")
-        dow = p.get("day_of_week", "")
-        tr = p.get("time_range", "")
-        lb = int(p.get("lookback_days", 30))
-
-        qkey = _temporal_query_key(q, gb, dow, tr)
-        if qkey in existing:
-            stats["skipped_cached"] += 1
-            log.debug(f"temporal_inference: cached, skipping: {qkey}")
-            continue
-
+    for db_name in list_managed_databases():
+        set_db_override(db_name)
         try:
-            await _recall_temporal_exec(
-                query=q, group_by=gb, day_of_week=dow,
-                time_range=tr, lookback_days=lb,
-                new=True, source="inferred",
-            )
-            stats["executed"] += 1
-            existing.add(qkey)  # prevent duplicates within same cycle
-            log.info(f"temporal_inference: executed: {qkey}")
-            import asyncio as _asyncio
-            try:
-                import notifier as _notifier
-                _asyncio.ensure_future(_notifier.fire_event(
-                    "temporal_pattern_inferred",
-                    f"query={q!r} group_by={gb}",
-                    f"lookback={lb}d",
-                ))
-            except Exception:
-                pass
+            # 1. Load recent topics
+            topics = await _load_recent_topics()
+            if len(topics) < cfg["min_st_rows"]:
+                log.debug(f"temporal_inference[{db_name}]: only {len(topics)} topics, below min {cfg['min_st_rows']}")
+                continue
+
+            # 2. Get existing cached keys
+            existing = await _existing_temporal_keys(cfg["cache_ttl_hours"])
+
+            # 3. Propose queries via LLM
+            proposals = await _propose_queries(topics, model_key, cfg["max_queries"])
+            stats["proposed"] += len(proposals)
+            log.info(f"temporal_inference[{db_name}]: {len(proposals)} queries proposed from {len(topics)} topics")
+
+            # 4. Execute missing queries
+            for p in proposals:
+                q = p.get("query", "")
+                gb = p.get("group_by", "day_of_week")
+                dow = p.get("day_of_week", "")
+                tr = p.get("time_range", "")
+                lb = int(p.get("lookback_days", 30))
+
+                qkey = _temporal_query_key(q, gb, dow, tr)
+                if qkey in existing:
+                    stats["skipped_cached"] += 1
+                    log.debug(f"temporal_inference[{db_name}]: cached, skipping: {qkey}")
+                    continue
+
+                try:
+                    await _recall_temporal_exec(
+                        query=q, group_by=gb, day_of_week=dow,
+                        time_range=tr, lookback_days=lb,
+                        new=True, source="inferred",
+                    )
+                    stats["executed"] += 1
+                    existing.add(qkey)
+                    log.info(f"temporal_inference[{db_name}]: executed: {qkey}")
+                    import asyncio as _asyncio
+                    try:
+                        import notifier as _notifier
+                        _asyncio.ensure_future(_notifier.fire_event(
+                            "temporal_pattern_inferred",
+                            f"query={q!r} group_by={gb}",
+                            f"lookback={lb}d",
+                        ))
+                    except Exception:
+                        pass
+                except Exception as e:
+                    stats["errors"] += 1
+                    log.warning(f"temporal_inference[{db_name}]: query failed: {qkey}: {e}")
         except Exception as e:
             stats["errors"] += 1
-            log.warning(f"temporal_inference: query failed: {qkey}: {e}")
+            log.warning(f"temporal_inference[{db_name}]: error: {e}")
+    set_db_override("")
 
     return stats
 

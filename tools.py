@@ -376,6 +376,15 @@ class _LlmCallArgs(BaseModel):
         default="",
         description="Exact tool name to delegate. Required when mode='tool'.",
     )
+    database: str = Field(
+        default="caller",
+        description=(
+            "Database context for tool execution. "
+            "'caller' — use the calling session's database (default). "
+            "'target' — use the target model's configured database. "
+            "'none'   — clear any override; falls back to model-key routing."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

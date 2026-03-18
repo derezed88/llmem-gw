@@ -14,7 +14,6 @@
       "llm_call_timeout": 60,
       "llm_tools": [
         "core",
-        "admin",
         "db",
         "search",
         "drive",
@@ -26,6 +25,7 @@
       "temperature": 1.0,
       "top_p": 1.0,
       "top_k": null,
+      "openai_responses_api": true,
       "token_selection_setting": "default"
     },
     "gpt5n": {
@@ -78,6 +78,7 @@
       "temperature": 1.0,
       "top_p": 1.0,
       "top_k": null,
+      "openai_responses_api": true,
       "token_selection_setting": "default"
     },
     "grok41fr": {
@@ -104,6 +105,7 @@
       "temperature": 1.0,
       "top_p": 1.0,
       "top_k": null,
+      "xai_responses_api": true,
       "token_selection_setting": "default"
     },
     "grok41fnr": {
@@ -130,6 +132,7 @@
       "temperature": 1.0,
       "top_p": 1.0,
       "top_k": null,
+      "xai_responses_api": true,
       "token_selection_setting": "default"
     },
     "gemini25f": {
@@ -374,6 +377,7 @@
       "conv_log": true,
       "agent_call_stream": true,
       "stream_level": 3,
+      "xai_responses_api": true,
       "identity_name": "samaritan"
     },
     "samaritan-voice-fast": {
@@ -407,6 +411,7 @@
       "conv_log": true,
       "agent_call_stream": true,
       "stream_level": 3,
+      "xai_responses_api": true,
       "identity_name": "samaritan"
     },
     "default-chat": {
@@ -433,6 +438,7 @@
       "token_selection_setting": "custom",
       "memory_scan": false,
       "conv_log": true,
+      "xai_responses_api": true,
       "allow_text_mode": true
     },
     "samaritan-reasoning": {
@@ -464,6 +470,7 @@
       "memory_types_enabled": true,
       "conv_log": true,
       "identity_name": "samaritan",
+      "xai_responses_api": true,
       "allow_text_mode": false
     },
     "samaritan-execution": {
@@ -563,6 +570,169 @@
       "conv_log": false,
       "allow_text_mode": false
     },
+    "ged-planner": {
+      "database": "default",
+      "model_id": "gemini-3.1-pro-preview",
+      "type": "GEMINI",
+      "host": null,
+      "env_key": "GEMINI_API_KEY",
+      "max_context": 50000,
+      "enabled": true,
+      "description": "GED lesson planner & exam generator (Gemini 3.1 Pro, low temp)",
+      "llm_call_timeout": 120,
+      "llm_tools": [],
+      "system_prompt_folder": "none",
+      "temperature": 0.3,
+      "top_p": 0.9,
+      "top_k": 20,
+      "token_selection_setting": "custom",
+      "memory_enabled": false,
+      "conv_log": false,
+      "memory_scan": false
+    },
+    "ged-quiz-gen": {
+      "database": "default",
+      "model_id": "claude-haiku-4-5-20251001",
+      "type": "OPENAI",
+      "host": "https://api.anthropic.com/v1",
+      "env_key": "ANTHROPIC_API_KEY",
+      "max_context": 50000,
+      "enabled": true,
+      "description": "GED quiz generator (Haiku 4.5, deterministic format output)",
+      "llm_call_timeout": 120,
+      "llm_tools": [],
+      "system_prompt_folder": "none",
+      "temperature": 0.2,
+      "token_selection_setting": "custom",
+      "memory_enabled": false,
+      "conv_log": false,
+      "memory_scan": false
+    },
+    "ged-math": {
+      "database": "gedmath",
+      "model_id": "grok-4.20-beta-0309-reasoning",
+      "type": "OPENAI",
+      "host": "https://api.x.ai/v1",
+      "env_key": "XAI_API_KEY",
+      "max_context": 30000,
+      "enabled": true,
+      "description": "GED Mathematical Reasoning tutor for Lee (Grok 4.20 beta)",
+      "llm_call_timeout": 120,
+      "llm_tools": [
+        "llm_call",
+        "db_query"
+      ],
+      "system_prompt_folder": "system_prompt/009_ged_math",
+      "temperature": 0.6,
+      "top_p": 0.9,
+      "max_tokens": 4096,
+      "token_selection_setting": "custom",
+      "memory_scan": true,
+      "conv_log": true,
+      "allow_text_mode": true,
+      "xai_responses_api": true,
+      "memory_enabled": true
+    },
+    "ged-rla-reading": {
+      "database": "gedreading",
+      "model_id": "grok-4.20-beta-0309-reasoning",
+      "type": "OPENAI",
+      "host": "https://api.x.ai/v1",
+      "env_key": "XAI_API_KEY",
+      "max_context": 30000,
+      "enabled": true,
+      "description": "GED RLA Reading tutor for Lee (Grok 4.20 beta)",
+      "llm_call_timeout": 120,
+      "llm_tools": [
+        "llm_call",
+        "db_query"
+      ],
+      "system_prompt_folder": "system_prompt/009_ged_rla_reading",
+      "temperature": 0.6,
+      "top_p": 0.9,
+      "max_tokens": 4096,
+      "token_selection_setting": "custom",
+      "memory_scan": true,
+      "conv_log": true,
+      "allow_text_mode": true,
+      "xai_responses_api": true,
+      "memory_enabled": true
+    },
+    "ged-rla-writing": {
+      "database": "gedwriting",
+      "model_id": "grok-4.20-beta-0309-reasoning",
+      "type": "OPENAI",
+      "host": "https://api.x.ai/v1",
+      "env_key": "XAI_API_KEY",
+      "max_context": 30000,
+      "enabled": true,
+      "description": "GED RLA Writing tutor for Lee (Grok 4.20 beta)",
+      "llm_call_timeout": 120,
+      "llm_tools": [
+        "llm_call",
+        "db_query"
+      ],
+      "system_prompt_folder": "system_prompt/009_ged_rla_writing",
+      "temperature": 0.6,
+      "top_p": 0.9,
+      "max_tokens": 4096,
+      "token_selection_setting": "custom",
+      "memory_scan": true,
+      "conv_log": true,
+      "allow_text_mode": true,
+      "xai_responses_api": true,
+      "memory_enabled": true
+    },
+    "ged-science": {
+      "database": "gedscience",
+      "model_id": "grok-4.20-beta-0309-reasoning",
+      "type": "OPENAI",
+      "host": "https://api.x.ai/v1",
+      "env_key": "XAI_API_KEY",
+      "max_context": 30000,
+      "enabled": true,
+      "description": "GED Science tutor for Lee (Grok 4.20 beta)",
+      "llm_call_timeout": 120,
+      "llm_tools": [
+        "llm_call",
+        "db_query"
+      ],
+      "system_prompt_folder": "system_prompt/009_ged_science",
+      "temperature": 0.6,
+      "top_p": 0.9,
+      "max_tokens": 4096,
+      "token_selection_setting": "custom",
+      "memory_scan": true,
+      "conv_log": true,
+      "allow_text_mode": true,
+      "xai_responses_api": true,
+      "memory_enabled": true
+    },
+    "ged-social": {
+      "database": "gedsocial",
+      "model_id": "grok-4.20-beta-0309-reasoning",
+      "type": "OPENAI",
+      "host": "https://api.x.ai/v1",
+      "env_key": "XAI_API_KEY",
+      "max_context": 30000,
+      "enabled": true,
+      "description": "GED Social Studies tutor for Lee (Grok 4.20 beta)",
+      "llm_call_timeout": 120,
+      "llm_tools": [
+        "llm_call",
+        "db_query"
+      ],
+      "system_prompt_folder": "system_prompt/009_ged_social",
+      "temperature": 0.6,
+      "top_p": 0.9,
+      "max_tokens": 4096,
+      "token_selection_setting": "custom",
+      "memory_scan": true,
+      "conv_log": true,
+      "allow_text_mode": true,
+      "xai_responses_api": true,
+      "memory_enabled": true
+    },
     "friendli-qwen3-executor": {
       "database": "mymcp",
       "model_id": "Qwen/Qwen3-235B-A22B-Instruct-2507",
@@ -605,7 +775,9 @@
     "prospective":             "qwen25-cogn",
     "reflection":              "summarizer-gemini",
     "goal_health":             "samaritan-reasoning",
-    "temporal_inference":      "summarizer-gemini"
+    "temporal_inference":      "summarizer-gemini",
+    "ged_planner":             "ged-planner",
+    "ged_quiz":                "ged-quiz-gen"
   },
   "limits": {
     "max_at_llm_depth": 1,

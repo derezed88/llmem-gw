@@ -327,55 +327,53 @@ async def run_scan() -> dict:
     max_pairs     = cfg["contradiction_max_pairs"]
     auto_retract  = cfg["contradiction_auto_retract"]
 
-    from database import set_model_context
-    from config import DEFAULT_MODEL
-    set_model_context(DEFAULT_MODEL)
+    from database import set_db_override, list_managed_databases
 
     t_start = time.monotonic()
     summary = {"pairs": 0, "contradictions": 0, "flags": 0, "error": None}
 
-    try:
-        beliefs = await _fetch_beliefs()
-        if len(beliefs) < min_beliefs:
-            log.debug(f"contradiction: only {len(beliefs)} beliefs < min={min_beliefs}, skipping")
-            summary["skipped"] = f"only {len(beliefs)} active beliefs (min={min_beliefs})"
-            raise _SkipScan(summary["skipped"])
+    flags_total_before = _stats["flags_written"]
+    for db_name in list_managed_databases():
+        set_db_override(db_name)
+        try:
+            beliefs = await _fetch_beliefs()
+            if len(beliefs) < min_beliefs:
+                log.debug(f"contradiction[{db_name}]: only {len(beliefs)} beliefs < min={min_beliefs}, skipping")
+                continue
 
-        pairs = _build_pairs(beliefs, max_pairs)
-        summary["pairs"] = len(pairs)
-        _stats["pairs_evaluated"] += len(pairs)
+            pairs = _build_pairs(beliefs, max_pairs)
+            summary["pairs"] += len(pairs)
+            _stats["pairs_evaluated"] += len(pairs)
 
-        if not pairs:
-            raise _SkipScan("no pairs to evaluate")
+            if not pairs:
+                continue
 
-        pairs_text = _format_batch(pairs)
-        results = await _call_llm(model_key, pairs_text)
+            pairs_text = _format_batch(pairs)
+            results = await _call_llm(model_key, pairs_text)
 
-        summary["contradictions"] = len(results)
-        _stats["contradictions_found"] += len(results)
+            summary["contradictions"] += len(results)
+            _stats["contradictions_found"] += len(results)
 
-        flags_before = _stats["flags_written"]
-        for item in results:
-            await _write_flag(item, auto_retract)
-        summary["flags"] = _stats["flags_written"] - flags_before
-        if summary["flags"] > 0:
-            import asyncio as _asyncio
-            try:
-                import notifier as _notifier
-                _asyncio.ensure_future(_notifier.fire_event(
-                    "contradiction_detected",
-                    f"{summary['contradictions']} contradiction(s) detected",
-                    f"flags written: {summary['flags']}",
-                ))
-            except Exception:
-                pass
+            for item in results:
+                await _write_flag(item, auto_retract)
+        except Exception as e:
+            log.error(f"contradiction[{db_name}]: scan error: {e}")
+            summary["error"] = str(e)
+            _stats["last_error"] = str(e)
+    set_db_override("")
 
-    except _SkipScan as e:
-        summary["skipped"] = str(e)
-    except Exception as e:
-        log.error(f"contradiction: scan error: {e}")
-        summary["error"] = str(e)
-        _stats["last_error"] = str(e)
+    summary["flags"] = _stats["flags_written"] - flags_total_before
+    if summary["flags"] > 0:
+        import asyncio as _asyncio
+        try:
+            import notifier as _notifier
+            _asyncio.ensure_future(_notifier.fire_event(
+                "contradiction_detected",
+                f"{summary['contradictions']} contradiction(s) detected",
+                f"flags written: {summary['flags']}",
+            ))
+        except Exception:
+            pass
 
     duration = time.monotonic() - t_start
     _stats["scans_run"]           += 1

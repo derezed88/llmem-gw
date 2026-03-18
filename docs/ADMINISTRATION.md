@@ -421,8 +421,189 @@ Once connected via shell.py, all administration is done via `!commands`.
 
 ```
 !model                     list available models (current marked)
-!model <name>              switch active LLM for this session
+!model <key>               switch active LLM for this session
+!model <key> [sys_prompt=none|caller|target] [history=none|caller] [database=caller|target|none]
 ```
+
+All options are optional. Defaults preserve the old behavior — bare `!model <key>` works exactly as before.
+
+| Option | Values | Default | Effect |
+|---|---|---|---|
+| `sys_prompt` | `none` / `caller` / `target` | `none` | Whether to inject a bridging system message into **history** at switch time. Does not affect which system prompt the new model uses on its next turn — that is always loaded fresh from `system_prompt_folder` regardless. |
+| `history` | `caller` / `none` | `caller` | `caller` keeps history (trimmed to new model's window). `none` clears history on switch. |
+| `database` | `caller` / `target` / `none` | `caller` | Controls `session["database"]` / `_active_db_override`. `caller` leaves the current override unchanged — the new model's configured `database` field in `llm-models.json` is **not** automatically adopted. `target` explicitly switches to it. `none` clears any override. |
+
+```
+# Switch model with history cleared:
+!model samaritan-reasoning history=none
+
+# Inject new model's system prompt into history at switch time (bridging):
+!model samaritan-execution sys_prompt=target
+
+# Switch model and adopt its configured database:
+!model samaritan-execution database=target
+
+# Full carry-over — old model's prompt injected into history, target's DB adopted:
+!model samaritan-execution sys_prompt=caller database=target
+```
+
+#### What `!model` does NOT touch
+
+These session state items are **always inherited** by the new model regardless of which options are passed:
+
+| Session state | Behavior after switch |
+|---|---|
+| System prompt (live) | **Always replaced automatically.** `agentic_lc` loads the new model's `system_prompt_folder` fresh on every turn — no option is needed for this. `sys_prompt=` only controls whether an extra copy is injected into the history list as a bridging message at switch time. |
+| Database (auto) | **Not automatically adopted.** With the default `database=caller`, the session keeps its current DB override even if the new model has a different `database` configured in `llm-models.json`. Use `database=target` to explicitly adopt the new model's database. |
+| `current_topic` | Never cleared by `!model`. The new model's first turn seeds Qdrant retrieval from the old model's last topic slug. **`!reset` does not clear it either** — see below. |
+| Memory injection | `auto_enrich_context` runs on the first message using the inherited `current_topic` (or last history turns if no topic is set). The new model's `memory_enabled` and `memory_scan` flags take effect from that first dispatch. |
+| `conv_log` | The new model's `conv_log` config applies from the next turn. Pre-switch turns are not backfilled. |
+| `tool_subscriptions` | Hot tool subscriptions carry over. The new model's `always_active` set recomputes on first dispatch. `!reset` clears these. |
+| `_at_llm_depth` | Depth counter is not reset on switch. |
+
+> **Clean-slate switch:** `!model <key> history=none` clears the history list. `!reset` before switching also clears `tool_subscriptions`. Neither clears `current_topic` — that only goes away on reconnect (it is not persisted).
+
+#### `!reset` behaviour
+
+`!reset` takes no arguments — there is no skip-summarize flag. Summarization is controlled entirely by config (`memory.enabled` and `memory.reset_summarize`) and the session `memory_enabled` override.
+
+`!reset` does the following:
+
+- **Summarizes** departing history using the configured `summarizer_model` if all of these are true:
+  - history has ≥ 4 turns
+  - `memory.enabled` is true (global config)
+  - `memory.reset_summarize` is true (global config)
+  - `session["memory_enabled"]` is not explicitly `false`
+- Writes to two tables (both respect the active database via `get_tables_for_model()`):
+  - `samaritan_cognition` — extracted memory items, one row per item, `origin="summary"`
+  - `samaritan_chat_summaries` — one row with the raw summary text and message count
+- Clears `session["history"]` and deletes the `.history` file on disk
+- Clears `session["tool_subscriptions"]` → `{}`
+- Resets `session["tool_list_injected"]` → `False`
+- Recomputes `session["history_max_ctx"]` from the current model config
+
+To suppress summarization without changing global config, set `memory_enabled` off for the session first: `!memory off`, then `!reset`.
+
+`!reset` does **not** touch:
+
+| State | After `!reset` |
+|---|---|
+| `current_topic` | **Not cleared.** Still set from the last turn before reset — still seeds Qdrant on the next message. Only lost on reconnect (not persisted). |
+| `model` | Unchanged. |
+| `database` | Unchanged — `session["database"]` and `_active_db_override` are not modified. |
+| `memory_enabled`, `auto_enrich`, all other `SESSION_CONFIG_KEYS` | Unchanged. |
+| `.config` file | Not touched — all persisted settings survive. |
+
+#### Session persistence across reconnects
+
+Session state is saved to a `.config` file on disk whenever `save_session_config` is called (on every model switch, database switch, and most `!` commands). The persisted whitelist (`SESSION_CONFIG_KEYS`) is:
+
+```
+model  database  memory_enabled  auto_enrich  tool_suppress  memory_scan_suppress
+stream_level  agent_call_stream  tool_preview_length
+```
+
+On reconnect with the same session ID, all of the above are reloaded and immediately applied — including calling `set_db_override()` and validating the model against `LLM_REGISTRY`. History is reloaded from a separate `.history` file.
+
+The following are **not persisted** and reset on every reconnect:
+
+| State | Reconnect behavior |
+|---|---|
+| `current_topic` | Lost. First turn falls back to scanning the last history turns as the Qdrant query seed. |
+| `tool_subscriptions` | Always starts cold (`{}`). Hot tool subscriptions must be re-triggered naturally or via `!tools hot`. |
+| `_at_llm_depth` | Resets to 0. |
+| `sys_prompt=` injection | Not a separate flag — exists only as a history entry. Survives reconnect as part of the persisted history file. |
+
+### Responses API (xAI + OpenAI)
+
+Models hosted on xAI or OpenAI can optionally use the **Responses API** (`POST {host}/v1/responses`) instead of the default Chat Completions API (`POST {host}/v1/chat/completions`). The Responses API stores conversation state server-side, so only the new user message needs to be sent after the first turn — the provider holds the full history.
+
+#### Enabling
+
+Add the per-model flag in `llm-models.json`:
+
+```json
+"samaritan-voice": {
+  "xai_responses_api": true,
+  ...
+}
+```
+
+```json
+"gpt5m": {
+  "openai_responses_api": true,
+  ...
+}
+```
+
+| Flag | Provider | Host guard |
+|---|---|---|
+| `xai_responses_api` | xAI (Grok models) | `x.ai` must be in host URL |
+| `openai_responses_api` | OpenAI (GPT models) | `openai.com` must be in host URL |
+
+Both flags default to `false`. The host guard prevents accidental use if a flag is set on a model with the wrong provider.
+
+#### How it works
+
+**Turn 1** — full context is sent: system prompt + enriched history + user message. The provider returns a `response_id` stored in `session["responses_api_id"]`.
+
+**Turn N** — only the new user message is sent, plus `previous_response_id`. The provider reconstructs context server-side. Memory enrichment from `auto_enrich_context()` is folded into the user message (the Responses API only accepts system messages as the first message of a chain).
+
+**Tool calls** — tool calls are returned as `function_call` output items; results are submitted as `function_call_output` input items. The tool loop works identically to `agentic_lc`.
+
+**Chain breaking** — the chain tip (`responses_api_id`) is cleared automatically on:
+- `!reset` — history cleared, chain broken, next turn starts fresh
+- `!model <key>` — model switch invalidates the chain (different model/context)
+- Session reconnect — `responses_api_id` is not persisted to disk
+
+#### Billing
+
+You are still billed for the full conversation history on every turn — the provider processes all accumulated context. The bandwidth savings come from not re-sending the history over the wire.
+
+#### 30-day retention
+
+Both xAI and OpenAI store responses for 30 days, after which they are automatically deleted. If a session goes idle beyond 30 days, the chain breaks silently and the next turn falls back to sending full context (same as a fresh session).
+
+#### Provider differences
+
+| Aspect | xAI | OpenAI |
+|---|---|---|
+| Content block type | `output_text` | `output_text` |
+| Tool schema | Flat (`name` at top level) | Flat (`name` at top level) |
+| `top_p` in payload | Skipped (reasoning models reject it) | Included when `token_selection_setting=custom` |
+| `store` parameter | Sent as `true` | Sent as `true` |
+
+#### Log signatures
+
+The log prefix distinguishes which path is active:
+
+```
+responses_api: model=samaritan-voice provider=xAI ...     # Responses API
+responses_api: model=gpt5m provider=OpenAI ...             # Responses API
+agentic_lc: model=samaritan-execution ...                  # Default chat completions
+```
+
+HTTP-level confirmation:
+```
+POST https://api.x.ai/v1/responses         # xAI Responses API
+POST https://api.openai.com/v1/responses    # OpenAI Responses API
+POST https://api.openai.com/v1/chat/completions  # Default path
+```
+
+#### What is NOT affected
+
+- **`llm_call()`** — model-to-model delegation always uses the default LangChain/chat completions path regardless of flags. The cognitive system (reflection, contradiction, prospective, temporal inference, goal processor) is fully isolated.
+- **Non-xAI/OpenAI models** — Gemini, Anthropic, local (Qwen, Llama) models are unaffected. The flags are silently ignored if the host doesn't match.
+- **Memory system** — ST/LT memory, Qdrant, conv_log, topic tagging all operate on the response text after it returns. The Responses API is a transport-level change only.
+
+#### Implementation
+
+- `agents_xai.py` — `is_responses_api()`, `agentic_responses_api()`, tool schema flattening, content block extraction
+- `config.py` — `xai_responses_api` and `openai_responses_api` in the model config whitelist
+- `agents.py` — `dispatch_llm()` forks to `agentic_responses_api()` when `is_responses_api()` is true
+- `routes.py` — `cmd_reset()` and `cmd_set_model()` clear `session["responses_api_id"]`
+
+---
 
 ### Tool Access Management
 
@@ -778,29 +959,51 @@ is restored afterward.
 
 #### `llm_call` — Unified LLM Delegation (tool + user command)
 
-The single unified delegation tool. Behaviour is controlled by three parameters:
+The single unified delegation tool. Only `model` and `prompt` are required — all other parameters
+are optional with the defaults shown below.
 
-**`mode`** — `"text"` (default) returns a text response; `"tool"` forces a single tool call
+| Parameter | Default | Options |
+|---|---|---|
+| `mode` | `"text"` | `"text"` / `"tool"` |
+| `sys_prompt` | `"none"` | `"none"` / `"caller"` / `"target"` |
+| `history` | `"none"` | `"none"` / `"caller"` |
+| `tool` | `""` | any tool name (required when `mode="tool"`) |
+| `database` | `"caller"` | `"caller"` / `"target"` / `"none"` |
+
+**`mode`** — `"text"` returns a text response; `"tool"` forces a single tool call
 (requires `tool=<name>`).
 
-**`sys_prompt`** — `"none"` (default): no system prompt; `"caller"`: calling model's assembled
+**`sys_prompt`** — `"none"`: no system prompt; `"caller"`: calling model's assembled
 prompt; `"target"`: target model's own folder prompt.
 
-**`history`** — `"none"` (default): no chat history; `"caller"`: full current session history
-(depth-guarded via `max_at_llm_depth`).
+**`history`** — `"none"`: no chat history; `"caller"`: full current session history
+(depth-guarded via `max_at_llm_depth`). There is no `"target"` option — `llm_call` is stateless.
+
+**`database`** — `"caller"`: use the calling session's database; `"target"`: use the
+target model's configured database; `"none"`: clear any override, fall back to model-key routing.
+Only relevant when `mode="tool"` (no DB calls occur in text mode).
+
+**`llm_call` is fully stateless.** The target model receives no memory injection, no
+`auto_enrich_context`, no conv_log, no topic tagging — none of the session machinery runs. It is a
+raw one-shot LLM invocation. The only session context it can receive is what you explicitly pass
+via `history="caller"` and `sys_prompt="caller"`.
 
 ```
-# Stateless text call (replaces llm_clean_text):
+# Stateless text call:
 !llm_call_invoke nuc11Local "Summarize: the quick brown fox..."
 llm_call(model="nuc11Local", prompt="Summarize the following text: ...")
 
-# Full-context delegation (replaces at_llm):
+# Full-context delegation:
 !llm_call_invoke gpt5m "Review the last tool result." history=caller sys_prompt=caller
 llm_call(model="gpt5m", prompt="Review the last tool result.", history="caller", sys_prompt="caller")
 
-# Tool delegation (replaces llm_clean_tool):
+# Tool delegation using caller's database (default):
 !llm_call_invoke nuc11Local "https://example.com summarize" mode=tool tool=url_extract
 llm_call(model="nuc11Local", prompt="https://example.com summarize", mode="tool", tool="url_extract")
+
+# Tool delegation targeting the remote model's own database:
+!llm_call_invoke samaritan-execution "INSERT INTO ..." mode=tool tool=db_query database=target
+llm_call(model="samaritan-execution", prompt="INSERT INTO ...", mode="tool", tool="db_query", database="target")
 ```
 
 **Rate limited:** default 3 calls per 20 seconds. `history=caller` calls are additionally

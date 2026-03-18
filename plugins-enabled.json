@@ -121,7 +121,7 @@
       "contradiction_interval_m": 10,
       "contradiction_min_beliefs": 2,
       "contradiction_max_pairs": 10,
-      "contradiction_auto_retract": true,
+      "contradiction_auto_retract": false,
       "prospective_enabled": true,
       "prospective_interval_m": 5,
       "prospective_reminder_imp": 9,

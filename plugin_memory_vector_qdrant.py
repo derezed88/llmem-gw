@@ -212,6 +212,50 @@ class QdrantVectorPlugin(BasePlugin):
         except Exception as e:
             log.warning(f"_ensure_proc_collection failed: {e}")
 
+    def ensure_collections(self, collection: str, proc_collection: str) -> list[str]:
+        """Ensure both memory and procedures collections exist. Returns list of created names."""
+        created = []
+        for coll, with_proc_index in [(collection, False), (proc_collection, True)]:
+            try:
+                existing = [c.name for c in self._qc.get_collections().collections]
+                if coll not in existing:
+                    self._qc.create_collection(
+                        collection_name=coll,
+                        vectors_config=VectorParams(
+                            size=self._cfg["vector_dims"],
+                            distance=Distance.COSINE,
+                        ),
+                    )
+                    created.append(coll)
+                    log.info(f"Created Qdrant collection '{coll}'")
+                    if with_proc_index:
+                        try:
+                            from qdrant_client.models import PayloadSchemaType
+                            self._qc.create_payload_index(
+                                collection_name=coll,
+                                field_name="task_type",
+                                field_schema=PayloadSchemaType.KEYWORD,
+                            )
+                        except Exception as idx_e:
+                            log.warning(f"ensure_collections: payload index on '{coll}' failed: {idx_e}")
+            except Exception as e:
+                log.warning(f"ensure_collections({coll!r}) failed: {e}")
+        return created
+
+    def delete_collections(self, collection: str, proc_collection: str) -> list[str]:
+        """Delete both memory and procedures Qdrant collections. Returns list of deleted names."""
+        deleted = []
+        for coll in (collection, proc_collection):
+            try:
+                existing = [c.name for c in self._qc.get_collections().collections]
+                if coll in existing:
+                    self._qc.delete_collection(collection_name=coll)
+                    deleted.append(coll)
+                    log.info(f"Deleted Qdrant collection '{coll}'")
+            except Exception as e:
+                log.warning(f"delete_collections({coll!r}) failed: {e}")
+        return deleted
+
     async def set_payload(self, row_id: int, payload: dict, collection: str | None = None) -> None:
         """Update payload fields on an existing Qdrant point without re-embedding."""
         coll = self._resolve_collection(collection)

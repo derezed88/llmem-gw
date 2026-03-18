@@ -7,7 +7,7 @@
       "sp_section": null
     },
     "core": {
-      "tools": ["get_system_info", "help", "llm_list", "llm_call", "sleep", "reset", "session"],
+      "tools": ["help", "llm_list", "llm_call", "sleep", "reset", "session"],
       "always_active": true,
       "sp_section": null
     },
@@ -24,8 +24,7 @@
     },
     "qwen": {
       "tools": [
-      "db_query", 
-      "get_system_info", 
+      "db_query",
       "search_tavily",
       "tmux_new", 
       "tmux_exec", 

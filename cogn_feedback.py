@@ -87,22 +87,22 @@ _REACTION = {
 _feedback_state: dict = {
     LOOP_REFLECTION:    {
         "consecutive_low": 0,
-        "last_watermark":  0,   # max ST row id seen at end of last reflection run
-        "conditioned_id":  0,   # row id in samaritan_conditioned (0 = not yet created)
+        "watermarks":      {},  # db_name → max ST row id seen at end of last run
+        "conditioned_ids": {},  # db_name → row id in <db>_conditioned (0 = not yet created)
         "current_strength": 0,
         "last_eval_at":    None,
         "last_ratio":      None,
     },
     LOOP_PROSPECTIVE:   {
         "consecutive_low": 0,
-        "conditioned_id":  0,
+        "conditioned_ids": {},
         "current_strength": 0,
         "last_eval_at":    None,
         "last_ratio":      None,
     },
     LOOP_CONTRADICTION: {
         "consecutive_low": 0,
-        "conditioned_id":  0,
+        "conditioned_ids": {},
         "current_strength": 0,
         "last_eval_at":    None,
         "last_ratio":      None,
@@ -121,6 +121,9 @@ def reset_feedback_state(loop_name: str) -> None:
         s["consecutive_low"] = 0
         s["current_strength"] = 0
         s["last_ratio"] = None
+        s["conditioned_ids"] = {}
+        if "watermarks" in s:
+            s["watermarks"] = {}
         log.info(f"cogn_feedback: reset state for {loop_name}")
 
 
@@ -150,9 +153,9 @@ def _fb_cfg() -> dict:
 # Conditioned row upsert
 # ---------------------------------------------------------------------------
 
-async def _upsert_conditioned(loop_name: str, strength: int, status: str = "active") -> int:
+async def _upsert_conditioned(loop_name: str, db_name: str, strength: int, status: str = "active") -> int:
     """
-    Create or update the conditioned row for this loop.
+    Create or update the conditioned row for this loop in the currently-active DB.
     Returns the row id.
     """
     from memory import _CONDITIONED, _typed_metric_write
@@ -166,7 +169,7 @@ async def _upsert_conditioned(loop_name: str, strength: int, status: str = "acti
     status = status if status in ("active", "extinguished") else "active"
     tbl = _CONDITIONED()
 
-    existing_id = state["conditioned_id"]
+    existing_id = state["conditioned_ids"].get(db_name, 0)
 
     # If we don't have a cached id, check DB by topic
     if not existing_id:
@@ -177,10 +180,10 @@ async def _upsert_conditioned(loop_name: str, strength: int, status: str = "acti
             )
             if rows:
                 existing_id = rows[0]["id"]
-                state["conditioned_id"] = existing_id
+                state["conditioned_ids"][db_name] = existing_id
                 state["current_strength"] = rows[0].get("strength", 0)
         except Exception as e:
-            log.warning(f"cogn_feedback: conditioned lookup failed for {loop_name}: {e}")
+            log.warning(f"cogn_feedback: conditioned lookup failed for {loop_name}[{db_name}]: {e}")
 
     if existing_id:
         try:
@@ -189,7 +192,7 @@ async def _upsert_conditioned(loop_name: str, strength: int, status: str = "acti
             )
             _typed_metric_write(tbl)
             state["current_strength"] = strength
-            log.info(f"cogn_feedback: updated conditioned id={existing_id} [{loop_name}] strength={strength} status={status}")
+            log.info(f"cogn_feedback: updated conditioned id={existing_id} [{loop_name}][{db_name}] strength={strength} status={status}")
             return existing_id
         except Exception as e:
             log.warning(f"cogn_feedback: conditioned update failed: {e}")
@@ -202,9 +205,9 @@ async def _upsert_conditioned(loop_name: str, strength: int, status: str = "acti
                 f"VALUES ('{topic}', '{trigger}', '{reaction}', {strength}, '{status}', 'assistant')"
             )
             _typed_metric_write(tbl)
-            state["conditioned_id"] = row_id
+            state["conditioned_ids"][db_name] = row_id
             state["current_strength"] = strength
-            log.info(f"cogn_feedback: created conditioned id={row_id} [{loop_name}] strength={strength}")
+            log.info(f"cogn_feedback: created conditioned id={row_id} [{loop_name}][{db_name}] strength={strength}")
             return row_id
         except Exception as e:
             log.warning(f"cogn_feedback: conditioned insert failed: {e}")
@@ -423,7 +426,8 @@ def _apply_interval_override(loop_name: str, verdict: str, cfg: dict) -> None:
 
 async def evaluate(loop_name: str, cycle_outcome: dict) -> dict:
     """
-    Evaluate loop effectiveness after one cycle and update conditioned behavior.
+    Evaluate loop effectiveness after one cycle and update conditioned behavior
+    across all managed databases.
 
     cycle_outcome keys (all optional, loop-specific):
         saved          int  — rows saved (reflection)
@@ -441,6 +445,8 @@ async def evaluate(loop_name: str, cycle_outcome: dict) -> dict:
     if cycle_outcome.get("error"):
         return {"skipped": "cycle had error"}
 
+    from database import set_db_override, list_managed_databases
+
     cfg   = _fb_cfg()
     state = _feedback_state[loop_name]
     min_rows = cfg["feedback_min_rows"]
@@ -448,34 +454,86 @@ async def evaluate(loop_name: str, cycle_outcome: dict) -> dict:
     result = {"loop": loop_name, "ratio": None, "verdict": None,
               "strength": state["current_strength"], "action": "none"}
 
-    # --- Compute ratio per loop type ---
-    try:
-        if loop_name == LOOP_REFLECTION:
-            wm = state.get("last_watermark", 0)
-            ratio, new_wm = await _reflection_ratio(wm, min_rows)
-            state["last_watermark"] = new_wm
+    # --- Compute ratio across all managed DBs, weighted by row count ---
+    total_accessed = 0
+    total_rows     = 0
+    any_data       = False
 
-        elif loop_name == LOOP_PROSPECTIVE:
-            ratio = await _prospective_ratio(min_rows)
+    for db_name in list_managed_databases():
+        set_db_override(db_name)
+        try:
+            if loop_name == LOOP_REFLECTION:
+                wm = state["watermarks"].get(db_name, 0)
+                from memory import _COGNITION
+                from database import fetch_dicts
+                try:
+                    rows = await fetch_dicts(
+                        f"SELECT id, last_accessed, created_at FROM {_COGNITION()} "
+                        f"WHERE id > {wm} AND origin = 'reflection' ORDER BY id ASC"
+                    )
+                    if rows:
+                        state["watermarks"][db_name] = max(r["id"] for r in rows)
+                    if len(rows) >= min_rows:
+                        accessed = sum(
+                            1 for r in rows
+                            if r.get("last_accessed") and r.get("created_at")
+                            and r["last_accessed"] > r["created_at"]
+                        )
+                        total_accessed += accessed
+                        total_rows     += len(rows)
+                        any_data = True
+                except Exception as e:
+                    log.warning(f"cogn_feedback: reflection_ratio query failed [{db_name}]: {e}")
 
-        elif loop_name == LOOP_CONTRADICTION:
-            ratio = await _contradiction_ratio(
-                cycle_outcome.get("flags", 0),
-                cycle_outcome.get("pairs", 0),
-            )
-        else:
-            ratio = None
-    except Exception as e:
-        log.warning(f"cogn_feedback: ratio computation failed for {loop_name}: {e}")
-        ratio = None
+            elif loop_name == LOOP_PROSPECTIVE:
+                from memory import _COGNITION
+                from database import fetch_dicts
+                try:
+                    rows = await fetch_dicts(
+                        f"SELECT last_accessed, created_at FROM {_COGNITION()} "
+                        f"WHERE origin = 'prospective' ORDER BY created_at DESC LIMIT 50"
+                    )
+                    if len(rows) >= min_rows:
+                        accessed = sum(
+                            1 for r in rows
+                            if r.get("last_accessed") and r.get("created_at")
+                            and r["last_accessed"] > r["created_at"]
+                        )
+                        total_accessed += accessed
+                        total_rows     += len(rows)
+                        any_data = True
+                except Exception as e:
+                    log.warning(f"cogn_feedback: prospective_ratio query failed [{db_name}]: {e}")
+
+            elif loop_name == LOOP_CONTRADICTION:
+                from memory import _BELIEFS
+                from database import fetch_dicts
+                try:
+                    rows = await fetch_dicts(
+                        f"SELECT status FROM {_BELIEFS()} WHERE topic='contradiction-flag'"
+                    )
+                    if len(rows) >= 3:
+                        retracted = sum(1 for r in rows if r.get("status") == "retracted")
+                        active    = sum(1 for r in rows if r.get("status") == "active")
+                        total_accessed += retracted
+                        total_rows     += retracted + active
+                        any_data = True
+                except Exception as e:
+                    log.warning(f"cogn_feedback: contradiction_ratio query failed [{db_name}]: {e}")
+
+        except Exception as e:
+            log.warning(f"cogn_feedback: ratio computation failed for {loop_name}[{db_name}]: {e}")
+        finally:
+            set_db_override("")
 
     state["last_eval_at"] = datetime.now(timezone.utc).isoformat()
 
-    if ratio is None:
+    if not any_data or total_rows < min_rows:
         result["verdict"] = "insufficient_data"
         result["action"] = "none"
         return result
 
+    ratio = total_accessed / total_rows
     result["ratio"] = ratio
 
     # --- Apply verdict ---
@@ -486,11 +544,18 @@ async def evaluate(loop_name: str, cycle_outcome: dict) -> dict:
     # Strength = consecutive low streak, capped at 10
     new_strength = min(10, streak)
 
-    # --- Update conditioned row if strength changed or verdict is notable ---
+    # --- Update conditioned row in each DB if strength changed or verdict is notable ---
     old_strength = state["current_strength"]
     if new_strength != old_strength or verdict in ("throttle", "extinguish", "useful"):
         status = "extinguished" if verdict == "extinguish" else "active"
-        await _upsert_conditioned(loop_name, new_strength if new_strength > 0 else 1, status)
+        for db_name in list_managed_databases():
+            set_db_override(db_name)
+            try:
+                await _upsert_conditioned(loop_name, db_name, new_strength if new_strength > 0 else 1, status)
+            except Exception as e:
+                log.warning(f"cogn_feedback: conditioned upsert failed [{loop_name}][{db_name}]: {e}")
+            finally:
+                set_db_override("")
 
     # --- Apply interval/enable overrides ---
     _apply_interval_override(loop_name, verdict, cfg)

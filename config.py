@@ -145,6 +145,8 @@ def load_llm_registry():
                 "memory_types_enabled": config.get('memory_types_enabled', False),
                 "self_model_enabled": config.get('self_model_enabled', True),
                 "allow_text_mode": config.get('allow_text_mode', True),
+                "xai_responses_api": config.get('xai_responses_api', False),
+                "openai_responses_api": config.get('openai_responses_api', False),
             }
 
         return registry

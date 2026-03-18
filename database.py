@@ -22,6 +22,7 @@ def _load_db_config() -> dict:
 _db_cfg = _load_db_config()
 _DB_DEFAULT    = _db_cfg.get("database", "")
 _DB_TABLES     = _db_cfg.get("tables", {})   # db_name -> {memory_shortterm, ...}
+_DB_META       = _db_cfg.get("meta", {})     # db_name -> {source: "switch"|"config", created_at: ...}
 
 # Context variable — set per-request so all DB calls in that request use the
 # correct database without threading model_key through every call site.
@@ -193,6 +194,21 @@ def list_managed_databases() -> list[str]:
         return [db for db in protected if db in _DB_TABLES]
     return list(_DB_TABLES.keys())
 
+def get_db_meta(db_name: str) -> dict:
+    """Return metadata for a database entry: {source, created_at}.
+    source is 'switch' (created via !db switch) or 'config' (pre-defined in db-config.json).
+    """
+    return _DB_META.get(db_name, {"source": "config"})
+
+def list_user_databases() -> list[str]:
+    """Return databases created via !db switch (source='switch'), not pre-defined in config."""
+    return [db for db in _DB_TABLES if _DB_META.get(db, {}).get("source") == "switch"]
+
+def get_model_databases() -> set[str]:
+    """Return the set of database names referenced by any model in llm-models.json."""
+    from config import LLM_REGISTRY
+    return {cfg["database"] for cfg in LLM_REGISTRY.values() if cfg.get("database")}
+
 def _generate_table_map(prefix: str) -> dict:
     """Generate a full table name map using the given prefix."""
     return {
@@ -213,6 +229,7 @@ def _generate_table_map(prefix: str) -> dict:
         "proc_collection": f"{prefix}procedures",
         "temporal": f"{prefix}temporal",
         "tool_stats": f"{prefix}tool_stats",
+        "cognition": f"{prefix}cognition",
     }
 
 def _get_create_tables_sql(prefix: str) -> str:
@@ -475,6 +492,32 @@ CREATE TABLE IF NOT EXISTS `{prefix}tool_stats` (
     UNIQUE KEY `idx_model_tool` (`model`, `tool_name`),
     KEY `idx_last_called` (`last_called`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS `{prefix}cognition` (
+    `id`            INT(11)      NOT NULL AUTO_INCREMENT,
+    `origin`        ENUM(
+                        'reflection',
+                        'goal_health',
+                        'self_model',
+                        'prospective',
+                        'tool_log',
+                        'tool_failure',
+                        'summary'
+                    ) NOT NULL,
+    `topic`         VARCHAR(255) NOT NULL DEFAULT '',
+    `content`       TEXT         NOT NULL,
+    `importance`    TINYINT      NOT NULL DEFAULT 5,
+    `source`        ENUM('session','user','directive','assistant') NOT NULL DEFAULT 'session',
+    `session_id`    VARCHAR(255) NOT NULL DEFAULT '',
+    `last_accessed` TIMESTAMP    NULL DEFAULT NULL,
+    `created_at`    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    KEY `idx_origin`          (`origin`),
+    KEY `idx_origin_topic`    (`origin`, `topic`),
+    KEY `idx_importance`      (`importance`),
+    KEY `idx_created`         (`created_at`),
+    KEY `idx_last_accessed`   (`last_accessed`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 
 
@@ -528,13 +571,30 @@ def _create_database_sync(db_name: str, prefix: str) -> str:
     conn2.close()
 
     # Register in _DB_TABLES at runtime
+    import datetime as _dt
     table_map = _generate_table_map(prefix)
     _DB_TABLES[db_name] = table_map
+    _DB_META[db_name] = {"source": "switch", "created_at": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")}
 
     # Persist to db-config.json
     _save_db_config()
 
+    # Create matching Qdrant collections (fire-and-forget; non-fatal if Qdrant unavailable)
+    qdrant_created = []
+    try:
+        from plugin_memory_vector_qdrant import get_vector_api
+        vec = get_vector_api()
+        if vec:
+            qdrant_created = vec.ensure_collections(
+                collection=table_map["collection"],
+                proc_collection=table_map["proc_collection"],
+            )
+    except Exception as _qe:
+        log.warning(f"create_database: Qdrant collection setup skipped: {_qe}")
+
     parts = [f"Database '{db_name}' ready — {len(created)} tables created (prefix: {prefix})"]
+    if qdrant_created:
+        parts.append(f"  Qdrant collections created: {', '.join(qdrant_created)}")
     if errors:
         parts.append(f"  Errors: {'; '.join(errors)}")
     return "\n".join(parts)
@@ -549,6 +609,12 @@ def _delete_database_sync(db_name: str) -> str:
     """Drop a MySQL database entirely. Returns status message."""
     if db_name in _PROTECTED_DBS:
         return f"ERROR: Database '{db_name}' is protected and cannot be deleted."
+
+    # Capture Qdrant collection names before removing from _DB_TABLES
+    table_map = _DB_TABLES.get(db_name, {})
+    qdrant_collection = table_map.get("collection", "")
+    qdrant_proc_collection = table_map.get("proc_collection", "")
+
     conn = mysql.connector.connect(
         host="localhost",
         user=os.getenv("MYSQL_USER"),
@@ -564,10 +630,29 @@ def _delete_database_sync(db_name: str) -> str:
         cursor.close()
         conn.close()
 
+    # Delete matching Qdrant collections (non-fatal if Qdrant unavailable)
+    qdrant_deleted = []
+    if qdrant_collection or qdrant_proc_collection:
+        try:
+            from plugin_memory_vector_qdrant import get_vector_api
+            vec = get_vector_api()
+            if vec and qdrant_collection:
+                qdrant_deleted = vec.delete_collections(
+                    collection=qdrant_collection,
+                    proc_collection=qdrant_proc_collection or f"{db_name}_procedures",
+                )
+        except Exception as _qe:
+            log.warning(f"delete_database: Qdrant collection deletion skipped: {_qe}")
+
     # Remove from runtime config
     _DB_TABLES.pop(db_name, None)
+    _DB_META.pop(db_name, None)
     _save_db_config()
-    return f"Database '{db_name}' deleted."
+
+    parts = [f"Database '{db_name}' deleted."]
+    if qdrant_deleted:
+        parts.append(f"  Qdrant collections deleted: {', '.join(qdrant_deleted)}")
+    return "\n".join(parts)
 
 
 async def delete_database(db_name: str) -> str:
@@ -600,6 +685,7 @@ def _save_db_config() -> None:
     cfg = {
         "tables": _DB_TABLES,
         "protected_databases": _PROTECTED_DBS,
+        "meta": _DB_META,
     }
     try:
         with open(path, "w") as f:

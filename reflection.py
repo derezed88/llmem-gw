@@ -747,134 +747,141 @@ async def run_reflection() -> dict:
     min_turns    = cfg["reflection_min_turns"]
     max_memories = cfg["reflection_max_memories"]
 
-    from database import set_model_context, fetch_dicts as _fd_refl
-    from config import DEFAULT_MODEL
-    set_model_context(DEFAULT_MODEL)
+    from database import set_db_override, list_managed_databases, fetch_dicts as _fd_refl
 
     t_start = time.monotonic()
     summary = {"turns": 0, "saved": 0, "skipped": 0, "error": None}
+    all_stale = True  # track if every DB was stale (skip entire cycle)
 
-    # Staleness gate: skip LLM call if no new ST entries since last interval
-    try:
-        from memory import _ST
-        staleness_minutes = cfg["reflection_interval_m"] * 1.3
-        latest = await _fd_refl(
-            f"SELECT MAX(created_at) AS latest FROM {_ST()} "
-            f"WHERE source IN ('user', 'assistant')"
-        )
-        if latest and latest[0].get("latest"):
-            from datetime import timedelta
-            age = datetime.now() - latest[0]["latest"]
-            if age > timedelta(minutes=staleness_minutes):
-                log.debug(
-                    f"reflection: newest ST entry is {age.total_seconds()/60:.0f}m old "
-                    f"(threshold {staleness_minutes:.0f}m) — skipping cycle"
-                )
-                summary["skipped_reason"] = f"no new turns in {age.total_seconds()/60:.0f}m"
-                return summary
-    except Exception as e:
-        log.debug(f"reflection: staleness check failed ({e}), proceeding anyway")
+    for db_name in list_managed_databases():
+        set_db_override(db_name)
 
-    try:
-        rows = await _fetch_recent_turns(turn_limit)
-        summary["turns"] = len(rows)
-        _stats["turns_processed"] += len(rows)
-
-        if len(rows) < min_turns:
-            log.debug(f"reflection: only {len(rows)} turns < min={min_turns}, skipping")
-            summary["skipped_reason"] = f"only {len(rows)} recent turns (min={min_turns})"
-            return summary
-
-        turns_text = _format_turns(rows)
-
-        # Fetch active goals to pass for completion detection
-        active_goals: list[dict] = []
+        # Staleness gate: skip LLM call if no new ST entries since last interval
         try:
-            from memory import _GOALS
-            from database import fetch_dicts as _fd
-            active_goals = await _fd(
-                f"SELECT id, title, description, attempt_count, failure_count "
-                f"FROM {_GOALS()} WHERE status = 'active'"
-            ) or []
-        except Exception as _ge:
-            log.debug(f"reflection: goals fetch failed: {_ge}")
-
-        items, goals_done = await _call_llm(model_key, turns_text, max_memories, active_goals)
-
-        # Second-pass: dedicated goal completion scan using reasoning model
-        if active_goals:
-            try:
-                goals_done_2 = await _scan_goal_completions(turns_text, active_goals)
-                # Merge: union of both passes
-                goals_done = list(set(goals_done) | set(goals_done_2))
-                if goals_done_2:
-                    log.info(f"reflection: goal-scan (reasoning) detected completions: {goals_done_2}")
-            except Exception as e:
-                log.warning(f"reflection: goal-scan second pass failed: {e}")
-
-        from memory import save_cognition as _save_cogn
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            topic   = str(item.get("topic", "reflection"))[:255]
-            content = str(item.get("content", ""))[:2000]
-            imp     = max(1, min(10, int(item.get("importance", 6))))
-
-            if not topic or not content:
-                continue
-
-            new_id = await _save_cogn(
-                origin="reflection",
-                topic=topic,
-                content=content,
-                importance=imp,
+            from memory import _ST
+            staleness_minutes = cfg["reflection_interval_m"] * 1.3
+            latest = await _fd_refl(
+                f"SELECT MAX(created_at) AS latest FROM {_ST()} "
+                f"WHERE source IN ('user', 'assistant')"
             )
-            if new_id:
-                summary["saved"] += 1
-                _stats["memories_saved"] += 1
-            else:
-                summary["skipped"] += 1
-                _stats["memories_skipped"] += 1
-
-        # Process goal completions detected by LLM
-        if goals_done:
-            from memory import _GOALS
-            from database import execute_sql as _exec_sql
-            valid_ids = {g["id"] for g in active_goals}
-            marked = []
-            for gid in goals_done:
-                if gid not in valid_ids:
-                    log.debug(f"reflection: goal_done id={gid} not in active goals — skipped")
-                    continue
-                try:
-                    await _exec_sql(
-                        f"UPDATE {_GOALS()} SET status='done' WHERE id={gid} AND status='active'"
+            if latest and latest[0].get("latest"):
+                from datetime import timedelta
+                age = datetime.now() - latest[0]["latest"]
+                if age > timedelta(minutes=staleness_minutes):
+                    log.debug(
+                        f"reflection[{db_name}]: newest ST entry is {age.total_seconds()/60:.0f}m old "
+                        f"(threshold {staleness_minutes:.0f}m) — skipping"
                     )
-                    marked.append(gid)
-                    log.info(f"reflection: marked goal id={gid} as done (detected in conversation)")
-                except Exception as _ge2:
-                    log.warning(f"reflection: goal mark-done failed id={gid}: {_ge2}")
-            if marked:
-                summary["goals_marked_done"] = marked
+                    continue
+        except Exception as e:
+            log.debug(f"reflection[{db_name}]: staleness check failed ({e}), proceeding anyway")
 
-        # Goal health pass — failure escalation, replanning, proposals
-        if active_goals:
+        all_stale = False
+
+        try:
+            rows = await _fetch_recent_turns(turn_limit)
+            summary["turns"] += len(rows)
+            _stats["turns_processed"] += len(rows)
+
+            if len(rows) < min_turns:
+                log.debug(f"reflection[{db_name}]: only {len(rows)} turns < min={min_turns}, skipping")
+                continue
+
+            turns_text = _format_turns(rows)
+
+            # Fetch active goals to pass for completion detection
+            active_goals: list[dict] = []
             try:
-                gh_summary = await _run_goal_health(active_goals, turns_text)
-                summary["goal_health"] = gh_summary
-                if gh_summary.get("abandoned"):
-                    log.info(f"reflection: goal_health abandoned: {gh_summary['abandoned']}")
-                if gh_summary.get("auto_created"):
-                    log.info(f"reflection: goal_health auto-created: {gh_summary['auto_created']}")
-                if gh_summary.get("pending_review"):
-                    log.info(f"reflection: goal_health pending review: {gh_summary['pending_review']}")
-            except Exception as e:
-                log.warning(f"reflection: goal_health pass failed: {e}")
+                from memory import _GOALS
+                from database import fetch_dicts as _fd
+                active_goals = await _fd(
+                    f"SELECT id, title, description, attempt_count, failure_count "
+                    f"FROM {_GOALS()} WHERE status = 'active'"
+                ) or []
+            except Exception as _ge:
+                log.debug(f"reflection[{db_name}]: goals fetch failed: {_ge}")
 
-    except Exception as e:
-        log.error(f"reflection: run error: {e}")
-        summary["error"] = str(e)
-        _stats["last_error"] = str(e)
+            items, goals_done = await _call_llm(model_key, turns_text, max_memories, active_goals)
+
+            # Second-pass: dedicated goal completion scan using reasoning model
+            if active_goals:
+                try:
+                    goals_done_2 = await _scan_goal_completions(turns_text, active_goals)
+                    goals_done = list(set(goals_done) | set(goals_done_2))
+                    if goals_done_2:
+                        log.info(f"reflection[{db_name}]: goal-scan (reasoning) detected completions: {goals_done_2}")
+                except Exception as e:
+                    log.warning(f"reflection[{db_name}]: goal-scan second pass failed: {e}")
+
+            from memory import save_cognition as _save_cogn
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                topic   = str(item.get("topic", "reflection"))[:255]
+                content = str(item.get("content", ""))[:2000]
+                imp     = max(1, min(10, int(item.get("importance", 6))))
+
+                if not topic or not content:
+                    continue
+
+                new_id = await _save_cogn(
+                    origin="reflection",
+                    topic=topic,
+                    content=content,
+                    importance=imp,
+                )
+                if new_id:
+                    summary["saved"] += 1
+                    _stats["memories_saved"] += 1
+                else:
+                    summary["skipped"] += 1
+                    _stats["memories_skipped"] += 1
+
+            # Process goal completions detected by LLM
+            if goals_done:
+                from memory import _GOALS
+                from database import execute_sql as _exec_sql
+                valid_ids = {g["id"] for g in active_goals}
+                marked = []
+                for gid in goals_done:
+                    if gid not in valid_ids:
+                        log.debug(f"reflection[{db_name}]: goal_done id={gid} not in active goals — skipped")
+                        continue
+                    try:
+                        await _exec_sql(
+                            f"UPDATE {_GOALS()} SET status='done' WHERE id={gid} AND status='active'"
+                        )
+                        marked.append(gid)
+                        log.info(f"reflection[{db_name}]: marked goal id={gid} as done (detected in conversation)")
+                    except Exception as _ge2:
+                        log.warning(f"reflection[{db_name}]: goal mark-done failed id={gid}: {_ge2}")
+                if marked:
+                    summary.setdefault("goals_marked_done", []).extend(marked)
+
+            # Goal health pass — failure escalation, replanning, proposals
+            if active_goals:
+                try:
+                    gh_summary = await _run_goal_health(active_goals, turns_text)
+                    summary["goal_health"] = gh_summary
+                    if gh_summary.get("abandoned"):
+                        log.info(f"reflection[{db_name}]: goal_health abandoned: {gh_summary['abandoned']}")
+                    if gh_summary.get("auto_created"):
+                        log.info(f"reflection[{db_name}]: goal_health auto-created: {gh_summary['auto_created']}")
+                    if gh_summary.get("pending_review"):
+                        log.info(f"reflection[{db_name}]: goal_health pending review: {gh_summary['pending_review']}")
+                except Exception as e:
+                    log.warning(f"reflection[{db_name}]: goal_health pass failed: {e}")
+
+        except Exception as e:
+            log.error(f"reflection[{db_name}]: run error: {e}")
+            summary["error"] = str(e)
+            _stats["last_error"] = str(e)
+
+    set_db_override("")
+
+    if all_stale:
+        summary["skipped_reason"] = "all databases stale"
+        return summary
 
     duration = time.monotonic() - t_start
     _stats["runs"]             += 1
@@ -887,18 +894,21 @@ async def run_reflection() -> dict:
         f"skipped={summary['skipped']} dur={duration:.1f}s"
     )
 
-    # Drive decay and goal-based nudge
-    try:
-        from memory import update_drives_from_goals
-        drive_summary = await update_drives_from_goals()
-        summary["drives_updated"] = drive_summary.get("drives_updated", 0)
-        log.info(
-            f"reflection: drives — updated={drive_summary.get('drives_updated', 0)} "
-            f"goals_done={drive_summary.get('goals_done', 0)} "
-            f"goals_blocked={drive_summary.get('goals_blocked', 0)}"
-        )
-    except Exception as e:
-        log.warning(f"reflection: drive update failed: {e}")
+    # Drive decay and goal-based nudge (runs across all managed DBs)
+    for db_name in list_managed_databases():
+        set_db_override(db_name)
+        try:
+            from memory import update_drives_from_goals
+            drive_summary = await update_drives_from_goals()
+            summary["drives_updated"] = summary.get("drives_updated", 0) + drive_summary.get("drives_updated", 0)
+            log.info(
+                f"reflection[{db_name}]: drives — updated={drive_summary.get('drives_updated', 0)} "
+                f"goals_done={drive_summary.get('goals_done', 0)} "
+                f"goals_blocked={drive_summary.get('goals_blocked', 0)}"
+            )
+        except Exception as e:
+            log.warning(f"reflection[{db_name}]: drive update failed: {e}")
+    set_db_override("")
 
     # Feedback evaluation — update watermark first so evaluator sees rows written this cycle
     try:

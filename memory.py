@@ -274,50 +274,53 @@ async def save_memory(
     importance = max(1, min(10, int(importance)))
     mem_type = type if type in _MEMORY_TYPES else "context"
 
-    # Dedup pass 1: exact match on topic+content in both tiers
-    try:
-        dup_check = (
-            f"SELECT 1 FROM {_ST()} "
-            f"WHERE topic = '{topic}' AND content = '{content}' LIMIT 1"
-        )
-        if "1" in (await execute_sql(dup_check)).strip():
-            log.info(f"save_memory exact-dedup ST: skipped source={source} topic={topic!r} content={content[:60]!r}")
-            return 0
-        dup_check_lt = (
-            f"SELECT 1 FROM {_LT()} "
-            f"WHERE topic = '{topic}' AND content = '{content}' LIMIT 1"
-        )
-        if "1" in (await execute_sql(dup_check_lt)).strip():
-            log.info(f"save_memory exact-dedup LT: skipped source={source} topic={topic!r} content={content[:60]!r}")
-            return 0
-    except Exception as e:
-        log.warning(f"save_memory exact-dedup check failed: {e}")
-
-    # Dedup pass 2: fuzzy similarity against existing rows for the same topic
-    threshold = _fuzzy_dedup_threshold()
-    if threshold is not None:
+    # Dedup: skip for user prompts — user input is ground truth and always saved verbatim.
+    # Only assistant/session/directive content is deduped.
+    if source != "user":
+        # Dedup pass 1: exact match on topic+content in both tiers
         try:
-            # Load content of existing rows with the same topic (both tiers)
-            rows_sql = (
-                f"SELECT content FROM {_ST()} WHERE topic = '{topic}' "
-                f"UNION ALL "
-                f"SELECT content FROM {_LT()} WHERE topic = '{topic}'"
+            dup_check = (
+                f"SELECT 1 FROM {_ST()} "
+                f"WHERE topic = '{topic}' AND content = '{content}' LIMIT 1"
             )
-            raw = await execute_sql(rows_sql)
-            # Parse: first line is header "content", rest are values
-            existing = [
-                line.strip() for line in raw.strip().splitlines()[1:]
-                if line.strip() and not set(line.strip()) <= set("-+|")
-            ]
-            for existing_content in existing:
-                if _fuzzy_similar(content, existing_content, threshold):
-                    log.debug(
-                        f"save_memory fuzzy-dedup: skipped topic={topic!r} "
-                        f"(ratio>={threshold:.2f} vs existing row)"
-                    )
-                    return 0
+            if "1" in (await execute_sql(dup_check)).strip():
+                log.info(f"save_memory exact-dedup ST: skipped source={source} topic={topic!r} content={content[:60]!r}")
+                return 0
+            dup_check_lt = (
+                f"SELECT 1 FROM {_LT()} "
+                f"WHERE topic = '{topic}' AND content = '{content}' LIMIT 1"
+            )
+            if "1" in (await execute_sql(dup_check_lt)).strip():
+                log.info(f"save_memory exact-dedup LT: skipped source={source} topic={topic!r} content={content[:60]!r}")
+                return 0
         except Exception as e:
-            log.warning(f"save_memory fuzzy-dedup check failed: {e}")
+            log.warning(f"save_memory exact-dedup check failed: {e}")
+
+        # Dedup pass 2: fuzzy similarity against existing rows for the same topic
+        threshold = _fuzzy_dedup_threshold()
+        if threshold is not None:
+            try:
+                # Load content of existing rows with the same topic (both tiers)
+                rows_sql = (
+                    f"SELECT content FROM {_ST()} WHERE topic = '{topic}' "
+                    f"UNION ALL "
+                    f"SELECT content FROM {_LT()} WHERE topic = '{topic}'"
+                )
+                raw = await execute_sql(rows_sql)
+                # Parse: first line is header "content", rest are values
+                existing = [
+                    line.strip() for line in raw.strip().splitlines()[1:]
+                    if line.strip() and not set(line.strip()) <= set("-+|")
+                ]
+                for existing_content in existing:
+                    if _fuzzy_similar(content, existing_content, threshold):
+                        log.debug(
+                            f"save_memory fuzzy-dedup: skipped topic={topic!r} "
+                            f"(ratio>={threshold:.2f} vs existing row)"
+                        )
+                        return 0
+            except Exception as e:
+                log.warning(f"save_memory fuzzy-dedup check failed: {e}")
 
     sql = (
         f"INSERT INTO {_ST()} "

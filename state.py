@@ -341,6 +341,19 @@ async def push_notif(client_id: str, text: str):
     """Push an async notification event to a session's SSE queue."""
     (await get_queue(client_id)).put_nowait({"t": "notif", "d": text.replace("\n", "\\n")})
 
+async def push_close(client_id: str):
+    """Signal the SSE generator to terminate, then remove the queue.
+
+    Used by the session reaper and explicit session deletion so the
+    server-side EventSourceResponse generator breaks out of its loop
+    instead of spinning forever after the session dict is gone.
+    """
+    if client_id in sse_queues:
+        sse_queues[client_id].put_nowait({"t": "close"})
+        # Don't delete the queue yet — the generator needs to read the
+        # sentinel first.  It will be garbage-collected when the generator
+        # exits and no more references remain.
+
 # ---------------------------------------------------------------------------
 # Gate infrastructure
 # Per-client pending gate requests: client_id -> asyncio.Future[bool]

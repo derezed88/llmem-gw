@@ -20,6 +20,14 @@ DB_NAME_MAP = {
     'mymcp': 'mymcp',
     'qwen':  'qwen',
     'test':  'test',
+    'default':    'default',
+    'testchat001': 'testchat001',
+    'leegeneral': 'leegeneral',
+    'gedmath':    'gedmath',
+    'gedreading': 'gedreading',
+    'gedwriting': 'gedwriting',
+    'gedscience': 'gedscience',
+    'gedsocial':  'gedsocial',
 }
 
 # Map db-config key → table prefix

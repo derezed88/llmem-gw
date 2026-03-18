@@ -202,7 +202,7 @@ async def run_agent(host: str = "0.0.0.0"):
     # inactive longer than session_idle_timeout_minutes.  A timeout of 0 disables.
     async def _session_reaper():
         import time
-        from state import sessions, remove_shorthand_mapping, save_history, init_reaper_wake
+        from state import sessions, remove_shorthand_mapping, save_history, init_reaper_wake, push_close
         from timer_registry import register_timer, timer_start, timer_end, timer_sleep, timer_disabled
         register_timer("session_reaper", "60s")
         _wake = init_reaper_wake()
@@ -232,6 +232,7 @@ async def run_agent(host: str = "0.0.0.0"):
                     if data.get("last_active", 0) < cutoff
                 ]
                 for cid in stale:
+                    await push_close(cid)          # signal SSE generator to terminate
                     data = sessions.pop(cid, None)
                     if data:
                         save_history(cid, data.get("history", []))
@@ -247,8 +248,7 @@ async def run_agent(host: str = "0.0.0.0"):
     async def _age_count_task():
         """Count-pressure aging: runs every memory_age_count_timer minutes."""
         from memory import age_by_count, _age_cfg
-        from database import set_model_context
-        from config import DEFAULT_MODEL
+        from database import set_db_override, list_managed_databases
         from timer_registry import register_timer, timer_start, timer_end, timer_sleep, timer_disabled
         register_timer("mem_age_count", "config")
         while True:
@@ -265,11 +265,17 @@ async def run_agent(host: str = "0.0.0.0"):
                     await asyncio.sleep(3600)
                     continue
                 register_timer("mem_age_count", f"{timer_min}m")
-                set_model_context(DEFAULT_MODEL)
                 t0 = timer_start("mem_age_count")
-                await age_by_count()
+                for db_name in list_managed_databases():
+                    set_db_override(db_name)
+                    try:
+                        await age_by_count()
+                    except Exception as e:
+                        log.warning(f"_age_count_task error on {db_name}: {e}")
+                set_db_override("")
                 timer_end("mem_age_count", t0)
             except Exception as e:
+                set_db_override("")
                 log.warning(f"_age_count_task error: {e}")
                 if t0 is not None:
                     timer_end("mem_age_count", t0, error=str(e))
@@ -284,8 +290,7 @@ async def run_agent(host: str = "0.0.0.0"):
     async def _age_minutes_task():
         """Staleness aging: runs every memory_age_minutes_timer minutes."""
         from memory import age_by_minutes, _age_cfg
-        from database import set_model_context
-        from config import DEFAULT_MODEL
+        from database import set_db_override, list_managed_databases
         from timer_registry import register_timer, timer_start, timer_end, timer_sleep, timer_disabled
         register_timer("mem_age_minutes", "config")
         while True:
@@ -302,11 +307,18 @@ async def run_agent(host: str = "0.0.0.0"):
                     await asyncio.sleep(3600)
                     continue
                 register_timer("mem_age_minutes", f"{timer_min}m")
-                set_model_context(DEFAULT_MODEL)
                 t0 = timer_start("mem_age_minutes")
-                await age_by_minutes(trigger_minutes=cfg["memory_age_trigger_minutes"])
+                trigger_min = cfg["memory_age_trigger_minutes"]
+                for db_name in list_managed_databases():
+                    set_db_override(db_name)
+                    try:
+                        await age_by_minutes(trigger_minutes=trigger_min)
+                    except Exception as e:
+                        log.warning(f"_age_minutes_task error on {db_name}: {e}")
+                set_db_override("")
                 timer_end("mem_age_minutes", t0)
             except Exception as e:
+                set_db_override("")
                 log.warning(f"_age_minutes_task error: {e}")
                 if t0 is not None:
                     timer_end("mem_age_minutes", t0, error=str(e))
@@ -321,8 +333,7 @@ async def run_agent(host: str = "0.0.0.0"):
     async def _age_temporal_task():
         """Temporal cache aging: runs every temporal.age_timer_minutes minutes."""
         from memory import age_temporal_cache, _temporal_age_cfg
-        from database import set_model_context
-        from config import DEFAULT_MODEL
+        from database import set_db_override, list_managed_databases
         from timer_registry import register_timer, timer_start, timer_end, timer_sleep, timer_disabled
         register_timer("mem_age_temporal", "config")
         while True:
@@ -335,11 +346,17 @@ async def run_agent(host: str = "0.0.0.0"):
                     await asyncio.sleep(3600)
                     continue
                 register_timer("mem_age_temporal", f"{timer_min}m")
-                set_model_context(DEFAULT_MODEL)
                 t0 = timer_start("mem_age_temporal")
-                await age_temporal_cache()
+                for db_name in list_managed_databases():
+                    set_db_override(db_name)
+                    try:
+                        await age_temporal_cache()
+                    except Exception as e:
+                        log.warning(f"_age_temporal_task error on {db_name}: {e}")
+                set_db_override("")
                 timer_end("mem_age_temporal", t0)
             except Exception as e:
+                set_db_override("")
                 log.warning(f"_age_temporal_task error: {e}")
                 if t0 is not None:
                     timer_end("mem_age_temporal", t0, error=str(e))

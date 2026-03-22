@@ -180,13 +180,13 @@ Plans can exist without a goal. `goal_id=0` means the plan is standalone — use
 | Setting | Value |
 |---------|-------|
 | Model key | `plan-decomposer` |
-| Model ID | `claude-haiku-4-5-20251001` |
+| Model ID | `claude-sonnet-4-6` |
 | Temperature | 0.2 |
-| Cost | $1 / $5 per 1M tokens (input/output) |
+| Cost | $3 / $15 per 1M tokens (input/output) |
 | Tools | none (pure text/JSON generation) |
 | Memory | disabled (`conv_log: false`, `memory_scan: false`) |
 
-**Why Haiku 4.5**: Structured decomposition requires instruction-following and JSON generation, not deep reasoning. Haiku is 3x cheaper than Sonnet ($1/$5 vs $3/$15 per 1M tokens) with sufficient quality for this task.
+**Why Sonnet 4.6**: Upgraded from Haiku 4.5 to eliminate model-name hallucinations in `tool_call` specs. Structured decomposition requires strong instruction-following and accurate JSON generation — Sonnet 4.6 produces significantly more reliable tool call specifications.
 
 ### 3.2 Decomposition Flow
 

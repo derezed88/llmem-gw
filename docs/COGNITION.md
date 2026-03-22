@@ -1,6 +1,6 @@
 # Cognitive Architecture — llmem-gw
 
-Last updated: 2026-03-14
+Last updated: 2026-03-21
 
 This document describes the cognitive architecture built on top of the tiered memory system. It was designed around the question: *what pieces does a reactive LLM agent need to become autonomous?* The answer shaped everything here.
 

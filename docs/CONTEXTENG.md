@@ -1,6 +1,6 @@
 # Context Engineering — llmem-gw
 
-Last updated: 2026-03-13
+Last updated: 2026-03-21
 
 This document describes every layer that contributes to the final prompt sent to an LLM, in injection order. Each layer has toggles at three scopes: **Global** (plugins-enabled.json), **Model** (llm-models.json), and **Session** (runtime state, set via `!config`/`!memory`).
 
@@ -179,12 +179,12 @@ Procedural memory from `samaritan_procedural` Qdrant collection, filtered by tas
 
 **When:** `_run_history_chain()` called in `routes.py:2088` (pre-LLM).
 
-**Plugin:** `plugin_history_default` — truncates oldest turns until token count ≤ `agent_max_ctx`.
+**Plugin:** `plugin_history_default` — sliding window that keeps the last N messages, where N = `min(agent_max_ctx, model.max_context)`.
 
 **Toggles:**
 | Scope | Key | Effect |
 |---|---|---|
-| Global | `plugins-enabled.json → plugin_history_default.agent_max_ctx` | Token window size |
+| Global | `plugins-enabled.json → plugin_history_default.agent_max_ctx` | Message window size (message count, not tokens) |
 
 ---
 
@@ -286,7 +286,7 @@ Auto-applied when `memory_scan: false`. Removes any `memory_save()` text from th
 | `memory.enabled` | 2, 10 | `true` | Master kill switch for all memory |
 | `memory.context_injection` | 2b | `true` | Toggle memory retrieval injection |
 | `memory.post_response_scan` | 7 | `true` | Toggle inline memory_save() scanning |
-| `plugin_history_default.agent_max_ctx` | 3a | varies | History sliding window token budget |
+| `plugin_history_default.agent_max_ctx` | 3a | varies | History sliding window message count |
 
 ### Model — `llm-models.json`
 

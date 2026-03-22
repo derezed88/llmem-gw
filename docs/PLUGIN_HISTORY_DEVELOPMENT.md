@@ -8,7 +8,7 @@ This guide is for developers and architects who want to experiment with or repla
 
 **History** is the correct term for what this system manages. It is a rolling log of `{"role": "user"|"assistant", "content": "..."}` message dicts — the OpenAI Chat Completions format, the de facto industry standard accepted by all major LLM APIs.
 
-**Memory** (not used here) refers to persistent, structured knowledge (RAG, vector stores, semantic summaries). This project does not have that yet.
+**Memory** refers to persistent, structured knowledge (RAG, vector stores, semantic summaries). The memory system is documented separately in [MEMORY_PROJECT1.md](MEMORY_PROJECT1.md) and [COGNITION.md](COGNITION.md). History plugins do not interact with memory — they operate only on the conversation history list.
 
 ---
 

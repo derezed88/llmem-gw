@@ -7,9 +7,10 @@ The MCP Agent is a multi-client AI agent server. It maintains persistent session
 ```
 Clients                 Server                          Backends
 ───────                 ──────                          ────────
-shell.py     ──SSE──►  llmem-gw.py                    OpenAI API (grok, gpt, local)
-open-webui    ─HTTP─►  ┌──────────────────────┐        Gemini API
-LM Studio app ─HTTP─►  │  routes.py           │        Local llama.cpp / Ollama
+shell.py     ──SSE──►  llmem-gw.py                    OpenAI API (gpt, local)
+open-webui    ─HTTP─►  ┌──────────────────────┐        xAI API (grok) + Responses API
+LM Studio app ─HTTP─►  │  routes.py           │        Gemini API
+                       │                      │        Local llama.cpp / Ollama
 Slack  ─Socket Mode──►  │  (process_request)   │
        ◄─Web API(bot)─  │                      │
                        │    │                 │
@@ -40,6 +41,7 @@ Slack  ─Socket Mode──►  │  (process_request)   │
 | `tools.py` | Core tool definitions as LangChain `StructuredTool` objects; plugin tool registry; per-model toolset filtering |
 | `prompt.py` | Recursive system prompt loader, section tree, `apply_prompt_operation()` |
 | `plugin_loader.py` | `BasePlugin` ABC, dynamic plugin loading from manifest |
+| `agents_xai.py` | Responses API dispatch for xAI and OpenAI models; `agentic_responses_api()` |
 | `database.py` | MySQL connection and SQL execution helpers |
 
 ## Request Flow
@@ -104,6 +106,10 @@ ChatGoogleGenerativeAI(model=..., google_api_key=...)
 ```
 
 Both return the same `ainvoke()` / `bind_tools()` interface — the rest of `agentic_lc()` is model-agnostic.
+
+### Responses API path (`agents_xai.py`)
+
+Models flagged with `xai_responses_api: true` or `openai_responses_api: true` in `llm-models.json` bypass LangChain and use the native Responses API via `agentic_responses_api()`. This enables direct access to provider-specific features (e.g., extended thinking for xAI/Grok). The dispatch logic in `dispatch_llm()` checks for these flags before falling back to the standard `agentic_lc()` loop.
 
 ### Tool schema format (`tools.py`)
 
@@ -193,11 +199,17 @@ Plugins are declared in `plugin-manifest.json` and enabled/disabled in `plugins-
 **`data_tool`** — registers tools callable by the LLM:
 - `plugin_database_mysql` — `db_query` tool
 - `plugin_storage_googledrive` — `google_drive` tool
-- `plugin_search_ddgs` — `ddgs_search` tool
-- `plugin_search_tavily` — `tavily_search` tool
-- `plugin_search_xai` — `xai_search` tool
-- `plugin_search_google` — `google_search` tool
+- `plugin_search_ddgs` — `search_ddgs` tool
+- `plugin_search_tavily` — `search_tavily` tool
+- `plugin_search_xai` — `search_xai` tool
+- `plugin_search_google` — `search_google` tool
+- `plugin_search_perplexity` — `perplexity_search`, `sonar_answer` tools
 - `plugin_urlextract_tavily` — `url_extract` tool
+- `plugin_calendar_google` — `calendar_google` tool
+- `plugin_geocode_google` — `geocode_google` tool
+- `plugin_places_google` — `places_google` tool
+- `plugin_weather_google` — `weather_google` tool
+- `plugin_sms_proxy` — `sms_proxy` tool
 
 ### Plugin loading sequence (llmem-gw.py startup)
 
@@ -366,13 +378,16 @@ No code changes are needed for models that use the standard `OPENAI` or `GEMINI`
 
 ## LLM Delegation Tools
 
-Three mechanisms for the session LLM to delegate work:
+The unified `llm_call` tool delegates sub-tasks to other registered models:
 
 | Tool | Context sent | Tools available | Use case |
 |---|---|---|---|
-| `llm_clean_text(model, prompt)` | None (prompt only) | None (text only) | Summarization, analysis of embedded data |
-| `llm_clean_tool(model, tool, arguments)` | Tool def only | One named tool | Isolated tool call via target model |
+| `llm_call(model, prompt, mode='text')` | Prompt only — no context, no tools | None (text only) | Summarization, analysis of embedded data |
+| `llm_call(model, prompt, mode='tool', tool=...)` | Tool def only | One named tool | Isolated tool call via target model |
+| `llm_call(model, prompt, mode='agent')` | Full history and tool context | Target model's `llm_tools` set | Sub-agent with full capabilities |
 | `@model <prompt>` (user-initiated) | Full session | Model's `llm_tools` set | Full turn delegation to free/local model |
+
+`backup_models` can be configured per-model in `llm-models.json` for automatic fallback when the primary delegation target fails.
 
 Tool access for delegation targets is controlled by the target model's `llm_tools` field in `llm-models.json`. Manage with `!llm_tools read <model>` and `!llm_tools write <model> <tools>`.
 

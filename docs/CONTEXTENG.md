@@ -175,16 +175,33 @@ Procedural memory from `samaritan_procedural` Qdrant collection, filtered by tas
 
 ## Layer 3a — History: Sliding Window Trim
 
-**What:** Trims conversation history to stay within token budget before sending to LLM.
+**What:** Trims conversation history so the LLM receives only the most recent messages.
 
-**When:** `_run_history_chain()` called in `routes.py:2088` (pre-LLM).
+**When:** `_run_history_chain()` called in `routes.py` immediately before `dispatch_llm()`. Also called again after the assistant response is appended (post-response chain pass for security/judge plugins).
 
-**Plugin:** `plugin_history_default` — sliding window that keeps the last N messages, where N = `min(agent_max_ctx, model.max_context)`.
+**How history reaches the LLM:** Yes — the entire (trimmed) history list is sent with every request. `dispatch_llm()` receives `session["history"]` and converts it to LangChain message objects (`HumanMessage`, `AIMessage`) via `_to_lc_messages()`. The system prompt (Layer 0) is prepended as a `SystemMessage`. The auto-enrichment block (Layer 2) is injected as an additional system message. The LLM sees: system prompt + enrichment context + full trimmed history + current user message.
+
+**What is one "unit" of history:** One message — a single `{"role": "user"|"assistant", "content": "..."}` dict. Each user turn is one message; each assistant response is one message. A conversation of 10 exchanges = 20 messages. The window size N counts individual messages, not turns, not tokens.
+
+**What happens at the limit:** `plugin_history_default.process()` applies `history[-N:]` — it keeps the last N messages and **permanently drops** the oldest ones. The trimmed list replaces `session["history"]`, so dropped messages are gone from the session (though they may persist in conv_log memory if `conv_log: true` is set on the model). When the next user message arrives, it is appended first, then the chain trims again — so the window always slides forward, dropping the oldest message to make room for the newest.
+
+**Plugin:** `plugin_history_default` — sliding window: `history[-N:]` where N = `min(agent_max_ctx, model.max_context)`.
+
+**Window size controls:**
+
+| Variable | Scope | Where configured | Default |
+|---|---|---|---|
+| `agent_max_ctx` | System-wide ceiling | `plugins-enabled.json → plugin_config.plugin_history_default.agent_max_ctx` | 200 |
+| `max_context` | Per-model preferred window | `llm-models.json` per model entry | varies |
+| **Effective N** | Per-session | `session["history_max_ctx"]` = `min(agent_max_ctx, model.max_context)` | — |
+
+The effective value is recomputed at session creation and on every `!model` switch. Runtime override: `!maxctx <N>` (persisted) or `!maxctx <N> temp` (session only).
 
 **Toggles:**
 | Scope | Key | Effect |
 |---|---|---|
-| Global | `plugins-enabled.json → plugin_history_default.agent_max_ctx` | Message window size (message count, not tokens) |
+| Global | `plugins-enabled.json → plugin_history_default.agent_max_ctx` | Message window ceiling (message count, not tokens) |
+| Model | `llm-models.json → max_context` | Per-model message window; effective window is `min()` of both |
 
 ---
 

@@ -3335,16 +3335,35 @@ async def cmd_plan(client_id: str, arg: str, model_key: str = ""):
         elif sub == "execute":
             goal_id = int(sub_arg) if sub_arg.isdigit() else None
             await push_tok(client_id, "Executing approved task steps...\n")
-            results = await plan_engine.execute_pending_tasks(goal_id=goal_id)
-            if not results:
-                await push_tok(client_id, "No approved task steps ready to execute.\n")
-            else:
+            total_executed = 0
+            # Loop until all approved tasks are done (batches of 20)
+            while True:
+                results = await plan_engine.execute_pending_tasks(
+                    goal_id=goal_id, max_steps=20
+                )
+                if not results:
+                    break
+                total_executed += len(results)
                 for r in results:
                     icon = "✓" if r["status"] == "done" else "✗"
                     await push_tok(
                         client_id,
                         f"  {icon} task {r['id']}: {r['result'][:120]}\n"
                     )
+            if total_executed == 0:
+                await push_tok(client_id, "No approved task steps ready to execute.\n")
+            else:
+                await push_tok(client_id, f"Execution complete: {total_executed} tasks processed.\n")
+                # Fire notification for goal completion check
+                try:
+                    import notifier as _notifier
+                    import asyncio as _asyncio
+                    _asyncio.ensure_future(_notifier.fire_event(
+                        "task_completed",
+                        f"!plan execute finished: {total_executed} tasks for goal_id={goal_id}"
+                    ))
+                except Exception:
+                    pass
 
         elif sub == "run":
             goal_id = int(sub_arg) if sub_arg.isdigit() else None
@@ -3485,10 +3504,35 @@ async def _cmd_plan_auto(client_id: str, arg: str):
                 await push_tok(client_id, "Usage: !plan auto approve <goal_id>\n")
                 return
             goal_id = int(sub_args[0])
+
+            # Validate: is this actually a goal ID?
+            goal_row = await fetch_dicts(
+                f"SELECT id, title, status, auto_process_status FROM {_goals_table()} "
+                f"WHERE id = {goal_id}"
+            )
+            if not goal_row:
+                # Check if user accidentally passed a step/plan ID
+                from memory import _PLANS
+                step_row = await fetch_dicts(
+                    f"SELECT id, goal_id, description FROM {_PLANS()} WHERE id = {goal_id}"
+                )
+                if step_row:
+                    real_goal = step_row[0]["goal_id"]
+                    await push_tok(
+                        client_id,
+                        f"{goal_id} is a plan step, not a goal. "
+                        f"The parent goal is {real_goal}.\n"
+                        f"Did you mean: `!plan auto approve {real_goal}`?\n"
+                    )
+                else:
+                    await push_tok(client_id, f"Goal {goal_id} not found.\n")
+                return
+
             # Approve the goal and all its proposed task steps
             await execute_sql(
                 f"UPDATE {_goals_table()} SET auto_process_status = 'approved' "
-                f"WHERE id = {goal_id} AND auto_process_status IN ('proposed', 'paused_user')"
+                f"WHERE id = {goal_id} AND (auto_process_status IN ('proposed', 'paused_user') "
+                f"OR auto_process_status IS NULL)"
             )
             # Also approve all proposed task steps for this goal
             from memory import _PLANS
@@ -3496,10 +3540,30 @@ async def _cmd_plan_auto(client_id: str, arg: str):
                 f"UPDATE {_PLANS()} SET approval = 'approved' "
                 f"WHERE goal_id = {goal_id} AND approval = 'proposed'"
             )
-            await push_tok(client_id, f"Goal {goal_id} approved for auto-execution.\n")
-            # Wake the goal processor
+
+            # Post-approval feedback: show what happens next
+            steps = await fetch_dicts(
+                f"SELECT id, step_type, status, approval, description "
+                f"FROM {_PLANS()} WHERE goal_id = {goal_id} ORDER BY step_order"
+            )
+            concept_pending = [s for s in steps if s["step_type"] == "concept" and s["status"] == "pending"]
+            task_pending = [s for s in steps if s["step_type"] == "task" and s["status"] not in ("done", "skipped")]
+            task_done = [s for s in steps if s["step_type"] == "task" and s["status"] in ("done", "skipped")]
+
+            lines = [f"Goal {goal_id} approved for auto-execution."]
+            if concept_pending and not task_pending:
+                lines.append(f"  → {len(concept_pending)} concept step(s) will be decomposed into tasks first.")
+            elif task_pending:
+                lines.append(f"  → {len(task_pending)} task(s) ready to execute ({len(task_done)} already done).")
+            elif not steps:
+                lines.append("  → No plan steps yet — goal processor will create them.")
+            lines.append("  → Goal processor triggered. Progress updates will appear here.")
+            await push_tok(client_id, "\n".join(lines) + "\n")
+
+            # Register initiator for progress notifications and wake the goal processor
             try:
-                from goal_processor import trigger_now
+                from goal_processor import trigger_now, register_initiator
+                register_initiator(goal_id, client_id)
                 trigger_now()
             except ImportError:
                 pass
@@ -3588,9 +3652,10 @@ async def _cmd_plan_auto(client_id: str, arg: str):
             )
             if step_rows and step_rows[0].get("parent_id"):
                 await plan_engine._check_parent_completion(step_rows[0]["parent_id"])
-            # Wake the goal processor
+            # Register initiator for progress notifications and wake the goal processor
             try:
-                from goal_processor import trigger_now
+                from goal_processor import trigger_now, register_initiator
+                register_initiator(goal_id, client_id)
                 trigger_now()
             except ImportError:
                 pass
@@ -5182,6 +5247,7 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
             return
         if cmd == "plan":
             await cmd_plan(client_id, arg, session.get("model", ""))
+            await conditional_push_done(client_id)
             return
         if cmd == "drives":
             await cmd_drives(client_id, arg, session.get("model", ""))
@@ -5409,6 +5475,7 @@ async def endpoint_stream(request: Request):
             elif t == "err": yield {"event": "error", "data": json.dumps({"error": item["d"]})}
             elif t == "model": yield {"event": "model", "data": item["d"]}
             elif t == "gate": yield {"event": "gate", "data": item["d"]}
+            elif t == "progress": yield {"event": "progress", "data": item["d"]}
             elif t == "notif": yield {"event": "notif", "data": item["d"]}
 
     return EventSourceResponse(generator())

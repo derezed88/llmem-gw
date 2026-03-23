@@ -52,6 +52,10 @@ _stats: dict = {
 
 _wake_event: asyncio.Event | None = None
 
+# Maps goal_id → client_id that approved the goal (for direct progress notifications).
+# Populated by register_initiator(), cleared on completion/error. Lost on restart — acceptable.
+_initiator_sessions: dict[int, str] = {}
+
 _PLUGINS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins-enabled.json")
 
 
@@ -59,9 +63,33 @@ def get_stats() -> dict:
     return dict(_stats)
 
 
+def register_initiator(goal_id: int, client_id: str) -> None:
+    """Record which session approved a goal so progress goes back to them."""
+    _initiator_sessions[goal_id] = client_id
+
+
 def trigger_now() -> None:
     if _wake_event:
         _wake_event.set()
+
+
+async def _notify_initiator(goal_id: int, msg: str, fallback_event: str = "") -> None:
+    """Send a progress message to the session that approved this goal.
+
+    Falls back to fire_event (broadcast) if no initiator is registered.
+    """
+    client_id = _initiator_sessions.get(goal_id)
+    if client_id:
+        try:
+            from state import push_notif
+            await push_notif(client_id, msg)
+            return
+        except Exception as e:
+            log.warning(f"goal_processor: push to initiator {client_id} failed: {e}")
+    # Fallback: broadcast via notifier
+    if fallback_event:
+        from notifier import fire_event
+        await fire_event(fallback_event, msg)
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +233,12 @@ async def _execute_goal_serial(goal_id: int, max_steps: int) -> dict:
     """
     from database import fetch_dicts, execute_sql
     import plan_engine
-    from notifier import fire_event
+
+    # Resolve goal title once for notifications
+    goal_rows = await fetch_dicts(
+        f"SELECT title FROM {_GOALS()} WHERE id = {goal_id}"
+    )
+    goal_title = goal_rows[0]["title"] if goal_rows else f"goal-{goal_id}"
 
     # Get all task steps ordered by step_order, not yet done
     steps = await fetch_dicts(
@@ -216,19 +249,70 @@ async def _execute_goal_serial(goal_id: int, max_steps: int) -> dict:
         f"LIMIT {max_steps}"
     )
 
+    # Count total tasks for progress fraction
+    total_row = await fetch_dicts(
+        f"SELECT COUNT(*) as total, "
+        f"SUM(CASE WHEN status IN ('done','skipped') THEN 1 ELSE 0 END) as completed "
+        f"FROM {_PLANS()} WHERE goal_id = {goal_id} AND step_type = 'task'"
+    )
+    total_tasks = total_row[0]["total"] if total_row else 0
+    done_tasks = total_row[0]["completed"] if total_row else 0
+
     if not steps:
-        # Check if all steps are done — goal might be completable
-        all_steps = await fetch_dicts(
-            f"SELECT COUNT(*) as total, "
-            f"SUM(CASE WHEN status IN ('done','skipped') THEN 1 ELSE 0 END) as completed "
-            f"FROM {_PLANS()} WHERE goal_id = {goal_id} AND step_type = 'task'"
+        # Check for pending concept steps FIRST — they may produce new tasks
+        pending_concepts = await fetch_dicts(
+            f"SELECT id, description FROM {_PLANS()} "
+            f"WHERE goal_id = {goal_id} AND step_type = 'concept' "
+            f"AND status = 'pending' AND approval = 'approved' "
+            f"ORDER BY step_order LIMIT 5"
         )
-        if all_steps and all_steps[0]["total"] > 0 and all_steps[0]["total"] == all_steps[0]["completed"]:
+        if pending_concepts:
+            # Notify: decomposition starting
+            concept_descs = [c.get("description", "")[:60] for c in pending_concepts]
+            await _notify_initiator(
+                goal_id,
+                f"Goal {goal_id} ({goal_title}): decomposing "
+                f"{len(pending_concepts)} concept step(s) into tasks...\n"
+                f"  {'; '.join(concept_descs)}"
+            )
+
+            decomposed_any = False
+            total_new_tasks = 0
+            for concept in pending_concepts:
+                try:
+                    cfg = _cfg()
+                    model_key = cfg.get("model") or ""
+                    if not model_key:
+                        from config import LLM_REGISTRY
+                        model_key = LLM_REGISTRY.get("model_roles", {}).get("plan_decomposer", "plan-decomposer")
+                    tasks = await plan_engine.decompose_concept_step(
+                        concept["id"], model_key=model_key, auto_approve=True
+                    )
+                    if tasks:
+                        decomposed_any = True
+                        total_new_tasks += len(tasks)
+                        log.info(f"goal_processor: auto-decomposed concept {concept['id']} "
+                                 f"into {len(tasks)} tasks for goal {goal_id}")
+                except Exception as e:
+                    log.error(f"goal_processor: failed to decompose concept {concept['id']}: {e}")
+            if decomposed_any:
+                # Notify: decomposition complete, starting execution
+                await _notify_initiator(
+                    goal_id,
+                    f"Goal {goal_id} ({goal_title}): decomposed into "
+                    f"{total_new_tasks} task(s). Executing..."
+                )
+                # Re-enter execution now that task steps exist
+                return await _execute_goal_serial(goal_id, max_steps)
+
+        # No pending concepts — check if all tasks are done (goal completable)
+        if total_tasks > 0 and total_tasks == done_tasks:
             await execute_sql(
                 f"UPDATE {_GOALS()} SET auto_process_status = 'completed' "
                 f"WHERE id = {goal_id}"
             )
             return {"completed": True, "goal_id": goal_id}
+
         return {"no_steps": True, "goal_id": goal_id}
 
     executed = 0
@@ -242,15 +326,12 @@ async def _execute_goal_serial(goal_id: int, max_steps: int) -> dict:
                 f"UPDATE {_GOALS()} SET auto_process_status = 'paused_user' "
                 f"WHERE id = {goal_id}"
             )
-            goal_rows = await fetch_dicts(
-                f"SELECT title FROM {_GOALS()} WHERE id = {goal_id}"
-            )
-            goal_title = goal_rows[0]["title"] if goal_rows else f"goal-{goal_id}"
-            await fire_event(
-                "goal_step_waiting_user",
+            await _notify_initiator(
+                goal_id,
                 f"Goal {goal_id} ({goal_title}) waiting on you:\n"
                 f"  Step [{step_id}]: {step.get('description', '')}\n\n"
-                f"When done: !plan auto done {goal_id} {step_id}"
+                f"When done: !plan auto done {goal_id} {step_id}",
+                fallback_event="goal_step_waiting_user",
             )
             log.info(f"goal_processor: goal {goal_id} paused at human step {step_id}")
             return {"paused_at": step_id, "reason": "user_step", "goal_id": goal_id}
@@ -261,11 +342,12 @@ async def _execute_goal_serial(goal_id: int, max_steps: int) -> dict:
                 f"UPDATE {_GOALS()} SET auto_process_status = 'paused_user' "
                 f"WHERE id = {goal_id}"
             )
-            await fire_event(
-                "goal_step_waiting_user",
-                f"Goal {goal_id} has an unresolved step:\n"
+            await _notify_initiator(
+                goal_id,
+                f"Goal {goal_id} ({goal_title}) has an unresolved step:\n"
                 f"  Step [{step_id}]: {step.get('description', '')}\n"
-                f"  (target=investigate — needs manual resolution)"
+                f"  (target=investigate — needs manual resolution)",
+                fallback_event="goal_step_waiting_user",
             )
             return {"paused_at": step_id, "reason": "investigate", "goal_id": goal_id}
 
@@ -278,8 +360,16 @@ async def _execute_goal_serial(goal_id: int, max_steps: int) -> dict:
         try:
             result = await plan_engine.execute_task_step(step_id)
             executed += 1
+            done_tasks += 1
             _stats["steps_executed"] += 1
             log.info(f"goal_processor: executed step {step_id} for goal {goal_id}")
+
+            # Per-step progress notification
+            desc = step.get("description", "")[:80]
+            await _notify_initiator(
+                goal_id,
+                f"Goal {goal_id}: step {done_tasks}/{total_tasks} done — {desc}"
+            )
 
             # Check if execution failed (plan_engine marks step done even on error results)
             if result and ("ERROR" in result.upper() or "failed" in result.lower()):
@@ -292,11 +382,12 @@ async def _execute_goal_serial(goal_id: int, max_steps: int) -> dict:
                     f"UPDATE {_GOALS()} SET auto_process_status = 'paused_user' "
                     f"WHERE id = {goal_id}"
                 )
-                await fire_event(
-                    "goal_step_waiting_user",
-                    f"Goal {goal_id} step [{step_id}] failed:\n"
+                await _notify_initiator(
+                    goal_id,
+                    f"Goal {goal_id} ({goal_title}) step [{step_id}] failed:\n"
                     f"  {result[:200]}\n\n"
-                    f"Fix the issue or skip: !plan auto done {goal_id} {step_id}"
+                    f"Fix the issue or skip: !plan auto done {goal_id} {step_id}",
+                    fallback_event="goal_step_waiting_user",
                 )
                 return {"failed_at": step_id, "result": result[:500], "goal_id": goal_id}
 
@@ -305,6 +396,11 @@ async def _execute_goal_serial(goal_id: int, max_steps: int) -> dict:
             await execute_sql(
                 f"UPDATE {_GOALS()} SET auto_process_status = 'paused_user' "
                 f"WHERE id = {goal_id}"
+            )
+            await _notify_initiator(
+                goal_id,
+                f"Goal {goal_id} ({goal_title}) step [{step_id}] error: {e}",
+                fallback_event="goal_step_waiting_user",
             )
             return {"error_at": step_id, "error": str(e), "goal_id": goal_id}
 
@@ -326,10 +422,27 @@ async def _execute_goal_serial(goal_id: int, max_steps: int) -> dict:
         for cr in (concept_rows or []):
             await plan_engine._check_parent_completion(cr["id"])
 
-        await fire_event(
-            "goal_completed",
-            f"Goal {goal_id} auto-completed all steps."
+        # Completion notification with result summary
+        done_steps = await fetch_dicts(
+            f"SELECT description, result FROM {_PLANS()} "
+            f"WHERE goal_id = {goal_id} AND step_type = 'task' AND status = 'done' "
+            f"ORDER BY step_order"
         )
+        result_lines = []
+        for ds in (done_steps or []):
+            r = ds.get("result", "") or ""
+            if r:
+                result_lines.append(f"  - {r[:120]}")
+        result_summary = "\n".join(result_lines[-5:]) if result_lines else "  (no result details)"
+
+        await _notify_initiator(
+            goal_id,
+            f"Goal {goal_id} ({goal_title}) completed — {done_tasks} task(s) done.\n"
+            f"Results:\n{result_summary}",
+            fallback_event="goal_completed",
+        )
+        # Clean up initiator tracking
+        _initiator_sessions.pop(goal_id, None)
         return {"completed": True, "executed": executed, "goal_id": goal_id}
 
     return {"executed": executed, "goal_id": goal_id}

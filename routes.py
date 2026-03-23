@@ -3639,19 +3639,28 @@ async def _cmd_plan_auto(client_id: str, arg: str):
                 f"result = 'Completed by user' "
                 f"WHERE id = {step_id} AND goal_id = {goal_id}"
             )
-            # Resume auto-execution
+            # Clear BLOCKED text from parent concept result (left by _check_parent_failure)
+            step_rows = await fetch_dicts(
+                f"SELECT parent_id FROM {_PLANS()} WHERE id = {step_id}"
+            )
+            parent_id = step_rows[0].get("parent_id") if step_rows else None
+            if parent_id:
+                await execute_sql(
+                    f"UPDATE {_PLANS()} SET result = NULL "
+                    f"WHERE id = {parent_id} AND (result LIKE '%BLOCKED:%' OR result LIKE '%FAILED:%')"
+                )
+            # Unblock goal AND resume auto-execution
             await execute_sql(
-                f"UPDATE {_goals_table()} SET auto_process_status = 'executing' "
-                f"WHERE id = {goal_id} AND auto_process_status = 'paused_user'"
+                f"UPDATE {_goals_table()} SET "
+                f"status = 'active', auto_process_status = 'approved' "
+                f"WHERE id = {goal_id} AND "
+                f"(auto_process_status = 'paused_user' OR status = 'blocked')"
             )
             await push_tok(client_id, f"Step {step_id} marked done. Goal {goal_id} resumed.\n")
             # Check parent completion
             import plan_engine
-            step_rows = await fetch_dicts(
-                f"SELECT parent_id FROM {_PLANS()} WHERE id = {step_id}"
-            )
-            if step_rows and step_rows[0].get("parent_id"):
-                await plan_engine._check_parent_completion(step_rows[0]["parent_id"])
+            if parent_id:
+                await plan_engine._check_parent_completion(parent_id)
             # Register initiator for progress notifications and wake the goal processor
             try:
                 from goal_processor import trigger_now, register_initiator

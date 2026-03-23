@@ -3,7 +3,7 @@ plan_engine.py — Two-tier plan decomposition and execution engine.
 
 Lifecycle:
   1. Concept steps created by human or reasoning model (step_type='concept')
-  2. Decomposer (Haiku 4.5) breaks concept steps into task steps (step_type='task')
+  2. Decomposer (Sonnet 4.6) breaks concept steps into task steps (step_type='task')
   3. Executor picks up approved task steps and runs tool_call specs
   4. Parent concept steps auto-complete when all child tasks are done
   5. Goal auto-completes when all concept steps are done
@@ -34,51 +34,79 @@ def _GOALS():
 # ---------------------------------------------------------------------------
 
 _DECOMPOSER_SYSTEM = """\
-You are a plan decomposition engine. Your job is to take a concept step (a
-human-readable description of intent) and break it into discrete, executable
-task steps.
+You are a plan decomposition engine. Break a concept step into discrete, executable task steps.
 
 You will receive:
 - The concept step description
 - The list of available tools and their argument schemas
 - Optional context (goal title, other concept steps for sequencing awareness)
 
-For EACH task step you produce, output:
-- description: short human-readable label for what this step does
+For EACH task step, output:
+- description: short human-readable label
 - tool_call: JSON object with "tool" and "args" keys, or null if not tool-executable
-- target: "model" if tool_call is populated, "human" if it requires human action,
-  "investigate" if you cannot determine how to execute it with current tools
-- reason: brief explanation of why this target was chosen (only for human/investigate)
+- target: "model" if tool_call is populated, "human" if requires human action,
+  "investigate" if you cannot determine how to execute with current tools
+- reason: brief explanation (only for human/investigate targets)
 
-Rules:
-1. Each task step must be ONE atomic action — one tool call or one human action.
-2. Prefer existing tools. Do not invent tool names.
-3. If the concept step says "human:" or explicitly names a person, set target="human".
-4. If unsure whether the system can do it, set target="investigate" — do NOT guess.
-5. Order task steps logically (they will be assigned ascending step_order).
-6. Keep descriptions concise but unambiguous.
-7. For db_query tool calls, write the actual SQL in args.query.
-8. If a concept step is already atomic (one tool call), emit exactly one task step.
+## Rules
 
-Respond with ONLY a JSON array. No markdown, no explanation outside the JSON.
+1. Each task step = ONE atomic tool call or ONE human action.
+2. **ONLY use tools from the AVAILABLE TOOLS list.** Do not invent tool names or add parameters not in the schema. If a tool is not listed, use target="investigate".
+3. **ONLY use parameter names shown in the tool schema.** Do not add extra args.
+4. If the concept says "human:" or names a person, set target="human".
+5. If unsure, set target="investigate" — do NOT guess.
+6. Order steps logically. They execute serially.
+7. For db_query, write actual SQL in args.query.
+8. If already atomic (one tool call), emit exactly one step.
 
-Example output:
+## Sequential dependency handling
+
+Task steps execute one at a time. If step N needs output from step N-1 (e.g., a file_id returned by a google_drive list), write the args with a placeholder description:
+- Use the SAME tool but note the dependency in the description (e.g., "Read the report file using file_id from previous step")
+- The executor will resolve the dependency at runtime
+- Do NOT hardcode IDs you don't have — leave args that depend on prior output EMPTY and note the dependency
+
+## Tool-specific rules
+
+### google_drive
+- Operations: list, read, create, append, delete
+- `list` → returns file names and IDs. Args: operation="list" (optional: folder_id)
+- `read` → requires file_id (NOT file_name). If you don't have the ID yet, first emit a "list" step, then a "read" step noting it needs the file_id from the list result
+- `create` → args: operation="create", file_name="...", content="..."
+- Do NOT pass file_name to read — it will fail. Only file_id works for read.
+
+### llm_call
+- REQUIRED args: model, prompt
+- model MUST be a real model key from the system (e.g., "samaritan-execution", "summarizer-gemini"). NEVER use "default" — it does not exist.
+- mode: "text" (default, generates text) or "tool" (delegates a tool call; requires "tool" arg)
+- Do NOT use mode="chat" — it does not exist.
+- **samaritan-execution REQUIRES mode="tool" with an explicit tool= argument.** It rejects mode="text". For cognitive writes (set_goal, set_plan, set_belief, procedure_save, save_memory_typed), always use: {"tool": "llm_call", "args": {"model": "samaritan-execution", "mode": "tool", "tool": "<tool_name>", "prompt": "..."}}
+- For synthesis/summarization tasks, use model="summarizer-gemini" with mode="text".
+
+### search_tavily / search_xai / search_brightdata
+- Args: query (string). search_tavily also accepts search_depth="basic"|"advanced".
+- search_xai has only the "query" parameter — do NOT add model or other args.
+- Do NOT use search_ddgs — it is not available as a tool.
+
+### memory_save / memory_recall / procedure_recall
+- memory_save: args: topic, content, importance (1-10)
+- memory_recall: args: query (semantic search)
+- procedure_recall: args: query
+
+### url_extract / url_extract_brightdata
+- Args: url (required), query (optional extraction prompt)
+
+## Output format
+
+Respond with ONLY a JSON array. No markdown fences, no explanation outside the JSON.
+
+Example:
 [
-  {
-    "description": "Query current API endpoint list from config table",
-    "tool_call": {"tool": "db_query", "args": {"query": "SELECT * FROM api_endpoints WHERE active=1"}},
-    "target": "model"
-  },
-  {
-    "description": "Review endpoint list and decide which to monitor",
-    "target": "human",
-    "reason": "Requires human judgment on monitoring priorities"
-  },
-  {
-    "description": "Research best uptime monitoring approach for our stack",
-    "target": "investigate",
-    "reason": "Need to evaluate available monitoring tools and integrations"
-  }
+  {"description": "List Google Drive files to find the target report", "tool_call": {"tool": "google_drive", "args": {"operation": "list"}}, "target": "model"},
+  {"description": "Read the report file (file_id from previous list step)", "tool_call": {"tool": "google_drive", "args": {"operation": "read", "file_id": ""}}, "target": "model"},
+  {"description": "Search for competitors in the LLM inference space", "tool_call": {"tool": "search_tavily", "args": {"query": "FriendliAI competitors LLM inference 2026", "search_depth": "advanced"}}, "target": "model"},
+  {"description": "Summarize findings into a structured competitor list", "tool_call": {"tool": "llm_call", "args": {"model": "summarizer-gemini", "prompt": "Summarize the competitor research into a structured list with key differentiators.", "mode": "text"}}, "target": "model"},
+  {"description": "Review competitor list for completeness", "target": "human", "reason": "Admin should verify the competitor list before proceeding to report generation"}
 ]
 """
 
@@ -88,8 +116,8 @@ Example output:
 
 def _build_tool_catalog() -> str:
     """
-    Build a compact tool catalog string for the decomposer.
-    Lists tool names and their parameter schemas.
+    Build a detailed tool catalog string for the decomposer.
+    Includes tool names, parameter schemas with types/defaults, and descriptions.
     """
     try:
         from tools import get_all_openai_tools
@@ -98,10 +126,27 @@ def _build_tool_catalog() -> str:
         for td in all_tools:
             fn = td.get("function", {})
             name = fn.get("name", "?")
-            desc = fn.get("description", "")[:120]
+            desc = fn.get("description", "")[:200]
             params = fn.get("parameters", {}).get("properties", {})
-            param_names = list(params.keys())
-            lines.append(f"- {name}({', '.join(param_names)}): {desc}")
+            required = fn.get("parameters", {}).get("required", [])
+            # Build param details
+            param_parts = []
+            for pname, pschema in params.items():
+                ptype = pschema.get("type", "str")
+                pdefault = pschema.get("default", "")
+                penum = pschema.get("enum")
+                req_mark = "*" if pname in required else ""
+                detail = f"{pname}{req_mark}: {ptype}"
+                if penum:
+                    detail += f" [{'/'.join(str(e) for e in penum)}]"
+                elif pdefault not in ("", None):
+                    detail += f" (default={pdefault})"
+                param_parts.append(detail)
+            lines.append(f"### {name}")
+            lines.append(f"  {desc}")
+            if param_parts:
+                lines.append(f"  Args: {', '.join(param_parts)}")
+            lines.append("")
         return "\n".join(lines)
     except Exception as e:
         log.warning(f"_build_tool_catalog failed: {e}")
@@ -165,6 +210,26 @@ async def decompose_concept_step(
         ]
         context_parts.append("Other steps in this plan:\n" + "\n".join(sib_lines))
 
+    # ---- Include results from completed sibling task steps ----
+    # This gives the decomposer access to data discovered in earlier steps
+    # (e.g., competitor names identified in step 1 feed into step 2 decomposition)
+    completed_results = await fetch_dicts(
+        f"SELECT p2.description, LEFT(p2.result, 500) as result "
+        f"FROM {_PLANS()} p2 "
+        f"WHERE p2.goal_id = {goal_id} AND p2.step_type = 'task' "
+        f"AND p2.status = 'done' AND p2.result IS NOT NULL "
+        f"AND p2.result != '' "
+        f"ORDER BY p2.step_order LIMIT 20"
+    ) or []
+    if completed_results:
+        res_lines = []
+        for cr in completed_results:
+            res_lines.append(f"  - {cr['description']}: {cr['result']}")
+        context_parts.append(
+            "RESULTS FROM COMPLETED EARLIER STEPS (use these to inform your decomposition):\n"
+            + "\n".join(res_lines)
+        )
+
     context_block = "\n".join(context_parts) if context_parts else "(no additional context)"
 
     user_prompt = f"""\
@@ -224,7 +289,10 @@ Decompose the concept step into discrete task steps. Output JSON array only."""
         tool_call_raw = task.get("tool_call")
         tool_call_sql = "NULL"
         if tool_call_raw and isinstance(tool_call_raw, dict):
-            tc_json = json.dumps(tool_call_raw).replace("'", "''")
+            tc_json = json.dumps(tool_call_raw)
+            # Escape for MySQL: double single quotes AND double backslashes
+            # so \n in JSON doesn't become a literal newline in MySQL storage
+            tc_json = tc_json.replace("\\", "\\\\").replace("'", "''")
             tool_call_sql = f"'{tc_json}'"
         elif target == "model":
             # Model target but no tool_call — downgrade to investigate
@@ -297,6 +365,116 @@ async def approve_plan(concept_step_id: int, approve: bool = True) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Resolve sequential dependencies between sibling task steps
+# ---------------------------------------------------------------------------
+
+async def _resolve_dependencies(step: dict, tool_name: str, tool_args: dict) -> dict:
+    """
+    Inspect tool_args for empty/placeholder values that can be resolved from
+    the results of earlier sibling steps (same parent_id, lower step_order).
+
+    Currently handles:
+    - google_drive read with empty file_id → scan prior list result for matching file
+    """
+    from database import fetch_dicts
+
+    # google_drive read with empty file_id
+    if tool_name == "google_drive" and tool_args.get("operation") == "read" and not tool_args.get("file_id"):
+        parent_id = step.get("parent_id")
+        if not parent_id:
+            return tool_args
+        # Find the most recent completed google_drive list sibling
+        siblings = await fetch_dicts(
+            f"SELECT result, tool_call FROM {_PLANS()} "
+            f"WHERE parent_id = {parent_id} AND step_type = 'task' "
+            f"AND status = 'done' AND id < {step['id']} "
+            f"ORDER BY step_order DESC"
+        ) or []
+        for sib in siblings:
+            sib_tc = sib.get("tool_call", "")
+            sib_result = sib.get("result", "") or ""
+            # Check if this sibling was a google_drive list
+            if isinstance(sib_tc, str):
+                try:
+                    sib_tc = json.loads(sib_tc)
+                except (json.JSONDecodeError, TypeError):
+                    sib_tc = {}
+            if (isinstance(sib_tc, dict) and
+                sib_tc.get("tool") == "google_drive" and
+                sib_tc.get("args", {}).get("operation") == "list"):
+                # Parse file IDs from the list result — look for "(id: XXXXX" pattern
+                import re
+                # Look for file name from description to match
+                desc_lower = step.get("description", "").lower()
+                # Find all file entries: [FILE] name  (id: XXXXX
+                file_entries = re.findall(
+                    r'\[FILE\]\s+(.+?)\s+\(id:\s+(\S+)', sib_result
+                )
+                if file_entries:
+                    # Try to match by name similarity
+                    best_id = None
+                    for fname, fid in file_entries:
+                        fname_lower = fname.lower().strip()
+                        if any(kw in fname_lower for kw in ["friendliai", "comprehensive", "report"]):
+                            best_id = fid
+                            break
+                    if not best_id and file_entries:
+                        # Fallback: use first file
+                        best_id = file_entries[0][1]
+                    if best_id:
+                        # Clean trailing parentheses
+                        best_id = best_id.rstrip(")")
+                        tool_args = dict(tool_args)
+                        tool_args["file_id"] = best_id
+                        log.info(
+                            f"_resolve_dependencies: resolved file_id={best_id} "
+                            f"for task step id={step['id']}"
+                        )
+                break  # Only check the most recent list result
+
+    # google_drive create with empty content → inject content from most recent
+    # sibling llm_call result (synthesis step produces the report text)
+    if (tool_name == "google_drive" and
+        tool_args.get("operation") == "create" and
+        not tool_args.get("content")):
+        parent_id = step.get("parent_id")
+        if parent_id:
+            # Find the most recent completed llm_call sibling before this step
+            siblings = await fetch_dicts(
+                f"SELECT result, tool_call FROM {_PLANS()} "
+                f"WHERE parent_id = {parent_id} AND step_type = 'task' "
+                f"AND status = 'done' AND id < {step['id']} "
+                f"ORDER BY id DESC LIMIT 5"
+            ) or []
+            for sib in siblings:
+                sib_tc = sib.get("tool_call", "")
+                sib_result = sib.get("result", "") or ""
+                if isinstance(sib_tc, str):
+                    try:
+                        sib_tc = json.loads(sib_tc)
+                    except (json.JSONDecodeError, TypeError):
+                        sib_tc = {}
+                # Look for the immediately preceding llm_call (synthesis step)
+                # Skip error/timeout results — they're not valid content
+                _is_error = (sib_result.startswith("ERROR:") or
+                             "timed out" in sib_result[:100] or
+                             "Invalid tool_call" in sib_result[:100])
+                if (isinstance(sib_tc, dict) and
+                    sib_tc.get("tool") == "llm_call" and
+                    sib_result and len(sib_result) > 50 and
+                    not _is_error):
+                    tool_args = dict(tool_args)
+                    tool_args["content"] = sib_result
+                    log.info(
+                        f"_resolve_dependencies: injected content ({len(sib_result)} chars) "
+                        f"from prior llm_call into google_drive create for task step id={step['id']}"
+                    )
+                    break
+
+    return tool_args
+
+
+# ---------------------------------------------------------------------------
 # Execute a single task step
 # ---------------------------------------------------------------------------
 
@@ -363,6 +541,11 @@ async def execute_task_step(task_step_id: int) -> str:
     tool_args = tool_call.get("args", {})
 
     # ------------------------------------------------------------------
+    # Resolve sequential dependencies from sibling step results
+    # ------------------------------------------------------------------
+    tool_args = await _resolve_dependencies(step, tool_name, tool_args)
+
+    # ------------------------------------------------------------------
     # TIER 1: Direct tool call (zero LLM cost)
     # ------------------------------------------------------------------
     executor_fn = get_tool_executor(tool_name)
@@ -380,6 +563,14 @@ async def execute_task_step(task_step_id: int) -> str:
         else:
             result = await executor_fn()
         result_str = str(result) if result else "(no output)"
+
+        # Check for error results returned as strings (e.g., timeouts)
+        if (result_str.startswith("ERROR:") or
+            "timed out" in result_str[:100] or
+            "Invalid tool_call" in result_str[:100]):
+            await _fail_task(task_step_id, result_str)
+            log.warning(f"execute_task_step: id={task_step_id} tool={tool_name} direct returned error: {result_str[:100]}")
+            return result_str
 
         # Direct call succeeded
         await _complete_task(task_step_id, result_str, executor="direct")
@@ -572,32 +763,22 @@ async def _fail_task(task_step_id: int, error: str):
 
 async def _check_parent_failure(parent_id: int, error: str):
     """
-    When a task step fails, mark the parent concept step as blocked
-    and propagate up to the goal.
+    When a task step fails, note the error on the parent concept step.
+
+    Does NOT block the goal — the goal processor manages failure recovery
+    (pauses for user, accepts !plan auto done, resumes). Blocking the goal
+    here creates an inconsistent state that manual recovery can't fix.
     """
     from database import execute_sql, fetch_dicts
 
-    # Mark concept step as blocked with the error
+    # Note the error on the concept step (append to result for audit trail)
     escaped = error[:2000].replace("'", "''")
     await execute_sql(
-        f"UPDATE {_PLANS()} SET status = 'pending', "
-        f"result = CONCAT(COALESCE(result, ''), ' | BLOCKED: {escaped}') "
+        f"UPDATE {_PLANS()} SET "
+        f"result = CONCAT(COALESCE(result, ''), ' | FAILED: {escaped}') "
         f"WHERE id = {parent_id} AND status IN ('pending', 'in_progress')"
     )
-    log.info(f"_check_parent_failure: concept {parent_id} blocked by task failure")
-
-    # Propagate to goal
-    goal_rows = await fetch_dicts(
-        f"SELECT goal_id FROM {_PLANS()} WHERE id = {parent_id} LIMIT 1"
-    )
-    if goal_rows and goal_rows[0].get("goal_id"):
-        goal_id = goal_rows[0]["goal_id"]
-        # Only block goal if it was active — don't downgrade already-blocked
-        await execute_sql(
-            f"UPDATE {_GOALS()} SET status = 'blocked' "
-            f"WHERE id = {goal_id} AND status = 'active'"
-        )
-        log.info(f"_check_parent_failure: goal {goal_id} blocked due to task failure")
+    log.info(f"_check_parent_failure: concept {parent_id} task failure noted: {error[:100]}")
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +828,7 @@ async def _check_goal_completion(goal_id: int):
             f"auto_process_status = CASE "
             f"  WHEN auto_process_status IS NOT NULL THEN 'completed' "
             f"  ELSE auto_process_status END "
-            f"WHERE id = {goal_id} AND status = 'active'"
+            f"WHERE id = {goal_id} AND status IN ('active', 'blocked')"
         )
         log.info(f"_check_goal_completion: goal id={goal_id} auto-completed")
 
@@ -703,6 +884,9 @@ async def decompose_pending_concepts(
 ) -> list[dict]:
     """
     Find concept steps that have no child task steps and decompose them.
+    Only decomposes the FIRST pending concept per goal — later concepts wait
+    until earlier ones are done, so the decomposer can use their results
+    (e.g., competitor names discovered in step 1 feed into step 2).
     Returns summary of decomposition results.
     """
     from database import fetch_dicts
@@ -716,10 +900,36 @@ async def decompose_pending_concepts(
     if goal_id is not None:
         where += f" AND p.goal_id = {goal_id}"
 
-    rows = await fetch_dicts(
-        f"SELECT p.id, p.description FROM {_PLANS()} p {where} "
+    all_rows = await fetch_dicts(
+        f"SELECT p.id, p.goal_id, p.step_order, p.description FROM {_PLANS()} p {where} "
         f"ORDER BY p.goal_id, p.step_order"
     )
+
+    # Only take the first pending concept per goal — later steps may depend
+    # on results from earlier steps (sequential decomposition)
+    seen_goals = set()
+    rows = []
+    for row in (all_rows or []):
+        gid = row["goal_id"]
+        if gid in seen_goals:
+            continue
+        # Check if all earlier concept steps for this goal are done
+        earlier_pending = await fetch_dicts(
+            f"SELECT id FROM {_PLANS()} "
+            f"WHERE goal_id = {gid} AND step_type = 'concept' "
+            f"AND step_order < {row['step_order']} "
+            f"AND status NOT IN ('done', 'skipped') LIMIT 1"
+        )
+        if earlier_pending:
+            # Earlier concept still in progress — skip this goal for now
+            log.info(
+                f"decompose_pending_concepts: skipping concept {row['id']} "
+                f"(goal {gid}) — earlier concept steps not yet done"
+            )
+            seen_goals.add(gid)
+            continue
+        rows.append(row)
+        seen_goals.add(gid)
     if not rows:
         return []
 
@@ -765,6 +975,19 @@ async def run_plan_pipeline(
     decomp_results = await decompose_pending_concepts(
         goal_id=goal_id, model_key=model_key, auto_approve=auto_approve
     )
+
+    # Auto-approve any proposed task steps that were created by a prior
+    # decompose (without auto_approve) so execute_pending_tasks picks them up.
+    if auto_approve:
+        from database import execute_sql
+        where = (
+            f"step_type = 'task' AND status = 'pending' AND approval = 'proposed'"
+        )
+        if goal_id is not None:
+            where += f" AND goal_id = {goal_id}"
+        await execute_sql(
+            f"UPDATE {_PLANS()} SET approval = 'approved' WHERE {where}"
+        )
 
     exec_results = await execute_pending_tasks(
         goal_id=goal_id, max_steps=max_exec_steps

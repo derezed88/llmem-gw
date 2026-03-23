@@ -374,12 +374,13 @@ async def _execute_goal_serial(goal_id: int, max_steps: int) -> dict:
             # Check if execution failed (plan_engine marks step done even on error results)
             if result and ("ERROR" in result.upper() or "failed" in result.lower()):
                 log.warning(f"goal_processor: step {step_id} may have failed: {result[:200]}")
-                # Revert step to pending and mark goal as paused for user intervention
+                # Revert step to pending; ensure goal is active+paused (not blocked)
                 await execute_sql(
                     f"UPDATE {_PLANS()} SET status = 'pending' WHERE id = {step_id}"
                 )
                 await execute_sql(
-                    f"UPDATE {_GOALS()} SET auto_process_status = 'paused_user' "
+                    f"UPDATE {_GOALS()} SET status = 'active', "
+                    f"auto_process_status = 'paused_user' "
                     f"WHERE id = {goal_id}"
                 )
                 await _notify_initiator(
@@ -393,13 +394,16 @@ async def _execute_goal_serial(goal_id: int, max_steps: int) -> dict:
 
         except Exception as e:
             log.error(f"goal_processor: step {step_id} execution error: {e}")
+            # Ensure goal is active+paused (not blocked)
             await execute_sql(
-                f"UPDATE {_GOALS()} SET auto_process_status = 'paused_user' "
+                f"UPDATE {_GOALS()} SET status = 'active', "
+                f"auto_process_status = 'paused_user' "
                 f"WHERE id = {goal_id}"
             )
             await _notify_initiator(
                 goal_id,
-                f"Goal {goal_id} ({goal_title}) step [{step_id}] error: {e}",
+                f"Goal {goal_id} ({goal_title}) step [{step_id}] error: {e}\n\n"
+                f"Fix the issue or skip: !plan auto done {goal_id} {step_id}",
                 fallback_event="goal_step_waiting_user",
             )
             return {"error_at": step_id, "error": str(e), "goal_id": goal_id}

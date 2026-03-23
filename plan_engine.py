@@ -812,23 +812,40 @@ async def _check_parent_completion(parent_id: int):
 
 async def _check_goal_completion(goal_id: int):
     """
-    If all concept steps for a goal are done/skipped,
-    mark the goal as done.
+    If all *approved* concept steps for a goal are done/skipped,
+    mark the goal as done. Proposed/rejected concepts don't block completion.
+    Orphaned pending/proposed steps are auto-skipped on goal completion.
     """
     from database import fetch_dicts, execute_sql
 
+    # Only approved concepts block completion — proposed/rejected ones don't
     remaining = await fetch_dicts(
         f"SELECT COUNT(*) as cnt FROM {_PLANS()} "
         f"WHERE goal_id = {goal_id} AND step_type = 'concept' "
+        f"AND approval = 'approved' "
         f"AND status NOT IN ('done', 'skipped')"
     )
     if remaining and remaining[0]["cnt"] == 0:
+        # Must have at least one approved concept to complete (guard against empty plans)
+        has_concepts = await fetch_dicts(
+            f"SELECT COUNT(*) as cnt FROM {_PLANS()} "
+            f"WHERE goal_id = {goal_id} AND step_type = 'concept' AND approval = 'approved'"
+        )
+        if not has_concepts or has_concepts[0]["cnt"] == 0:
+            return
+
         await execute_sql(
             f"UPDATE {_GOALS()} SET status = 'done', "
             f"auto_process_status = CASE "
             f"  WHEN auto_process_status IS NOT NULL THEN 'completed' "
             f"  ELSE auto_process_status END "
             f"WHERE id = {goal_id} AND status IN ('active', 'blocked')"
+        )
+        # Close orphaned plan steps (pending/proposed tasks under completed goal)
+        await execute_sql(
+            f"UPDATE {_PLANS()} SET status = 'skipped', "
+            f"result = COALESCE(result, 'Skipped: parent goal completed') "
+            f"WHERE goal_id = {goal_id} AND status NOT IN ('done', 'skipped')"
         )
         log.info(f"_check_goal_completion: goal id={goal_id} auto-completed")
 

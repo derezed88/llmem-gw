@@ -1,6 +1,6 @@
 # Cognitive Architecture — llmem-gw
 
-Last updated: 2026-03-21
+Last updated: 2026-03-23
 
 This document describes the cognitive architecture built on top of the tiered memory system. It was designed around the question: *what pieces does a reactive LLM agent need to become autonomous?* The answer shaped everything here.
 
@@ -69,9 +69,17 @@ Each step has:
 - `executor`: which model ran the step
 - `result`: execution output
 
-**Completion cascade**: task done → `_check_parent_completion()` → concept done → `_check_goal_completion()` → goal done.
+**Decomposition model**: `model_roles["plan_decomposer"]` (currently Sonnet 4.6, upgraded from Haiku 4.5 to eliminate model-name hallucinations in `tool_call` specs).
 
-**Execution chain** (3 tiers):
+**Decomposer rules** (enforced in decomposer system prompt, `plan_engine.py`):
+- Each task step = one atomic tool call or one human action
+- Only tools from the available tools catalog may be used
+- `samaritan-execution` **requires** `mode="tool"` with an explicit `tool=` argument (rejects `mode="text"`)
+- For synthesis/summarization, use `summarizer-gemini` with `mode="text"`
+- Sequential dependencies use placeholder descriptions, resolved at runtime
+
+### Execution Chain (3 Tiers)
+
 1. **Direct executor** — parse `tool_call` JSON, look up the Python executor function via `get_tool_executor()`, map arguments, and call directly. Zero LLM cost. This is the happy path for most steps.
 2. **Primary executor** — LLM-based execution via `model_roles["plan_executor"]`. Only invoked if Tier 1 throws an exception. The LLM receives the tool name, args, step description, and the direct-execution error, then calls the tool via `llm_call(mode="tool")` with the ability to adapt arguments or recover.
 3. **Fallback executor** — LLM-based execution via `model_roles["plan_executor_fallback"]`. Only invoked if Tier 2 also fails. Same pattern, different model. Last resort before the step is marked failed.
@@ -88,9 +96,24 @@ Each step has:
 
 Tier 1 is a dumb function call — if the JSON spec is perfectly formed and the runtime state is exactly right, it works. Tier 2 adds reasoning to recover from gaps between the plan and reality.
 
-**Decomposition model**: `model_roles["plan_decomposer"]` (currently Sonnet 4.6, upgraded from Haiku 4.5 to eliminate model-name hallucinations in `tool_call` specs).
+### Completion & Cleanup Cascade
 
-Manual commands: `!plan`, `!plan decompose`, `!plan approve/reject`, `!plan execute`, `!plan run`.
+**Automatic completion** (`plan_engine.py`):
+
+```
+task done → _check_parent_completion() → concept done → _check_goal_completion() → goal done
+```
+
+- `_check_parent_completion`: when all task steps under a concept are done/skipped, concept is marked done
+- `_check_goal_completion`: when all **approved** concept steps are done/skipped, goal is marked done
+  - Only approved concepts block completion — proposed/rejected concepts do not
+  - Must have at least one approved concept to complete (guard against empty plans)
+
+**Orphan cleanup**: when a goal completes, all remaining pending/proposed plan steps are auto-skipped with result `"Skipped: parent goal completed"`. This prevents orphaned plans from accumulating under completed goals.
+
+**Explicit closing**: user can close goals/plans directly:
+- `!plan auto done <goal_id> <step_id>` — mark a specific step done and resume execution
+- Model can delegate `set_goal(id=N, status='done')` or `set_plan(id=N, status='done')` to close items
 
 ### Goal Processor — Autonomous Goal Flow
 
@@ -104,23 +127,90 @@ Background task that autonomously scans for goals, proposes plans, and executes 
 NULL → proposed → approved → executing → completed
                 ↘ deferred (with defer_until datetime)
                 ↘ rejected
-                         → paused_user (human step or failure)
+       approved → executing → paused_user (human step or failure) → approved (via !plan auto done)
 ```
 
-**Lifecycle** (all phases run in a single 30-minute cycle):
-1. **Scanner** — pure SQL query: finds active goals with `auto_process_status IS NULL` and no plan steps. If none found, the cycle ends here. **Zero LLM tokens on quiet cycles.**
-2. **Decomposer** — only called if the scanner found unplanned goals. Creates concept + task steps via `plan_decomposer` model role (Sonnet 4.6). This is the only phase that costs decomposer tokens.
-3. **Proposal** sent to user via notifier (`goal_plan_proposed` event)
-4. **User responds**: approve / defer / reject / modify steps
-5. **Deferred check** — SQL query: finds goals with `auto_process_status = 'deferred'` where `defer_until <= NOW()`, re-queues them (`auto_process_status` → NULL) so the next cycle's scanner picks them up.
-6. **Executor** — runs model-owned steps for `approved`/`executing` goals serially; pauses on human steps (`goal_step_waiting_user` event). Uses the 3-tier execution chain (direct → plan_executor → fallback), so most steps also cost zero LLM tokens.
-7. **Completion** cascades via existing plan_engine logic
+### Full Goal Lifecycle — End-to-End
 
-**Failure handling**: If a step result contains ERROR/failed, the step is reverted to `pending`, the goal is set to `paused_user`, and a notification is fired.
+**Phase 1: Goal Creation**
+- User asks for multi-step work → reasoning model creates goal via `set_goal` delegation + 1-2 concept steps via `set_plan`
+- Model reports goal ID and step IDs, then **stops** (goal-first execution rule)
+- Goal appears as `status=active`, `auto_process_status=NULL`
 
-**Deferred goals**: When `defer_until` expires, the goal is re-queued (`auto_process_status` → NULL) for the next scan cycle.
+**Phase 2: Autonomous Planning**
+- Goal processor scanner (30-min cycle) finds unplanned goals
+- Decomposer creates concept + task steps via LLM
+- Goal marked `auto_process_status=proposed`
+- Notification sent to user: "Goal N: X steps (Y auto, Z user). `!plan auto approve N`"
 
-**Config** (`plugins-enabled.json → plugin_config.goal_processor`):
+**Phase 3: User Approval**
+- `!plan auto approve <goal_id>`:
+  - Validates the ID is a goal (not a step — shows "Did you mean?" if wrong)
+  - Sets `auto_process_status=approved`, approves all proposed steps
+  - Shows what happens next: "1 concept step(s) will be decomposed..." or "3 task(s) ready to execute"
+  - Registers the session for progress notifications
+  - Triggers goal processor immediately
+- Alternatives: `!plan auto defer <goal_id>`, `!plan auto reject <goal_id>`
+
+**Phase 4: Execution with Progress**
+- Goal processor picks up approved goals, sets `auto_process_status=executing`
+- **Auto-decomposition**: if approved concept steps have no task children, they are decomposed on the fly (with notification: "decomposing N concept step(s)...")
+- Tasks execute serially via 3-tier chain (direct → LLM executor → fallback)
+- **Per-step progress**: after each task completes, initiating session receives: "Goal N: step 3/5 done — Read competitor report"
+- **Human steps**: execution pauses, user notified: "Goal N waiting on you: Step [M]: ... When done: `!plan auto done N M`"
+
+**Phase 5: Error Handling**
+- When a step fails:
+  - Step reverted to `pending`, goal set to `active` + `paused_user` (NOT `blocked`)
+  - `_check_parent_failure` notes error on parent concept (audit trail) but does **not** block the goal
+  - User notified: "Goal N step [M] failed: ... Fix or skip: `!plan auto done N M`"
+  - Double failures don't compound — goal stays `active` + `paused_user`
+- Recovery via `!plan auto done <goal_id> <step_id>`:
+  - Marks step done, clears FAILED text from parent concept
+  - Sets goal to `active` + `approved` (not just `executing` — ensures processor picks it up)
+  - Registers session for progress, triggers processor immediately
+
+**Phase 6: Completion**
+- All approved concept steps done → `_check_goal_completion` fires:
+  - Goal marked `status=done`, `auto_process_status=completed`
+  - Orphaned pending/proposed steps auto-skipped
+- Completion notification to initiating session: "Goal N completed — X task(s) done. Results: ..."
+- Initiator session tracking cleaned up
+
+### Plan-Only Workflows (No Goal)
+
+Plans can exist without goals (`goal_id=0`):
+- `!plan adhoc <description>` — creates a concept step with `goal_id=0`
+- `!plan decompose` — decomposes pending concepts (any goal, including 0)
+- `!plan execute` — executes approved tasks (any goal, including 0)
+- `!plan run` — full pipeline: decompose → auto-approve → execute
+- These use `plan_engine.execute_pending_tasks()` directly, not the goal processor
+
+### Manual Commands
+
+| Command | Purpose |
+|---|---|
+| `!plan` | Show active plans (concept + task hierarchy) |
+| `!plan all` | Show all plans including completed |
+| `!plan <goal_id>` | Show plans for a specific goal |
+| `!plan decompose [goal_id]` | Decompose pending concept steps into tasks |
+| `!plan approve <concept_id>` | Approve proposed task steps under a concept |
+| `!plan reject <concept_id>` | Reject proposed task steps |
+| `!plan execute [goal_id]` | Execute approved task steps |
+| `!plan run [goal_id]` | Full pipeline: decompose → auto-approve → execute |
+| `!plan add <goal_id> <desc>` | Add a concept step to a goal |
+| `!plan adhoc <desc>` | Create a concept step without a goal |
+| `!plan auto` | Show goals with auto-process status |
+| `!plan auto approve <goal_id>` | Approve goal for autonomous execution |
+| `!plan auto reject <goal_id>` | Reject (never auto-process) |
+| `!plan auto defer <goal_id>` | Defer until datetime (default +24h) |
+| `!plan auto done <goal_id> <step_id>` | Mark user step done, resume execution |
+| `!plan auto trigger` | Wake goal processor immediately |
+| `!plan auto stats` | Show goal processor stats |
+
+### Config
+
+**Goal processor** (`plugins-enabled.json → plugin_config.goal_processor`):
 
 | Key | Default | Purpose |
 |---|---|---|
@@ -129,8 +219,6 @@ NULL → proposed → approved → executing → completed
 | `max_goals_per_cycle` | 3 | Max goals to propose per cycle |
 | `max_exec_steps_per_cycle` | 10 | Max steps to execute per cycle |
 | `defer_cooldown_hours` | 24 | Hours before re-proposing deferred goals |
-
-Manual commands: `!plan auto status`, `!plan auto approve/reject/defer/done/trigger/stats`.
 
 ---
 

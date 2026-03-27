@@ -209,7 +209,7 @@
       "description": "Google gemini-2.0-flash (extractor role)",
       "llm_call_timeout": 120,
       "llm_tools": [
-                "extract_files"
+        "extract_files"
       ],
       "system_prompt_folder": "system_prompt/005_fileops",
       "temperature": 0.0,
@@ -292,9 +292,9 @@
       "max_context": 100000,
       "enabled": true,
       "description": "Google gemini-2.5-flash (summarizer role)",
-      "llm_call_timeout": 120,
+      "llm_call_timeout": 300,
       "llm_tools": [
-                "drive",
+        "drive",
         "extract_files",
         "vscode"
       ],
@@ -317,7 +317,7 @@
       "description": "Anthropic claude-haiku-4-5 (summarizer role)",
       "llm_call_timeout": 120,
       "llm_tools": [
-                "drive",
+        "drive",
         "vscode"
       ],
       "system_prompt_folder": "system_prompt/003_claudeVSCode",
@@ -334,7 +334,7 @@
       "env_key": "ANTHROPIC_API_KEY",
       "max_context": 200000,
       "enabled": true,
-      "description": "Plan decomposer: concept steps → executable task steps (Sonnet 4.6)",
+      "description": "Plan decomposer: concept steps \u2192 executable task steps (Sonnet 4.6)",
       "llm_call_timeout": 90,
       "llm_tools": [],
       "system_prompt_folder": "none",
@@ -345,6 +345,47 @@
       "conv_log": false,
       "allow_text_mode": true,
       "memory_scan": false
+    },
+    "samaritan-voice-verbose": {
+      "database": "mymcp",
+      "model_id": "grok-4-1-fast-reasoning",
+      "type": "OPENAI",
+      "host": "https://api.x.ai/v1",
+      "env_key": "XAI_API_KEY",
+      "max_context": 40,
+      "enabled": true,
+      "description": "Samaritan conversation",
+      "llm_call_timeout": 90,
+      "llm_tools": [
+        "llm_call",
+        "llm_list"
+      ],
+      "system_prompt_folder": "system_prompt/004_voice_verbose",
+      "temperature": 0.6,
+      "top_p": 0.9,
+      "top_k": null,
+      "max_tokens": 4096,
+      "token_selection_setting": "custom",
+      "tool_suppress": true,
+      "memory_scan": false,
+      "memory_types_enabled": true,
+      "conv_log": true,
+      "agent_call_stream": true,
+      "stream_level": 3,
+      "xai_responses_api": true,
+      "identity_name": "samaritan",
+      "retry_on_503": {
+        "max_retries": 2,
+        "backoff": [
+          5,
+          15
+        ]
+      },
+      "backup_models": [
+        "samaritan-voice-backup1"
+      ],
+      "progress_response_freq": 10,
+      "progress_response_stages": false
     },
     "samaritan-voice": {
       "database": "mymcp",
@@ -357,13 +398,8 @@
       "description": "Samaritan conversation",
       "llm_call_timeout": 90,
       "llm_tools": [
-                "llm_call",
-        "llm_list",
-        "search_tavily",
-        "search_xai",
-        "search_brightdata",
-        "extract",
-        "memory_typed"
+        "llm_call",
+        "llm_list"
       ],
       "system_prompt_folder": "system_prompt/004_voice",
       "temperature": 0.6,
@@ -378,7 +414,46 @@
       "agent_call_stream": true,
       "stream_level": 3,
       "xai_responses_api": true,
-      "identity_name": "samaritan"
+      "identity_name": "samaritan",
+      "retry_on_503": {
+        "max_retries": 2,
+        "backoff": [
+          5,
+          15
+        ]
+      },
+      "backup_models": [
+        "samaritan-voice-backup1"
+      ],
+      "progress_response_freq": 10,
+      "progress_response_stages": false
+    },
+    "samaritan-voice-backup1": {
+      "database": "mymcp",
+      "model_id": "gpt-5.3-chat-latest",
+      "type": "OPENAI",
+      "host": "https://api.openai.com/v1",
+      "env_key": "OPENAI_API_KEY",
+      "max_context": 40,
+      "enabled": true,
+      "description": "Samaritan conversation (OpenAI backup for xAI 503)",
+      "llm_call_timeout": 90,
+      "llm_tools": [
+        "llm_call",
+        "llm_list"
+      ],
+      "system_prompt_folder": "system_prompt/004_voice",
+      "max_tokens": 4096,
+      "tool_suppress": true,
+      "memory_scan": false,
+      "memory_types_enabled": true,
+      "conv_log": true,
+      "agent_call_stream": true,
+      "stream_level": 3,
+      "openai_responses_api": true,
+      "identity_name": "samaritan",
+      "progress_response_freq": 10,
+      "progress_response_stages": false
     },
     "samaritan-voice-fast": {
       "database": "mymcp",
@@ -392,12 +467,7 @@
       "llm_call_timeout": 60,
       "llm_tools": [
         "llm_call",
-        "llm_list",
-        "search_tavily",
-        "search_xai",
-        "search_brightdata",
-        "extract",
-        "memory_typed"
+        "llm_list"
       ],
       "system_prompt_folder": "system_prompt/004_voice",
       "temperature": 0.6,
@@ -412,7 +482,19 @@
       "agent_call_stream": true,
       "stream_level": 3,
       "xai_responses_api": true,
-      "identity_name": "samaritan"
+      "identity_name": "samaritan",
+      "retry_on_503": {
+        "max_retries": 2,
+        "backoff": [
+          5,
+          15
+        ]
+      },
+      "backup_models": [
+        "samaritan-voice-backup1"
+      ],
+      "progress_response_freq": 10,
+      "progress_response_stages": false
     },
     "default-chat": {
       "database": "default",
@@ -422,13 +504,11 @@
       "env_key": "XAI_API_KEY",
       "max_context": 20000,
       "enabled": true,
-      "description": "Default chat assistant — warm, helpful, per-session DB",
+      "description": "Default chat assistant \u2014 warm, helpful, per-session DB",
       "llm_call_timeout": 120,
       "llm_tools": [
-        "search_tavily",
-        "search_xai",
-        "search_brightdata",
-        "extract"
+        "llm_call",
+        "llm_list"
       ],
       "system_prompt_folder": "system_prompt/008_default",
       "temperature": 0.6,
@@ -454,11 +534,7 @@
       "llm_tools": [
         "db_query",
         "llm_call",
-        "llm_list",
-        "search_tavily",
-        "search_xai",
-        "search_brightdata",
-        "extract"
+        "llm_list"
       ],
       "system_prompt_folder": "system_prompt/004_reasoning",
       "temperature": 0.4,
@@ -471,9 +547,11 @@
       "conv_log": true,
       "identity_name": "samaritan",
       "xai_responses_api": true,
-      "allow_text_mode": false
+      "allow_text_mode": false,
+      "progress_response_freq": 10,
+      "progress_response_stages": false
     },
-    "samaritan-execution": {
+    "gpt-4o-execution": {
       "database": "mymcp",
       "model_id": "gpt-4o-mini",
       "type": "OPENAI",
@@ -481,16 +559,25 @@
       "env_key": "OPENAI_API_KEY",
       "max_context": 100000,
       "enabled": true,
-      "description": "Samaritan execution arm (gpt-4o-mini, obedient tool caller)",
+      "description": "Samaritan execution backup (gpt-4o-mini, obedient tool caller)",
       "llm_call_timeout": 120,
       "llm_tools": [
-        "core",
-        "db",
-        "drive",
-        "search",
+        "db_query",
+        "search_tavily",
+        "search_xai",
+        "search_brightdata",
+        "search_perplexity",
+        "google_drive",
+        "google_calendar",
+        "geocode",
+        "places",
+        "weather",
+        "url_extract",
+        "url_extract_brightdata",
         "memory",
         "memory_typed",
-        "procedures"
+        "procedures",
+        "prob_calc"
       ],
       "system_prompt_folder": "system_prompt/004_execution",
       "temperature": 0.1,
@@ -517,58 +604,6 @@
       "system_prompt_folder": "system_prompt/007_judge",
       "token_selection_setting": "custom",
       "memory_enabled": false
-    },
-    "friendli-llama31": {
-      "database": "mymcp",
-      "model_id": "meta-llama-3.1-8b-instruct",
-      "type": "OPENAI",
-      "host": "https://api.friendli.ai/serverless/v1",
-      "env_key": "FRIENDLI_TOKEN",
-      "max_context": 2000,
-      "enabled": true,
-      "description": "FriendliAI Llama-3.1-8B-Instruct (serverless)",
-      "llm_call_timeout": 60,
-      "llm_tools": [
-        "core",
-        "admin",
-        "db",
-        "search",
-        "drive",
-        "extract",
-        "agent",
-        "vscode"
-      ],
-      "system_prompt_folder": "system_prompt/004_reasoning",
-      "temperature": 1.0,
-      "top_p": 1.0,
-      "top_k": null,
-      "token_selection_setting": "default"
-    },
-    "friendli-llama31-executor": {
-      "database": "mymcp",
-      "model_id": "meta-llama-3.1-8b-instruct",
-      "type": "OPENAI",
-      "host": "https://api.friendli.ai/serverless/v1",
-      "env_key": "FRIENDLI_TOKEN",
-      "max_context": 8000,
-      "enabled": false,
-      "description": "FriendliAI Llama-3.1-8B-Instruct — FAILED executor eval: hallucinates tool outputs",
-      "llm_call_timeout": 90,
-      "llm_tools": [
-        "db",
-        "search",
-        "drive",
-        "extract"
-      ],
-      "system_prompt_folder": "system_prompt/004_execution",
-      "temperature": 0.0,
-      "top_p": 0.1,
-      "top_k": null,
-      "token_selection_setting": "custom",
-      "llm_tools_gates": [],
-      "memory_enabled": false,
-      "conv_log": false,
-      "allow_text_mode": false
     },
     "ged-planner": {
       "database": "default",
@@ -620,7 +655,8 @@
       "llm_call_timeout": 120,
       "llm_tools": [
         "llm_call",
-        "db_query"
+        "db_query",
+        "prob_calc"
       ],
       "system_prompt_folder": "system_prompt/009_ged_math",
       "temperature": 0.6,
@@ -695,7 +731,8 @@
       "llm_call_timeout": 120,
       "llm_tools": [
         "llm_call",
-        "db_query"
+        "db_query",
+        "prob_calc"
       ],
       "system_prompt_folder": "system_prompt/009_ged_science",
       "temperature": 0.6,
@@ -733,51 +770,191 @@
       "xai_responses_api": true,
       "memory_enabled": true
     },
-    "friendli-qwen3-executor": {
+    "samaritan-execution": {
       "database": "mymcp",
-      "model_id": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+      "model_id": "deepseek-ai/DeepSeek-V3.2",
       "type": "OPENAI",
       "host": "https://api.friendli.ai/serverless/v1",
       "env_key": "FRIENDLI_TOKEN",
       "max_context": 8000,
       "enabled": true,
-      "description": "FriendliAI Qwen3-235B-A22B — single-step executor eval (db, drive, search, extract)",
-      "llm_call_timeout": 90,
+      "description": "FriendliAI DeepSeek-V3.2 \u2014 reliable tool executor (0.50/1.50 per M tok)",
+      "llm_call_timeout": 120,
       "llm_tools": [
         "db_query",
         "search_tavily",
         "search_xai",
         "search_brightdata",
+        "search_perplexity",
         "google_drive",
+        "google_calendar",
+        "geocode",
+        "places",
+        "weather",
         "url_extract",
-        "url_extract_brightdata"
+        "url_extract_brightdata",
+        "file_extract",
+        "memory",
+        "memory_typed",
+        "procedures",
+        "prob_calc",
+        "sms"
       ],
       "system_prompt_folder": "system_prompt/004_execution",
-      "temperature": 0.0,
-      "top_p": 0.1,
+      "temperature": 0.1,
+      "top_p": 0.5,
       "top_k": null,
       "token_selection_setting": "custom",
       "llm_tools_gates": [],
       "memory_enabled": false,
+      "memory_types_enabled": true,
       "conv_log": false,
-      "allow_text_mode": false
+      "allow_text_mode": false,
+      "backup_models": ["gpt-4o-execution"]
+    },
+    "deliberation-grok": {
+      "database": "mymcp",
+      "model_id": "grok-4.20-beta-0309-reasoning",
+      "type": "OPENAI",
+      "host": "https://api.x.ai/v1",
+      "env_key": "XAI_API_KEY",
+      "max_context": 50000,
+      "enabled": true,
+      "description": "Deliberation panel: Grok 4.20 beta (multi-agent internal debate, reasoning mode)",
+      "llm_call_timeout": 180,
+      "llm_tools": [],
+      "system_prompt_folder": "none",
+      "temperature": 0.3,
+      "top_p": 0.9,
+      "max_tokens": 8192,
+      "token_selection_setting": "custom",
+      "memory_enabled": false,
+      "conv_log": false,
+      "memory_scan": false,
+      "xai_responses_api": true
+    },
+    "deliberation-gpt": {
+      "database": "mymcp",
+      "model_id": "gpt-5.4",
+      "type": "OPENAI",
+      "host": "https://api.openai.com/v1",
+      "env_key": "OPENAI_API_KEY",
+      "max_context": 50000,
+      "enabled": true,
+      "description": "Deliberation panel: GPT-5.4 (xhigh reasoning effort, frontier model)",
+      "llm_call_timeout": 180,
+      "llm_tools": [],
+      "system_prompt_folder": "none",
+      "temperature": 0.3,
+      "top_p": 0.9,
+      "top_k": null,
+      "max_tokens": 8192,
+      "token_selection_setting": "custom",
+      "memory_enabled": false,
+      "conv_log": false,
+      "memory_scan": false,
+      "openai_responses_api": true
+    },
+    "deliberation-gemini": {
+      "database": "mymcp",
+      "model_id": "gemini-3.1-pro-preview",
+      "type": "GEMINI",
+      "host": null,
+      "env_key": "GEMINI_API_KEY",
+      "max_context": 50000,
+      "enabled": true,
+      "description": "Deliberation panel: Gemini 3.1 Pro Preview (highest Gemini reasoning tier)",
+      "llm_call_timeout": 180,
+      "llm_tools": [],
+      "system_prompt_folder": "none",
+      "temperature": 0.3,
+      "top_p": 0.9,
+      "top_k": 20,
+      "max_tokens": 8192,
+      "token_selection_setting": "custom",
+      "memory_enabled": false,
+      "conv_log": false,
+      "memory_scan": false
+    },
+    "reason-grok": {
+      "database": "mymcp",
+      "model_id": "grok-4-1-fast-reasoning",
+      "type": "OPENAI",
+      "host": "https://api.x.ai/v1",
+      "env_key": "XAI_API_KEY",
+      "max_context": 30000,
+      "enabled": true,
+      "description": "Reasoning panel (cost-effective): Grok 4.1 Fast reasoning — $0.20/$0.50 per 1M tokens",
+      "llm_call_timeout": 120,
+      "llm_tools": [],
+      "system_prompt_folder": "none",
+      "temperature": 0.4,
+      "top_p": 0.9,
+      "max_tokens": 4096,
+      "token_selection_setting": "custom",
+      "memory_enabled": false,
+      "conv_log": false,
+      "memory_scan": false,
+      "xai_responses_api": true
+    },
+    "reason-gpt": {
+      "database": "mymcp",
+      "model_id": "gpt-5-mini",
+      "type": "OPENAI",
+      "host": "https://api.openai.com/v1",
+      "env_key": "OPENAI_API_KEY",
+      "max_context": 30000,
+      "enabled": true,
+      "description": "Reasoning panel (cost-effective): GPT-5 Mini — $0.25/$2.00 per 1M tokens",
+      "llm_call_timeout": 120,
+      "llm_tools": [],
+      "system_prompt_folder": "none",
+      "temperature": 0.4,
+      "top_p": 0.9,
+      "top_k": null,
+      "max_tokens": 4096,
+      "token_selection_setting": "custom",
+      "memory_enabled": false,
+      "conv_log": false,
+      "memory_scan": false,
+      "openai_responses_api": true
+    },
+    "reason-gemini": {
+      "database": "mymcp",
+      "model_id": "gemini-2.5-flash",
+      "type": "GEMINI",
+      "host": null,
+      "env_key": "GEMINI_API_KEY",
+      "max_context": 30000,
+      "enabled": true,
+      "description": "Reasoning panel (cost-effective): Gemini 2.5 Flash — $0.30/$2.50 per 1M tokens",
+      "llm_call_timeout": 120,
+      "llm_tools": [],
+      "system_prompt_folder": "none",
+      "temperature": 0.4,
+      "top_p": 0.9,
+      "top_k": 20,
+      "max_tokens": 4096,
+      "token_selection_setting": "custom",
+      "memory_enabled": false,
+      "conv_log": false,
+      "memory_scan": false
     }
   },
   "model_roles": {
-    "summarizer":              "summarizer-anthropic",
-    "reviewer":                "reviewer-gemini",
-    "extractor":               "extractor-gemini",
-    "judge":                   "judge-gemini",
-    "plan_decomposer":         "plan-decomposer",
-    "plan_executor":           "friendli-qwen3-executor",
-    "plan_executor_fallback":  "samaritan-execution",
-    "contradiction":           "qwen25-cogn",
-    "prospective":             "qwen25-cogn",
-    "reflection":              "summarizer-gemini",
-    "goal_health":             "samaritan-reasoning",
-    "temporal_inference":      "summarizer-gemini",
-    "ged_planner":             "ged-planner",
-    "ged_quiz":                "ged-quiz-gen"
+    "summarizer": "summarizer-anthropic",
+    "reviewer": "reviewer-gemini",
+    "extractor": "extractor-gemini",
+    "judge": "judge-gemini",
+    "plan_decomposer": "plan-decomposer",
+    "plan_executor": "samaritan-execution",
+    "contradiction": "qwen25-cogn",
+    "prospective": "qwen25-cogn",
+    "reflection": "summarizer-gemini",
+    "goal_health": "samaritan-reasoning",
+    "temporal_inference": "summarizer-gemini",
+    "ged_planner": "ged-planner",
+    "ged_quiz": "ged-quiz-gen"
   },
   "limits": {
     "max_at_llm_depth": 1,

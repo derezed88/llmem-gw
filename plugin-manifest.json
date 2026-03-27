@@ -184,6 +184,24 @@
         "search_brightdata"
       ]
     },
+    "plugin_search_perplexity": {
+      "type": "data_tool",
+      "file": "plugin_search_perplexity.py",
+      "description": "Web search via Perplexity AI (raw search, sonar AI answers, agent research)",
+      "dependencies": [
+        "httpx"
+      ],
+      "env_vars": [
+        "PERPLEXITY_API_KEY"
+      ],
+      "config_files": [],
+      "priority": 350,
+      "tools": [
+        "perplexity_search",
+        "sonar_answer",
+        "perplexity_research"
+      ]
+    },
     "plugin_urlextract_tavily": {
       "type": "data_tool",
       "file": "plugin_urlextract_tavily.py",
@@ -242,6 +260,82 @@
       "config_files": [],
       "priority": 25
     },
+    "plugin_calendar_google": {
+      "type": "data_tool",
+      "file": "plugin_calendar_google.py",
+      "description": "Google Calendar read-only operations (list calendars, events, freebusy)",
+      "dependencies": [
+        "google-auth",
+        "google-auth-oauthlib",
+        "google-api-python-client"
+      ],
+      "env_vars": [],
+      "config_files": [
+        "credentials.json",
+        "token_calendar.json"
+      ],
+      "priority": 210,
+      "tools": [
+        "google_calendar"
+      ]
+    },
+    "plugin_places_google": {
+      "type": "data_tool",
+      "file": "plugin_places_google.py",
+      "description": "Google Places API (nearby search, text search, place details)",
+      "dependencies": [
+        "httpx"
+      ],
+      "env_vars": [
+        "GEMINI_API_KEY"
+      ],
+      "config_files": [],
+      "priority": 215,
+      "tools": [
+        "places"
+      ]
+    },
+    "plugin_weather_google": {
+      "type": "data_tool",
+      "file": "plugin_weather_google.py",
+      "description": "Google Maps Weather API (current conditions, daily/hourly forecasts, alerts)",
+      "dependencies": [
+        "httpx"
+      ],
+      "env_vars": [
+        "GEMINI_API_KEY"
+      ],
+      "config_files": [],
+      "priority": 225,
+      "tools": [
+        "weather"
+      ]
+    },
+    "plugin_geocode_google": {
+      "type": "data_tool",
+      "file": "plugin_geocode_google.py",
+      "description": "Google Maps Geocoding with permanent coordinate cache (place name to lat/lng)",
+      "dependencies": [
+        "googlemaps"
+      ],
+      "env_vars": [
+        "GEMINI_API_KEY"
+      ],
+      "config_files": [],
+      "priority": 220,
+      "tools": [
+        "geocode"
+      ]
+    },
+    "plugin_sms_proxy": {
+      "type": "client_interface",
+      "file": "plugin_sms_proxy.py",
+      "description": "SMS relay via macOS Messages proxy — notifier integration and !sms commands",
+      "dependencies": [],
+      "env_vars": [],
+      "config_files": [],
+      "priority": 35
+    },
     "plugin_tmux": {
       "type": "data_tool",
       "file": "plugin_tmux.py",
@@ -259,6 +353,19 @@
         "tmux_history",
         "tmux_history_limit"
       ]
+    },
+    "plugin_mcp_direct": {
+      "type": "client_interface",
+      "file": "plugin_mcp_direct.py",
+      "description": "Direct MCP access for Claude Code — memory, goals, plans, DB, Drive, calendar bypassing LLM routing",
+      "dependencies": [
+        "mcp>=1.20"
+      ],
+      "env_vars": [],
+      "config_files": [],
+      "priority": 40,
+      "port_config_key": "mcp_direct_port",
+      "default_port": 8769
     }
   },
   "metadata": {

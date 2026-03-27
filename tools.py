@@ -1,4 +1,5 @@
 import datetime
+import os
 import platform
 from mcp.server.fastmcp import FastMCP
 from langchain_core.tools import StructuredTool
@@ -319,6 +320,8 @@ def get_tool_executor(tool_name: str):
         'save_memory_typed':     _save_memory_typed_exec,
         'procedure_save':        _procedure_save_exec,
         'procedure_recall':      _procedure_recall_exec,
+        'prob_calc':             _prob_calc_exec,
+        'sms_send':              _sms_send_exec,
     }
 
     if tool_name in core_executors:
@@ -611,6 +614,44 @@ class _RecallTemporalArgs(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Probability calculator
+# ---------------------------------------------------------------------------
+
+class _ProbCalcArgs(BaseModel):
+    operation: str = Field(
+        description=(
+            "Which probability operation to compute. One of:\n"
+            "  'intersection' — P(A∩B) = P(A) * P(B|A), or P(A) * P(B) if independent\n"
+            "  'union' — P(A∪B) = P(A) + P(B) - P(A∩B)\n"
+            "  'conditional' — P(A|B) = P(A∩B) / P(B)\n"
+            "  'complement' — P(not A) = 1 - P(A)\n"
+            "  'bayes' — P(A|B) = P(B|A) * P(A) / P(B)\n"
+            "  'chain' — P(A1 ∩ A2 ∩ ... ∩ An) for sequential dependent events\n"
+            "  'binomial' — P(X=k) = C(n,k) * p^k * (1-p)^(n-k)\n"
+            "  'permutation' — P(n,r) = n! / (n-r)!\n"
+            "  'combination' — C(n,r) = n! / (r!(n-r)!)\n"
+            "  'expected_value' — E[X] = Σ(x_i * p_i)\n"
+            "  'joint_independent' — P(A∩B∩C∩...) = product of all probabilities"
+        )
+    )
+    p_a: float = Field(default=0.0, description="P(A) — probability of event A (0.0 to 1.0)")
+    p_b: float = Field(default=0.0, description="P(B) — probability of event B (0.0 to 1.0)")
+    p_a_and_b: float = Field(default=0.0, description="P(A∩B) — joint probability (for union/conditional)")
+    p_b_given_a: float = Field(default=0.0, description="P(B|A) — conditional prob of B given A (for intersection/bayes)")
+    n: int = Field(default=0, description="Total items or trials (for combination/permutation/binomial)")
+    r: int = Field(default=0, description="Items chosen (for combination/permutation)")
+    k: int = Field(default=0, description="Exact successes (for binomial)")
+    p: float = Field(default=0.0, description="Success probability per trial (for binomial)")
+    values: str = Field(default="", description="JSON array of floats for chain/joint_independent, or [[value, prob], ...] pairs for expected_value. E.g. '[0.9, 0.8, 0.7]' or '[[10, 0.3], [20, 0.5], [30, 0.2]]'")
+
+
+class _SmsSendArgs(BaseModel):
+    message: str = Field(description="The SMS text to send.")
+    phone: str = Field(default="", description="Recipient phone number in E.164 format (e.g. '+14155551234'). Required if name is not provided.")
+    name: str = Field(default="", description="Recipient name to look up in the person table (e.g. 'Lee'). The phone number will be resolved from the database.")
+
+
+# ---------------------------------------------------------------------------
 # Typed memory tools: set_goal, set_plan, assert_belief
 # ---------------------------------------------------------------------------
 
@@ -632,7 +673,7 @@ class _SetPlanArgs(BaseModel):
     id: int = Field(default=0, description="Existing plan step id to update. 0 = create new.")
     memory_link: str = Field(default="", description="JSON array of memory row IDs related to this step.")
     step_type: str = Field(default="concept", description="'concept' (human-readable intent) or 'task' (executable atom).")
-    target: str = Field(default="model", description="'model' (auto-executable), 'human' (requires person), or 'investigate' (needs analysis).")
+    target: str = Field(default="model", description="'model' (auto-executable), 'human' (requires person), 'investigate' (needs analysis), or 'claude-code' (queued for Claude Code).")
     approval: str = Field(default="proposed", description="'proposed' (needs review), 'approved', 'rejected', or 'auto'.")
 
 class _AssertBeliefArgs(BaseModel):
@@ -692,8 +733,16 @@ async def _procedure_save_exec(
         steps_list = _json.loads(steps) if isinstance(steps, str) else steps
         if not isinstance(steps_list, list):
             return "procedure_save: 'steps' must be a JSON array."
-    except Exception as e:
-        return f"procedure_save: steps JSON parse failed: {e}"
+    except Exception:
+        # Fallback: split numbered plain-text steps ("1. Do X 2. Do Y" or "1. Do X\n2. Do Y")
+        import re as _re
+        parts = _re.split(r'\s*\d+\.\s+', steps.strip())
+        steps_list = [{"action": s.strip()} for s in parts if s.strip()]
+        if not steps_list:
+            return "procedure_save: 'steps' must be a JSON array or numbered list."
+    # Normalize: if items are plain strings, wrap in {"action": ...}
+    if steps_list and isinstance(steps_list[0], str):
+        steps_list = [{"action": s} for s in steps_list]
     row_id = await save_procedure(
         topic=topic, task_type=task_type, steps=steps_list,
         outcome=outcome, notes=notes, importance=importance,
@@ -979,17 +1028,48 @@ async def _set_plan_exec(
     session_id = current_client_id.get("") or ""
     status = status if status in ("pending", "in_progress", "done", "skipped") else "pending"
     step_type = step_type if step_type in ("concept", "task") else "concept"
-    target = target if target in ("model", "human", "investigate") else "model"
+    target = target if target in ("model", "human", "investigate", "claude-code") else "model"
     approval = approval if approval in ("proposed", "approved", "rejected", "auto") else "proposed"
     ml_val = memory_link.replace("'", "''") if memory_link else "NULL"
 
     if id and id > 0:
+        # ── Guard: read current step state for validation ────────
+        from database import fetch_dicts as _fd_guard
+        _cur = await _fd_guard(
+            f"SELECT status, approval, description FROM {_PLANS()} WHERE id = {id} LIMIT 1"
+        )
+        if not _cur:
+            return f"set_plan: step id={id} not found."
+        _cur_status = _cur[0]["status"]
+        _cur_approval = _cur[0]["approval"]
+
+        # ── Guard 1: LLM cannot self-approve plan steps ──────────
+        if approval in ("approved", "auto") and _cur_approval not in ("approved", "auto"):
+            return (
+                f"set_plan DENIED: cannot set approval='{approval}' on step id={id} "
+                f"(current approval='{_cur_approval}'). Use !plan approve <concept_id> instead."
+            )
+
+        # ── Guard 2: cannot mark done unless step is approved ────
+        if status == "done" and _cur_approval not in ("approved", "auto"):
+            return (
+                f"set_plan DENIED: cannot set status='done' on step id={id} — "
+                f"step must be approved first (current approval='{_cur_approval}'). "
+                f"Use !plan approve <concept_id> to approve, then execute via plan engine."
+            )
+
+        # ── Guard 3: cannot rewrite description of completed steps
+        if description and _cur_status == "done":
+            return (
+                f"set_plan DENIED: cannot modify description of completed step id={id}."
+            )
+
         parts = [f"status = '{status}'"]
         if description:
             parts.append(f"description = '{description.replace(chr(39), chr(39)*2)}'")
         if memory_link:
             parts.append(f"memory_link = '{ml_val}'")
-        # Allow updating target and approval on existing steps
+        # Allow updating target; approval kept as-is (guarded above)
         parts.append(f"target = '{target}'")
         parts.append(f"approval = '{approval}'")
         sql = f"UPDATE {_PLANS()} SET {', '.join(parts)} WHERE id = {id}"
@@ -1017,6 +1097,11 @@ async def _set_plan_exec(
     else:
         if not description:
             return "set_plan: description is required for new steps."
+        # ── Guard: new steps cannot be pre-approved or pre-completed ──
+        if approval in ("approved", "auto"):
+            approval = "proposed"  # force to proposed; approval via !plan approve
+        if status == "done":
+            return "set_plan DENIED: cannot create a new step with status='done'. Steps must be approved and executed through the plan engine."
         d = description.replace("'", "''")
         _ml = "NULL" if not memory_link else f"'{ml_val}'"
         sql = (
@@ -1250,7 +1335,10 @@ async def _memory_save_exec(topic: str, content: str, importance: int = 5, sourc
     return f"Memory saved (id={row_id}): [{topic}] {content} (importance={importance})"
 
 
-async def _memory_recall_exec(topic: str = "", tier: str = "short", limit: int = 20) -> str:
+async def _memory_recall_exec(topic: str = "", tier: str = "short", limit: int = 20, query: str = "") -> str:
+    # LLMs sometimes pass 'query' instead of 'topic' — treat as alias
+    if not topic and query:
+        topic = query
     from memory import load_short_term, load_long_term
     if tier == "long":
         rows = await load_long_term(limit=limit, topic=topic)
@@ -1500,6 +1588,295 @@ async def _memory_update_exec(id: int, tier: str = "short", importance: int = 0,
         content=content if content else None,
         topic=topic if topic else None,
     )
+
+
+# ---------------------------------------------------------------------------
+# SMS send executor
+# ---------------------------------------------------------------------------
+
+async def _sms_send_exec(message: str, phone: str = "", name: str = "") -> str:
+    """Send an SMS via the sms_proxy plugin outbound queue.
+
+    Resolves phone from the person table if name is given.
+    If phone is given without name, reverse-looks up the name.
+    """
+    import asyncio as _aio
+
+    if not phone and not name:
+        return "ERROR: Either 'phone' or 'name' must be provided."
+
+    display_name = name  # what we show in the response
+
+    def _db_lookup_by_name(n):
+        import mysql.connector
+        conn = mysql.connector.connect(
+            host="localhost",
+            user=os.getenv("MYSQL_USER"),
+            password=os.getenv("MYSQL_PASS"),
+            database="mymcp",
+        )
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT nickname, full_name, phone FROM person "
+                "WHERE (full_name LIKE %s OR nickname LIKE %s) AND phone IS NOT NULL "
+                "LIMIT 5",
+                (f"%{n}%", f"%{n}%"),
+            )
+            return cur.fetchall()
+        finally:
+            cur.close()
+            conn.close()
+
+    def _db_lookup_by_phone(p):
+        import mysql.connector
+        conn = mysql.connector.connect(
+            host="localhost",
+            user=os.getenv("MYSQL_USER"),
+            password=os.getenv("MYSQL_PASS"),
+            database="mymcp",
+        )
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT nickname, full_name FROM person WHERE phone = %s LIMIT 1", (p,))
+            return cur.fetchone()
+        finally:
+            cur.close()
+            conn.close()
+
+    # Resolve phone from name
+    if name and not phone:
+        rows = await _aio.to_thread(_db_lookup_by_name, name)
+        if not rows:
+            return f"ERROR: No person named '{name}' found with a phone number in the database."
+        if len(rows) > 1:
+            matches = ", ".join(f"{r[0] or r[1]}" for r in rows)
+            return f"ERROR: Multiple matches for '{name}': {matches}. Please specify the phone number directly."
+        display_name = rows[0][0] or rows[0][1]  # nickname first
+        phone = rows[0][2]
+        log.info(f"sms_send: resolved '{name}' → {display_name} ({phone})")
+
+    # Reverse-lookup name from phone
+    if phone and not display_name:
+        row = await _aio.to_thread(_db_lookup_by_phone, phone)
+        if row:
+            display_name = row[0] or row[1]  # nickname first
+
+    if not phone:
+        return "ERROR: Could not resolve phone number."
+
+    # Queue via plugin_sms_proxy
+    try:
+        import plugin_sms_proxy as _sms_mod
+    except ImportError:
+        return "ERROR: plugin_sms_proxy is not loaded."
+
+    if not _sms_mod._is_enabled():
+        return "ERROR: SMS relay is disabled. Use !sms enable to turn it on."
+
+    _sms_mod._outbound_counter += 1
+    from state import current_client_id as _ccid
+    _sms_mod._outbound.append({
+        "id": _sms_mod._outbound_counter,
+        "phone": phone,
+        "text": message,
+        "timestamp": __import__("time").time(),
+        "from_session": _ccid.get(""),
+    })
+
+    recipient = display_name or phone
+    log.info(f"sms_send: queued → {recipient}: {message[:80]}")
+    return f"SMS sent to {recipient}. {message[:80]}{'...' if len(message) > 80 else ''}"
+
+
+# ---------------------------------------------------------------------------
+# Probability calculator executor
+# ---------------------------------------------------------------------------
+
+async def _prob_calc_exec(
+    operation: str,
+    p_a: float = 0.0,
+    p_b: float = 0.0,
+    p_a_and_b: float = 0.0,
+    p_b_given_a: float = 0.0,
+    n: int = 0,
+    r: int = 0,
+    k: int = 0,
+    p: float = 0.0,
+    values: str = "",
+) -> str:
+    """Pure-math probability calculator. Returns JSON with result and formula."""
+    import json as _json
+    import math as _math
+
+    def _err(msg: str) -> str:
+        return _json.dumps({"error": msg})
+
+    def _ok(result: float, formula: str, inputs: dict) -> str:
+        return _json.dumps({
+            "operation": operation,
+            "result": round(result, 10),
+            "formula": formula,
+            "inputs": inputs,
+        })
+
+    def _validate_prob(val: float, name: str) -> str | None:
+        if val < 0.0 or val > 1.0:
+            return f"{name}={val} must be between 0.0 and 1.0"
+        return None
+
+    def _parse_values() -> list | str:
+        if not values or not values.strip():
+            return "values parameter is required for this operation"
+        try:
+            parsed = _json.loads(values)
+        except _json.JSONDecodeError as e:
+            return f"values is not valid JSON: {e}"
+        if not isinstance(parsed, list) or len(parsed) == 0:
+            return "values must be a non-empty JSON array"
+        return parsed
+
+    op = operation.strip().lower()
+
+    if op == "complement":
+        err = _validate_prob(p_a, "p_a")
+        if err:
+            return _err(err)
+        result = 1.0 - p_a
+        return _ok(result, "P(not A) = 1 - P(A)", {"p_a": p_a})
+
+    elif op == "intersection":
+        err = _validate_prob(p_a, "p_a")
+        if err:
+            return _err(err)
+        if p_b_given_a > 0:
+            err = _validate_prob(p_b_given_a, "p_b_given_a")
+            if err:
+                return _err(err)
+            result = p_a * p_b_given_a
+            return _ok(result, "P(A∩B) = P(A) × P(B|A)", {"p_a": p_a, "p_b_given_a": p_b_given_a})
+        else:
+            err = _validate_prob(p_b, "p_b")
+            if err:
+                return _err(err)
+            result = p_a * p_b
+            return _ok(result, "P(A∩B) = P(A) × P(B) [independent]", {"p_a": p_a, "p_b": p_b})
+
+    elif op == "union":
+        for name, val in [("p_a", p_a), ("p_b", p_b), ("p_a_and_b", p_a_and_b)]:
+            err = _validate_prob(val, name)
+            if err:
+                return _err(err)
+        result = p_a + p_b - p_a_and_b
+        return _ok(result, "P(A∪B) = P(A) + P(B) - P(A∩B)", {"p_a": p_a, "p_b": p_b, "p_a_and_b": p_a_and_b})
+
+    elif op == "conditional":
+        err = _validate_prob(p_a_and_b, "p_a_and_b")
+        if err:
+            return _err(err)
+        err = _validate_prob(p_b, "p_b")
+        if err:
+            return _err(err)
+        if p_b == 0:
+            return _err("P(B) cannot be 0 (division by zero)")
+        result = p_a_and_b / p_b
+        return _ok(result, "P(A|B) = P(A∩B) / P(B)", {"p_a_and_b": p_a_and_b, "p_b": p_b})
+
+    elif op == "bayes":
+        for name, val in [("p_b_given_a", p_b_given_a), ("p_a", p_a), ("p_b", p_b)]:
+            err = _validate_prob(val, name)
+            if err:
+                return _err(err)
+        if p_b == 0:
+            return _err("P(B) cannot be 0 (division by zero)")
+        result = (p_b_given_a * p_a) / p_b
+        return _ok(result, "P(A|B) = P(B|A) × P(A) / P(B)", {"p_b_given_a": p_b_given_a, "p_a": p_a, "p_b": p_b})
+
+    elif op == "chain":
+        parsed = _parse_values()
+        if isinstance(parsed, str):
+            return _err(parsed)
+        result = 1.0
+        for i, v in enumerate(parsed):
+            if not isinstance(v, (int, float)):
+                return _err(f"values[{i}] = {v} is not a number")
+            err = _validate_prob(float(v), f"values[{i}]")
+            if err:
+                return _err(err)
+            result *= float(v)
+        return _ok(result, "P(A1∩A2∩...∩An) = P(A1) × P(A2|A1) × ... × P(An|A1...An-1)", {"values": parsed})
+
+    elif op == "joint_independent":
+        parsed = _parse_values()
+        if isinstance(parsed, str):
+            return _err(parsed)
+        result = 1.0
+        for i, v in enumerate(parsed):
+            if not isinstance(v, (int, float)):
+                return _err(f"values[{i}] = {v} is not a number")
+            err = _validate_prob(float(v), f"values[{i}]")
+            if err:
+                return _err(err)
+            result *= float(v)
+        return _ok(result, "P(A∩B∩C∩...) = P(A) × P(B) × P(C) × ... [independent]", {"values": parsed})
+
+    elif op == "binomial":
+        if n < 0:
+            return _err("n must be non-negative")
+        if n > 1000:
+            return _err("n must be ≤ 1000 (computational limit)")
+        if k < 0 or k > n:
+            return _err(f"k={k} must be between 0 and n={n}")
+        err = _validate_prob(p, "p")
+        if err:
+            return _err(err)
+        coeff = _math.comb(n, k)
+        result = coeff * (p ** k) * ((1 - p) ** (n - k))
+        return _ok(result, f"P(X={k}) = C({n},{k}) × p^{k} × (1-p)^{n-k}", {"n": n, "k": k, "p": p, "C(n,k)": coeff})
+
+    elif op == "permutation":
+        if n < 0 or r < 0:
+            return _err("n and r must be non-negative")
+        if n > 1000:
+            return _err("n must be ≤ 1000 (computational limit)")
+        if r > n:
+            return _err(f"r={r} cannot exceed n={n}")
+        result = float(_math.perm(n, r))
+        return _ok(result, f"P({n},{r}) = {n}! / ({n}-{r})!", {"n": n, "r": r})
+
+    elif op == "combination":
+        if n < 0 or r < 0:
+            return _err("n and r must be non-negative")
+        if n > 1000:
+            return _err("n must be ≤ 1000 (computational limit)")
+        if r > n:
+            return _err(f"r={r} cannot exceed n={n}")
+        result = float(_math.comb(n, r))
+        return _ok(result, f"C({n},{r}) = {n}! / ({r}! × ({n}-{r})!)", {"n": n, "r": r})
+
+    elif op == "expected_value":
+        parsed = _parse_values()
+        if isinstance(parsed, str):
+            return _err(parsed)
+        result = 0.0
+        prob_sum = 0.0
+        for i, pair in enumerate(parsed):
+            if not isinstance(pair, list) or len(pair) != 2:
+                return _err(f"values[{i}] must be [value, probability], got {pair}")
+            val, prob = float(pair[0]), float(pair[1])
+            err = _validate_prob(prob, f"values[{i}][1]")
+            if err:
+                return _err(err)
+            result += val * prob
+            prob_sum += prob
+        inputs = {"pairs": parsed, "probability_sum": round(prob_sum, 10)}
+        if abs(prob_sum - 1.0) > 0.01:
+            inputs["warning"] = f"probabilities sum to {prob_sum:.4f}, not 1.0"
+        return _ok(result, "E[X] = Σ(x_i × p_i)", inputs)
+
+    else:
+        valid = "intersection, union, conditional, complement, bayes, chain, binomial, permutation, combination, expected_value, joint_independent"
+        return _err(f"Unknown operation '{operation}'. Valid: {valid}")
 
 
 # ---------------------------------------------------------------------------
@@ -2141,8 +2518,9 @@ def _make_core_lc_tools() -> list:
             coroutine=_session_exec,
             name="session",
             description=(
-                "Manage agent sessions. action='list' shows all active sessions. "
-                "action='delete' removes a session (requires session_id, can be shorthand integer or full ID)."
+                "Manage agent sessions (connection/model info only). action='list' shows all active sessions. "
+                "action='delete' removes a session (requires session_id, can be shorthand integer or full ID). "
+                "NOT for goals, plans, memory, or data queries — use db_query for those."
             ),
             args_schema=_SessionArgs,
         ),
@@ -2409,6 +2787,30 @@ def _make_core_lc_tools() -> list:
                 "task_type: optional exact slug to narrow results."
             ),
             args_schema=_ProcedureRecallArgs,
+        ),
+        StructuredTool.from_function(
+            coroutine=_sms_send_exec,
+            name="sms_send",
+            description=(
+                "Send an SMS message via the macOS Messages proxy. "
+                "Provide either a phone number directly or a person's name to look up from the database. "
+                "The message is queued for delivery by the macOS proxy client. "
+                "phone: E.164 format (e.g. '+14155551234'). "
+                "name: person name to resolve from the person table (e.g. 'Lee')."
+            ),
+            args_schema=_SmsSendArgs,
+        ),
+        StructuredTool.from_function(
+            coroutine=_prob_calc_exec,
+            name="prob_calc",
+            description=(
+                "Probability calculator — performs exact probability computations. "
+                "Gather data first (via search, memory, drive tools), then call this "
+                "with numeric values for precise results. "
+                "Operations: intersection, union, conditional, complement, bayes, chain, "
+                "binomial, permutation, combination, expected_value, joint_independent."
+            ),
+            args_schema=_ProbCalcArgs,
         ),
     ]
 

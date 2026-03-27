@@ -11,13 +11,20 @@
     "plugin_search_tavily",
     "plugin_search_xai",
     "plugin_search_brightdata",
+    "plugin_search_perplexity",
     "plugin_proxy_llama",
     "plugin_client_slack",
     "plugin_urlextract_tavily",
     "plugin_urlextract_brightdata",
     "plugin_extract_gemini",
+    "plugin_calendar_google",
+    "plugin_places_google",
+    "plugin_weather_google",
+    "plugin_geocode_google",
     "plugin_tmux",
-    "plugin_claude_vscode_sessions"
+    "plugin_claude_vscode_sessions",
+    "plugin_sms_proxy",
+    "plugin_mcp_direct"
   ],
   "plugin_config": {
     "plugin_memory_vector_qdrant": {
@@ -81,6 +88,11 @@
     },
     "plugin_claude_vscode_sessions": {
       "enabled": true
+    },
+    "plugin_sms_proxy": {
+      "enabled": true,
+      "relay_enabled": true,
+      "notify_models": ["samaritan-voice*", "samaritan-reasoning"]
     },
     "memory": {
       "enabled": true,
@@ -217,7 +229,7 @@
   },
   "rate_limits": {
     "llm_call": {
-      "calls": 12,
+      "calls": 20,
       "window_seconds": 30,
       "auto_disable": true
     },

@@ -351,6 +351,22 @@ async def _execute_goal_serial(goal_id: int, max_steps: int) -> dict:
             )
             return {"paused_at": step_id, "reason": "investigate", "goal_id": goal_id}
 
+        # Claude Code step — pause and notify (queued for Claude Code to pick up)
+        if target == "claude-code":
+            await execute_sql(
+                f"UPDATE {_GOALS()} SET auto_process_status = 'paused_user' "
+                f"WHERE id = {goal_id}"
+            )
+            await _notify_initiator(
+                goal_id,
+                f"Goal {goal_id} ({goal_title}) has a step queued for Claude Code:\n"
+                f"  Step [{step_id}]: {step.get('description', '')}\n"
+                f"  (target=claude-code — pick up via MCP direct tools)",
+                fallback_event="goal_step_waiting_user",
+            )
+            log.info(f"goal_processor: goal {goal_id} paused at claude-code step {step_id}")
+            return {"paused_at": step_id, "reason": "claude_code_step", "goal_id": goal_id}
+
         # Not approved — stop
         if step.get("approval") != "approved":
             log.debug(f"goal_processor: step {step_id} not approved, stopping")
@@ -372,7 +388,10 @@ async def _execute_goal_serial(goal_id: int, max_steps: int) -> dict:
             )
 
             # Check if execution failed (plan_engine marks step done even on error results)
-            if result and ("ERROR" in result.upper() or "failed" in result.lower()):
+            # Only check the first 200 chars — tool errors appear at the start,
+            # not buried in search result body text that may mention "failed" incidentally.
+            _result_head = (result or "")[:200]
+            if _result_head and ("ERROR" in _result_head.upper() or "failed" in _result_head.lower()):
                 log.warning(f"goal_processor: step {step_id} may have failed: {result[:200]}")
                 # Revert step to pending; ensure goal is active+paused (not blocked)
                 await execute_sql(

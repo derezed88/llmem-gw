@@ -88,6 +88,18 @@ Task steps execute one at a time. If step N needs output from step N-1 (e.g., a 
 - search_xai has only the "query" parameter — do NOT add model or other args.
 - Do NOT use search_ddgs — it is not available as a tool.
 
+### assert_belief (via llm_call to samaritan-execution)
+- Confidence scoring rules — do NOT default to high confidence:
+  - **confidence 9-10**: Only for directly verified facts, official documentation, or first-hand experience
+  - **confidence 7-8**: Well-sourced from multiple corroborating references
+  - **confidence 5-6**: Single search result, plausible but not cross-verified
+  - **confidence ≤4**: Speculative, conflicting sources, or uncertain
+- When the belief comes from automated research (search results), cap confidence at **7** unless multiple independent sources confirm it.
+
+### procedure_save (via llm_call to samaritan-execution)
+- The `steps` arg must be a JSON array of objects: [{"action": "step description"}, ...]
+- Do NOT pass steps as a plain numbered string.
+
 ### memory_save / memory_recall / procedure_recall
 - memory_save: args: topic, content, importance (1-10)
 - memory_recall: args: query (semantic search)
@@ -283,7 +295,7 @@ Decompose the concept step into discrete task steps. Output JSON array only."""
     for i, task in enumerate(tasks, start=1):
         desc = str(task.get("description", "")).replace("'", "''")
         target = task.get("target", "model")
-        if target not in ("model", "human", "investigate"):
+        if target not in ("model", "human", "investigate", "claude-code"):
             target = "investigate"
 
         tool_call_raw = task.get("tool_call")
@@ -480,15 +492,15 @@ async def _resolve_dependencies(step: dict, tool_name: str, tool_args: dict) -> 
 
 async def execute_task_step(task_step_id: int) -> str:
     """
-    Execute a single approved task step using three-tier execution:
+    Execute a single approved task step using two-tier execution:
 
     1. Direct tool call — call the Python executor function directly (zero LLM cost).
-    2. Primary executor — LLM-based execution via model_roles["plan_executor"].
-    3. Fallback executor — LLM-based execution via model_roles["plan_executor_fallback"].
+    2. LLM executor — model_roles["plan_executor"] (samaritan-execution).
+       Provider failover handled by backup_models on the model config.
 
     The `executor` column is written with the actual execution method for audit trail:
       "direct"       — tier 1 succeeded
-      "<model_key>"  — tier 2 or 3 LLM model that executed it
+      "<model_key>"  — tier 2 LLM model that executed it
 
     Returns the result text.
     """
@@ -544,6 +556,12 @@ async def execute_task_step(task_step_id: int) -> str:
     # Resolve sequential dependencies from sibling step results
     # ------------------------------------------------------------------
     tool_args = await _resolve_dependencies(step, tool_name, tool_args)
+
+    # ------------------------------------------------------------------
+    # Sanitize db_query SQL: fix unescaped single quotes in string literals
+    # ------------------------------------------------------------------
+    if tool_name == "db_query" and "sql" in tool_args:
+        tool_args["sql"] = _fix_sql_quotes(tool_args["sql"])
 
     # ------------------------------------------------------------------
     # TIER 1: Direct tool call (zero LLM cost)
@@ -604,6 +622,36 @@ async def execute_task_step(task_step_id: int) -> str:
     return err
 
 
+def _fix_sql_quotes(sql: str) -> str:
+    """Fix unescaped single quotes inside SQL string literals.
+
+    LLM-generated SQL often contains apostrophes (e.g. Symbotic's) that
+    break string literals.  Walks character-by-character: any single quote
+    flanked by word characters on both sides (letter'letter) is treated as
+    an apostrophe and doubled.
+    """
+    chars = list(sql)
+    i = 0
+    patched = False
+    while i < len(chars):
+        if chars[i] == "'" and i > 0 and i < len(chars) - 1:
+            prev_is_word = chars[i - 1].isalpha()
+            next_is_word = chars[i + 1].isalpha()
+            # Already escaped '' — skip both
+            if i + 1 < len(chars) and chars[i + 1] == "'":
+                i += 2
+                continue
+            if prev_is_word and next_is_word:
+                chars.insert(i, "'")
+                patched = True
+                i += 2  # skip past the doubled quote
+                continue
+        i += 1
+    if patched:
+        log.info("_fix_sql_quotes: patched unescaped apostrophes in SQL")
+    return "".join(chars)
+
+
 def _map_tool_args(executor_fn, tool_args: dict, tool_name: str) -> dict:
     """Map tool_call args to executor function parameter names."""
     if not isinstance(tool_args, dict):
@@ -641,38 +689,34 @@ async def _try_llm_executors(
     direct_err: str | None,
 ) -> str | None:
     """
-    Try primary then fallback LLM executor models.
+    Try the plan_executor LLM model.  Provider-level failover is handled by
+    backup_models on the executor model config (e.g. samaritan-execution →
+    gpt-4o-execution), so only one role is needed here.
     Returns result string on success, None if all fail.
     """
     from config import get_model_role
 
-    executor_roles = ["plan_executor", "plan_executor_fallback"]
-    last_err = ""
+    try:
+        model_key = get_model_role("plan_executor")
+    except KeyError:
+        log.warning("_try_llm_executors: plan_executor role not configured")
+        return None
 
-    for role in executor_roles:
-        try:
-            model_key = get_model_role(role)
-        except KeyError:
-            log.debug(f"_try_llm_executors: role '{role}' not configured, skipping")
-            continue
+    log.info(
+        f"_try_llm_executors: id={task_step_id} tool={tool_name} "
+        f"trying plan_executor={model_key}"
+    )
 
+    result = await _llm_execute_tool(model_key, tool_name, tool_args, step, direct_err)
+    if result is not None:
+        await _complete_task(task_step_id, result, executor=model_key)
         log.info(
-            f"_try_llm_executors: id={task_step_id} tool={tool_name} "
-            f"trying {role}={model_key}"
+            f"execute_task_step: id={task_step_id} tool={tool_name} "
+            f"executor={model_key} → done"
         )
+        return result
 
-        result = await _llm_execute_tool(model_key, tool_name, tool_args, step, direct_err)
-        if result is not None:
-            await _complete_task(task_step_id, result, executor=model_key)
-            log.info(
-                f"execute_task_step: id={task_step_id} tool={tool_name} "
-                f"executor={model_key} ({role}) → done"
-            )
-            return result
-        else:
-            last_err = f"{role}={model_key} failed"
-            log.warning(f"_try_llm_executors: {last_err}")
-
+    log.warning(f"_try_llm_executors: plan_executor={model_key} failed")
     return None
 
 
@@ -1040,7 +1084,7 @@ async def create_concept_step(
 
     desc = description.replace("'", "''")
     source = source if source in ("session", "user", "directive", "assistant") else "assistant"
-    target = target if target in ("model", "human", "investigate") else "model"
+    target = target if target in ("model", "human", "investigate", "claude-code") else "model"
     approval = approval if approval in ("proposed", "approved", "rejected", "auto") else "proposed"
     sid = session_id.replace("'", "''") if session_id else "NULL"
     sid_sql = f"'{sid}'" if session_id else "NULL"
@@ -1091,10 +1135,11 @@ async def view_plan(goal_id: int | None = None, include_done: bool = False) -> s
             c["status"], "?"
         )
         approval_tag = f" [{c.get('approval', '?')}]" if c.get("approval") != "approved" else ""
-        target_tag = f" →{c.get('target', '?')}" if c.get("target") != "model" else ""
+        target_label = {"model": "🤖", "human": "👤", "investigate": "🔍", "claude-code": "💻"}.get(
+            c.get("target", "model"), c.get("target", "?"))
         lines.append(
-            f"  {status_icon} [{c['id']}] step {c['step_order']}: "
-            f"{c['description']}{approval_tag}{target_tag}"
+            f"  {status_icon} [{c['id']}] step {c['step_order']} {target_label}: "
+            f"{c['description']}{approval_tag}"
         )
 
         # Load child task steps
@@ -1108,7 +1153,8 @@ async def view_plan(goal_id: int | None = None, include_done: bool = False) -> s
                 t_icon = {"pending": "·", "in_progress": "▸", "done": "✓", "skipped": "—"}.get(
                     t["status"], "?"
                 )
-                t_target = f" →{t['target']}" if t.get("target") != "model" else ""
+                t_target_label = {"model": "🤖", "human": "👤", "investigate": "🔍", "claude-code": "💻"}.get(
+                    t.get("target", "model"), t.get("target", "?"))
                 t_approval = f" [{t.get('approval', '?')}]" if t.get("approval") != "approved" else ""
                 tc = ""
                 if t.get("tool_call"):
@@ -1118,7 +1164,7 @@ async def view_plan(goal_id: int | None = None, include_done: bool = False) -> s
                     except Exception:
                         tc = " tool:?"
                 lines.append(
-                    f"      {t_icon} [{t['id']}] {t['description']}{tc}{t_target}{t_approval}"
+                    f"      {t_icon} [{t['id']}] {t_target_label} {t['description']}{tc}{t_approval}"
                 )
                 if t.get("result") and t["status"] == "done":
                     result_preview = str(t["result"])[:80].replace("\n", " ")

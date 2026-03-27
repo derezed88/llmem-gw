@@ -158,6 +158,8 @@ async def cmd_help(client_id: str):
         "\n"
         "Plan Engine:\n"
         "  !plan                                     - show active plans (concept + task hierarchy)\n"
+        "  !plan pending                             - show goals awaiting approval with next actions\n"
+        "  !plan close <goal_id>                     - close goal and skip all unfinished steps\n"
         "  !plan all                                 - show all plans including completed\n"
         "  !plan <goal_id>                           - show plans for a specific goal\n"
         "  !plan decompose [goal_id]                 - decompose concept steps into task steps\n"
@@ -1237,7 +1239,8 @@ async def cmd_memreview(client_id: str, arg: str = "", model_key: str = "",
         "- Only propose merges when content clearly overlaps (same real-world subject).\n"
         "- Do NOT merge topics that merely share a word prefix (e.g. 'memory-system' and 'memory-roadmap' are distinct).\n"
         "- Do NOT propose changes for topics that are already well-named and distinct.\n"
-        "- Prefer shorter, clearer slugs.\n"
+        "- Prefer shorter, clearer slugs (ideal: 2 hyphenated words like 'job-seeking' or 'health-advice').\n"
+        "- Topics starting with 'conv-' are ALWAYS auto-generated garbage slugs. ALWAYS propose a rename to a proper 2-word slug based on their sample content. Merge into an existing topic if the content matches.\n"
         "- If no changes are needed, return an empty proposals list.\n\n"
         "Return ONLY valid JSON (no markdown fences, no commentary):\n"
         '{"proposals": [{"action": "merge"|"rename", "from": "old-slug", "to": "new-slug", "reason": "brief explanation"}]}\n\n'
@@ -3262,6 +3265,8 @@ async def cmd_timers(client_id: str, arg: str = ""):
 async def cmd_plan(client_id: str, arg: str, model_key: str = ""):
     """
     !plan                              — show active plans (concept + task hierarchy)
+    !plan pending                      — show goals awaiting approval with next actions
+    !plan close <goal_id>              — close goal and skip all unfinished steps
     !plan all                          — show all plans including completed
     !plan <goal_id>                    — show plans for a specific goal
     !plan decompose [goal_id]          — decompose pending concept steps into task steps
@@ -3285,6 +3290,9 @@ async def cmd_plan(client_id: str, arg: str, model_key: str = ""):
             include_done = sub == "all"
             result = await plan_engine.view_plan(include_done=include_done)
             await push_tok(client_id, f"**Active Plans**\n{result}\n")
+
+        elif sub == "pending":
+            await _cmd_plan_pending(client_id)
 
         elif sub.isdigit():
             goal_id = int(sub)
@@ -3425,15 +3433,48 @@ async def cmd_plan(client_id: str, arg: str, model_key: str = ""):
                 f"Ad-hoc concept step created (id={row_id}): {sub_arg}\n"
             )
 
+        elif sub == "close":
+            if not sub_arg.isdigit():
+                await push_tok(client_id, "Usage: !plan close <goal_id>\n")
+                return
+            goal_id = int(sub_arg)
+            from database import fetch_dicts as _fd, execute_sql as _ex
+            from memory import _PLANS as _P, _GOALS as _G
+            # Verify goal exists
+            gr = await _fd(f"SELECT id, title, status FROM {_G()} WHERE id = {goal_id}")
+            if not gr:
+                await push_tok(client_id, f"Goal {goal_id} not found.\n")
+                return
+            # Count unfinished steps, then skip them
+            unfinished = await _fd(
+                f"SELECT COUNT(*) AS cnt FROM {_P()} "
+                f"WHERE goal_id = {goal_id} AND status NOT IN ('done', 'skipped')"
+            )
+            skipped = unfinished[0]["cnt"] if unfinished else 0
+            await _ex(
+                f"UPDATE {_P()} SET status = 'skipped', result = 'Closed by user' "
+                f"WHERE goal_id = {goal_id} AND status NOT IN ('done', 'skipped')"
+            )
+            # Mark goal done and clear auto_process_status
+            await _ex(
+                f"UPDATE {_G()} SET status = 'done', auto_process_status = 'completed' "
+                f"WHERE id = {goal_id}"
+            )
+            await push_tok(
+                client_id,
+                f"Goal {goal_id} (\"{gr[0]['title']}\") closed.\n"
+                f"  {skipped} unfinished step(s) skipped, goal marked done.\n"
+            )
+
         elif sub == "auto":
             await _cmd_plan_auto(client_id, sub_arg)
 
         else:
             await push_tok(
                 client_id,
-                "Unknown !plan subcommand. Use: !plan, !plan decompose, "
-                "!plan approve, !plan reject, !plan execute, !plan run, "
-                "!plan add, !plan adhoc, !plan auto\n"
+                "Unknown !plan subcommand. Use: !plan, !plan pending, !plan close, "
+                "!plan decompose, !plan approve, !plan reject, !plan execute, "
+                "!plan run, !plan add, !plan adhoc, !plan auto\n"
             )
 
     except Exception as e:
@@ -3443,6 +3484,83 @@ async def cmd_plan(client_id: str, arg: str, model_key: str = ""):
 
 
 # ---------------------------------------------------------------------------
+# !plan pending — discovery-first approval workflow
+# ---------------------------------------------------------------------------
+
+async def _cmd_plan_pending(client_id: str):
+    """Show goals with steps awaiting approval, grouped by goal with actionable commands."""
+    from state import push_tok
+    from database import fetch_dicts
+    from memory import _GOALS, _PLANS
+
+    # Goals that have proposed/pending plan steps OR proposed auto_process_status
+    rows = await fetch_dicts(
+        f"SELECT g.id AS goal_id, g.title, g.status AS goal_status, "
+        f"g.auto_process_status, g.importance, "
+        f"p.id AS step_id, p.step_type, p.status AS step_status, "
+        f"p.approval, p.description AS step_desc "
+        f"FROM {_GOALS()} g "
+        f"JOIN {_PLANS()} p ON p.goal_id = g.id "
+        f"WHERE (p.approval = 'proposed' OR p.status = 'pending') "
+        f"AND g.status IN ('active', 'blocked') "
+        f"ORDER BY g.importance DESC, g.id, p.step_order"
+    )
+
+    if not rows:
+        await push_tok(client_id, "No plans awaiting approval.\n")
+        return
+
+    # Group by goal
+    from collections import OrderedDict
+    goals = OrderedDict()
+    for r in rows:
+        gid = r["goal_id"]
+        if gid not in goals:
+            goals[gid] = {
+                "title": r["title"],
+                "goal_status": r["goal_status"],
+                "auto_status": r.get("auto_process_status") or "—",
+                "importance": r.get("importance", "?"),
+                "proposed": 0,
+                "pending": 0,
+                "steps_preview": [],
+            }
+        g = goals[gid]
+        if r["approval"] == "proposed":
+            g["proposed"] += 1
+        if r["step_status"] == "pending":
+            g["pending"] += 1
+        if len(g["steps_preview"]) < 4:
+            desc = r["step_desc"] or ""
+            if len(desc) > 60:
+                desc = desc[:57] + "..."
+            g["steps_preview"].append(desc)
+
+    lines = ["**Plans Awaiting Approval**\n"]
+    goal_ids = []
+    for gid, g in goals.items():
+        goal_ids.append(str(gid))
+        lines.append(
+            f"  **Goal {gid}** — {g['title']}"
+        )
+        lines.append(
+            f"    importance={g['importance']}  auto={g['auto_status']}  "
+            f"{g['proposed']} proposed, {g['pending']} pending"
+        )
+        for desc in g["steps_preview"]:
+            lines.append(f"      - {desc}")
+        remaining = g["proposed"] + g["pending"] - len(g["steps_preview"])
+        if remaining > 0:
+            lines.append(f"      ... and {remaining} more")
+        lines.append(f"    → `!plan auto approve {gid}`")
+        lines.append("")
+
+    if len(goal_ids) > 1:
+        lines.append(f"Approve all: `!plan auto approve {' '.join(goal_ids)}`")
+
+    await push_tok(client_id, "\n".join(lines) + "\n")
+
+
 # !plan auto — autonomous goal processor commands
 # ---------------------------------------------------------------------------
 
@@ -3501,70 +3619,89 @@ async def _cmd_plan_auto(client_id: str, arg: str):
 
         elif sub == "approve":
             if not sub_args or not sub_args[0].isdigit():
-                await push_tok(client_id, "Usage: !plan auto approve <goal_id>\n")
+                await push_tok(client_id, "Usage: !plan auto approve <goal_id> [goal_id2 ...]\n")
                 return
-            goal_id = int(sub_args[0])
 
-            # Validate: is this actually a goal ID?
-            goal_row = await fetch_dicts(
-                f"SELECT id, title, status, auto_process_status FROM {_goals_table()} "
-                f"WHERE id = {goal_id}"
-            )
-            if not goal_row:
-                # Check if user accidentally passed a step/plan ID
-                from memory import _PLANS
+            # Collect all numeric IDs from args
+            raw_ids = [int(a) for a in sub_args if a.isdigit()]
+            if not raw_ids:
+                await push_tok(client_id, "Usage: !plan auto approve <goal_id> [goal_id2 ...]\n")
+                return
+
+            # Resolve each ID: could be goal or step
+            goal_ids = []
+            from memory import _PLANS
+            for rid in raw_ids:
+                goal_row = await fetch_dicts(
+                    f"SELECT id, title FROM {_goals_table()} WHERE id = {rid}"
+                )
+                if goal_row:
+                    goal_ids.append(rid)
+                    continue
+                # Auto-resolve step ID → parent goal
                 step_row = await fetch_dicts(
-                    f"SELECT id, goal_id, description FROM {_PLANS()} WHERE id = {goal_id}"
+                    f"SELECT id, goal_id, description FROM {_PLANS()} WHERE id = {rid}"
                 )
                 if step_row:
                     real_goal = step_row[0]["goal_id"]
                     await push_tok(
                         client_id,
-                        f"{goal_id} is a plan step, not a goal. "
-                        f"The parent goal is {real_goal}.\n"
-                        f"Did you mean: `!plan auto approve {real_goal}`?\n"
+                        f"{rid} is a plan step → resolved to goal {real_goal}\n"
                     )
+                    if real_goal not in goal_ids:
+                        goal_ids.append(real_goal)
                 else:
-                    await push_tok(client_id, f"Goal {goal_id} not found.\n")
+                    await push_tok(client_id, f"ID {rid} not found as goal or step — skipped.\n")
+
+            if not goal_ids:
                 return
 
-            # Approve the goal and all its proposed task steps
-            await execute_sql(
-                f"UPDATE {_goals_table()} SET auto_process_status = 'approved' "
-                f"WHERE id = {goal_id} AND (auto_process_status IN ('proposed', 'paused_user') "
-                f"OR auto_process_status IS NULL)"
-            )
-            # Also approve all proposed task steps for this goal
-            from memory import _PLANS
-            await execute_sql(
-                f"UPDATE {_PLANS()} SET approval = 'approved' "
-                f"WHERE goal_id = {goal_id} AND approval = 'proposed'"
-            )
+            # Approve each goal
+            for goal_id in goal_ids:
+                await execute_sql(
+                    f"UPDATE {_goals_table()} SET auto_process_status = 'approved' "
+                    f"WHERE id = {goal_id} AND (auto_process_status IN ('proposed', 'paused_user') "
+                    f"OR auto_process_status IS NULL)"
+                )
+                await execute_sql(
+                    f"UPDATE {_PLANS()} SET approval = 'approved' "
+                    f"WHERE goal_id = {goal_id} AND approval = 'proposed'"
+                )
 
-            # Post-approval feedback: show what happens next
-            steps = await fetch_dicts(
-                f"SELECT id, step_type, status, approval, description "
-                f"FROM {_PLANS()} WHERE goal_id = {goal_id} ORDER BY step_order"
-            )
-            concept_pending = [s for s in steps if s["step_type"] == "concept" and s["status"] == "pending"]
-            task_pending = [s for s in steps if s["step_type"] == "task" and s["status"] not in ("done", "skipped")]
-            task_done = [s for s in steps if s["step_type"] == "task" and s["status"] in ("done", "skipped")]
+                # Post-approval feedback
+                steps = await fetch_dicts(
+                    f"SELECT id, step_type, status, approval, description "
+                    f"FROM {_PLANS()} WHERE goal_id = {goal_id} ORDER BY step_order"
+                )
+                concept_pending = [s for s in steps if s["step_type"] == "concept" and s["status"] == "pending"]
+                task_pending = [s for s in steps if s["step_type"] == "task" and s["status"] not in ("done", "skipped")]
+                task_done = [s for s in steps if s["step_type"] == "task" and s["status"] in ("done", "skipped")]
 
-            lines = [f"Goal {goal_id} approved for auto-execution."]
-            if concept_pending and not task_pending:
-                lines.append(f"  → {len(concept_pending)} concept step(s) will be decomposed into tasks first.")
-            elif task_pending:
-                lines.append(f"  → {len(task_pending)} task(s) ready to execute ({len(task_done)} already done).")
-            elif not steps:
-                lines.append("  → No plan steps yet — goal processor will create them.")
-            lines.append("  → Goal processor triggered. Progress updates will appear here.")
-            await push_tok(client_id, "\n".join(lines) + "\n")
+                goal_row = await fetch_dicts(
+                    f"SELECT title FROM {_goals_table()} WHERE id = {goal_id}"
+                )
+                title = goal_row[0]["title"] if goal_row else "?"
+                lines = [f"Goal {goal_id} (\"{title}\") approved."]
+                if concept_pending and not task_pending:
+                    lines.append(f"  → {len(concept_pending)} concept step(s) will be decomposed into tasks first.")
+                elif task_pending:
+                    lines.append(f"  → {len(task_pending)} task(s) ready to execute ({len(task_done)} already done).")
+                elif not steps:
+                    lines.append("  → No plan steps yet — goal processor will create them.")
+                await push_tok(client_id, "\n".join(lines) + "\n")
 
-            # Register initiator for progress notifications and wake the goal processor
+                # Register initiator for progress notifications
+                try:
+                    from goal_processor import register_initiator
+                    register_initiator(goal_id, client_id)
+                except ImportError:
+                    pass
+
+            # Wake goal processor once for all approved goals
             try:
-                from goal_processor import trigger_now, register_initiator
-                register_initiator(goal_id, client_id)
+                from goal_processor import trigger_now
                 trigger_now()
+                await push_tok(client_id, "Goal processor triggered.\n")
             except ImportError:
                 pass
 

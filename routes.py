@@ -270,6 +270,25 @@ async def cmd_help(client_id: str):
         "    fields: model, mode, threshold, gates\n"
         "  Note: enable plugin_history_judge in chain for tool+memory gates to be active.\n"
         "\n"
+        "Claude Code Relay:\n"
+        "  !claude                                   - enable Claude Code relay (routes all input to Claude Code via MCP)\n"
+        "  !claude on                                - same as !claude\n"
+        "  !claude off                               - disable relay, return to normal LLM pipeline\n"
+        "  !claude status                            - show relay mode and connection health\n"
+        "\n"
+        "Email Triage:\n"
+        "  !email                                    - show recent triage decisions\n"
+        "  !email scan                               - trigger immediate inbox scan\n"
+        "  !email review                             - show unreviewed decisions\n"
+        "  !email approve <id>                       - mark decision as correct\n"
+        "  !email override <id> <action>             - correct a decision (delete|spam|archive|notify|skip)\n"
+        "  !email stats                              - scan statistics\n"
+        "  !email on|off                             - enable/disable triage timer\n"
+        "  !email rules                              - list classification rules\n"
+        "  !email rules add <type>:<value> <action>  - add rule (e.g. domain:groupon.com delete)\n"
+        "  !email rules disable|enable|delete <id>   - manage rules\n"
+        "  !email rules stats                        - rule hit counts\n"
+        "\n"
         "AI tools:\n"
         "  get_system_info()                         - show date/time/status\n"
         "  llm_call(model, prompt, ...)              - call a model (mode/sys_prompt/history/tool)\n"
@@ -3100,6 +3119,19 @@ async def cmd_timers(client_id: str, arg: str = ""):
                              f"steps_executed={gs['steps_executed']}")
             except ImportError:
                 pass
+        elif arg == "email_triage":
+            try:
+                from plugin_email_yahoo import get_stats as get_email_stats
+                es = get_email_stats()
+                lines.append("")
+                lines.append("**Email Triage Stats** (since restart)")
+                lines.append(f"  scans={es['scans']}  emails={es['emails_scanned']}  "
+                             f"rules={es['rules_matched']}  llm={es['llm_classified']}  "
+                             f"notify={es['notifications_sent']}")
+                if es.get("last_error"):
+                    lines.append(f"  last_error: {es['last_error']}")
+            except ImportError:
+                pass
         elif arg in ("contradiction", "prospective", "reflection"):
             lines.append(f"\n  (use !cogn for full {arg} stats)")
 
@@ -3126,6 +3158,9 @@ async def cmd_timers(client_id: str, arg: str = ""):
         ]),
         ("Inference", [
             "temporal_inference",
+        ]),
+        ("Automation", [
+            "email_triage",
         ]),
         ("Maintenance", [
             "memreview_auto",
@@ -5084,6 +5119,123 @@ async def cmd_stream(client_id: str, arg: str, session: dict):
     await conditional_push_done(client_id)
 
 
+# ── !claude — route session through Claude Code via MCP Direct relay ────
+
+_MCP_DIRECT_URL = os.environ.get("MCP_DIRECT_URL", "http://localhost:8769")
+
+
+async def cmd_claude(client_id: str, arg: str, session: dict):
+    """
+    !claude [on|off|status]
+
+    Toggle Claude Code relay mode. When on, all user text is routed through
+    the MCP Direct voice relay to Claude Code instead of the LLM pipeline.
+    Works on all frontends (shell, Slack, API, open-webui).
+    Requires Claude Code to have voice relay mode enabled.
+    """
+    sub = arg.strip().lower()
+
+    if sub in ("off", "exit", "default"):
+        session["claude_mode"] = False
+        await push_tok(client_id, "Claude mode OFF — back to normal LLM pipeline.\n")
+        await conditional_push_done(client_id)
+        return
+
+    if sub == "status":
+        enabled = session.get("claude_mode", False)
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=3) as http:
+                r = await http.get(f"{_MCP_DIRECT_URL}/voice_relay/status")
+                relay = r.json()
+        except Exception:
+            relay = {"enabled": False, "error": "unreachable"}
+        channels = relay.get("channels", {})
+        ch_lines = ""
+        if channels:
+            ch_lines = "\n".join(
+                f"  [{ch}]: inbox={info.get('inbox_count',0)} outbox={info.get('outbox_count',0)}"
+                for ch, info in channels.items()
+            )
+        await push_tok(client_id,
+            f"Claude mode: {'ON' if enabled else 'OFF'}\n"
+            f"Relay server: {'enabled' if relay.get('enabled') else 'not enabled'}\n"
+            f"Active channels:\n{ch_lines or '  (none)'}\n")
+        await conditional_push_done(client_id)
+        return
+
+    # Default: on
+    # Check relay availability first
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=3) as http:
+            r = await http.get(f"{_MCP_DIRECT_URL}/voice_relay/status")
+            relay = r.json()
+        if not relay.get("enabled"):
+            await push_tok(client_id,
+                "Cannot enable Claude mode — voice relay is not active.\n"
+                "Run 'enter voice relay mode' in Claude Code first.\n")
+            await conditional_push_done(client_id)
+            return
+    except Exception as e:
+        await push_tok(client_id,
+            f"Cannot reach MCP Direct (port 8769): {e}\n"
+            f"Is llmem-gw running with plugin_mcp_direct?\n")
+        await conditional_push_done(client_id)
+        return
+
+    session["claude_mode"] = True
+    await push_tok(client_id,
+        "Claude mode ON — all input now routes to Claude Code.\n"
+        "Use !claude off to return to normal.\n")
+    await conditional_push_done(client_id)
+
+
+async def _claude_relay_dispatch(client_id: str, text: str, session: dict):
+    """Route user text through MCP Direct voice relay to Claude Code."""
+    import httpx
+
+    await push_tok(client_id, "")  # keep connection alive
+    try:
+        # Submit to relay
+        async with httpx.AsyncClient(timeout=10) as http:
+            r = await http.post(
+                f"{_MCP_DIRECT_URL}/voice_relay/submit",
+                json={"text": text, "source": session.get("model", "llmem-gw")},
+            )
+            if r.status_code == 503:
+                session["claude_mode"] = False
+                await push_tok(client_id,
+                    "Claude relay no longer active — switching back to normal mode.\n")
+                await conditional_push_done(client_id)
+                return
+            r.raise_for_status()
+
+        # Long-poll for response (up to 60s)
+        deadline = asyncio.get_event_loop().time() + 60
+        response = None
+        while asyncio.get_event_loop().time() < deadline:
+            async with httpx.AsyncClient(timeout=15) as http:
+                r = await http.get(
+                    f"{_MCP_DIRECT_URL}/voice_relay/poll",
+                    params={"wait": "10"},
+                )
+                data = r.json()
+                if data.get("status") == "ok":
+                    response = data
+                    break
+
+        if response:
+            await push_tok(client_id, response["text"])
+        else:
+            await push_tok(client_id, "(Claude Code did not respond in time)")
+
+    except Exception as e:
+        await push_tok(client_id, f"Claude relay error: {e}")
+
+    await conditional_push_done(client_id)
+
+
 async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip: str = None):
     from state import get_or_create_shorthand_id, load_history, load_session_config
 
@@ -5258,6 +5410,8 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
                     await cmd_memage(client_id, session.get("model", ""))
                 elif cmd == "memtrim":
                     await cmd_memtrim(client_id, arg, session.get("model", ""))
+                elif cmd == "claude":
+                    await cmd_claude(client_id, arg, session)
                 elif cmd == "cogn":
                     await cmd_cogn(client_id, arg, session.get("model", ""))
                 elif cmd == "timers":
@@ -5413,6 +5567,9 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
         if cmd == "notifier":
             await cmd_notifier(client_id, arg)
             return
+        if cmd == "claude":
+            await cmd_claude(client_id, arg, session)
+            return
 
         # Plugin-registered commands (e.g. !tmux, !tmux_call_limit from plugin_tmux)
         if get_plugin_command(cmd) is not None:
@@ -5422,6 +5579,13 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
         # Catch-all for unknown commands - don't pass to LLM
         await push_tok(client_id, f"Unknown command: !{cmd}\nUse !help to see available commands.")
         await conditional_push_done(client_id)
+        return
+
+    # ── Claude Code relay mode ──────────────────────────────────────────
+    # When !claude is active for this session, route text through the MCP
+    # Direct voice relay to Claude Code instead of the LLM pipeline.
+    if session.get("claude_mode"):
+        await _claude_relay_dispatch(client_id, stripped, session)
         return
 
     # @<model> per-turn model switch

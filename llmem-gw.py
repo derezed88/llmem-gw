@@ -381,6 +381,7 @@ async def run_agent(host: str = "0.0.0.0"):
         _temporal_inference_task_wrapper(),
         _memreview_auto_task_wrapper(),
         _goal_processor_task_wrapper(),
+        _email_triage_task_wrapper(),
     )
 
 
@@ -448,6 +449,17 @@ async def _goal_processor_task_wrapper():
         log.warning(f"goal_processor module not available: {e}")
     except Exception as e:
         log.error(f"goal_processor_task crashed: {e}")
+
+
+async def _email_triage_task_wrapper():
+    """Thin wrapper so import errors don't crash the gather."""
+    try:
+        from plugin_email_yahoo import email_triage_task
+        await email_triage_task()
+    except ImportError as e:
+        log.warning(f"email_triage module not available: {e}")
+    except Exception as e:
+        log.error(f"email_triage_task crashed: {e}")
 
 
 def main():

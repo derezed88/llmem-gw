@@ -51,22 +51,55 @@ mcp = FastMCP(
 )
 
 # ---------------------------------------------------------------------------
-# Context helpers — set DB context for each tool call
+# Context helpers — workspace registration + DB routing
 # ---------------------------------------------------------------------------
 
 _DEFAULT_DB = os.getenv("MCP_DIRECT_DB", "mymcp")
 _CLIENT_ID_PREFIX = "claude-code"
 
+# Workspace registry: name → {database, channel, registered_at}
+# Populated by workspace_register() at session start.
+_workspaces: dict = {}
+_active_workspace: str = "default"  # current workspace name
 
-def _set_context():
+
+def _set_context(database: str = ""):
     """Set database and client context for tool execution."""
     from database import set_db_override
     from state import current_client_id
-    set_db_override(_DEFAULT_DB)
-    # Use a stable client ID so memories are attributed consistently
+    # Use workspace-specific DB if registered, else default
+    db = database or _workspaces.get(_active_workspace, {}).get("database", _DEFAULT_DB)
+    set_db_override(db)
     cid = current_client_id.get("")
+    ws = _active_workspace
     if not cid or not cid.startswith(_CLIENT_ID_PREFIX):
-        current_client_id.set(f"{_CLIENT_ID_PREFIX}-mcp")
+        current_client_id.set(f"{_CLIENT_ID_PREFIX}-{ws}")
+
+
+@mcp.tool()
+async def workspace_register(
+    name: str,
+    database: str = "mymcp",
+) -> str:
+    """Register this Claude Code workspace with a name and database target.
+
+    Call this ONCE at session start. All subsequent tool calls will use this
+    workspace's database for memory, goals, plans, etc.
+
+    Args:
+        name: Workspace identifier (e.g. 'default', 'ged-math', 'ged-reading').
+              Also used as the voice relay channel name.
+        database: MySQL database to use (e.g. 'mymcp', 'gedmath', 'gedreading')
+    """
+    global _active_workspace
+    _workspaces[name] = {
+        "database": database,
+        "channel": name,
+        "registered_at": __import__("time").time(),
+    }
+    _active_workspace = name
+    _set_context()
+    return f"Workspace '{name}' registered → database={database}, relay channel={name}"
 
 
 # Stop words excluded from topic slug generation
@@ -1024,20 +1057,23 @@ async def steps_for_claude_code(
     for Claude Code to execute (e.g. code changes, filesystem operations).
     """
     _set_context()
-    from memory import _PLANS
+    from memory import _PLANS, _GOALS
     from database import execute_sql
 
-    sql = (
-        f"SELECT p.id, p.goal_id, p.step_order, p.description, p.status, "
-        f"p.step_type, p.approval, LEFT(p.result, 200) as result, "
-        f"g.title as goal_title "
-        f"FROM {_PLANS()} p "
-        f"LEFT JOIN samaritan_goals g ON g.id = p.goal_id "
-        f"WHERE p.target = 'claude-code' AND p.status IN ('pending', 'in_progress') "
-        f"ORDER BY p.goal_id, p.step_order"
-    )
-    result = await execute_sql(sql)
-    return result if result.strip() else "(no steps queued for claude-code)"
+    try:
+        sql = (
+            f"SELECT p.id, p.goal_id, p.step_order, p.description, p.status, "
+            f"p.step_type, p.approval, LEFT(p.result, 200) as result, "
+            f"g.title as goal_title "
+            f"FROM {_PLANS()} p "
+            f"LEFT JOIN {_GOALS()} g ON g.id = p.goal_id "
+            f"WHERE p.target = 'claude-code' AND p.status IN ('pending', 'in_progress') "
+            f"ORDER BY p.goal_id, p.step_order"
+        )
+        result = await execute_sql(sql)
+        return result if result.strip() else "(no steps queued for claude-code)"
+    except Exception:
+        return "(no steps — goals/plans tables not available in this database)"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1519,15 +1555,10 @@ import asyncio as _asyncio
 from collections import deque
 import time as _time
 
-# In-memory relay queue (session-scoped, clears on restart)
-_voice_relay = {
-    "enabled": False,
-    "inbox": deque(maxlen=50),     # voice→claude: {id, text, source, timestamp}
-    "outbox": deque(maxlen=50),    # claude→voice: {id, reply_to, text, timestamp}
-    "msg_counter": 0,
-    "inbox_event": None,           # asyncio.Event — set when new message arrives
-    "last_message_at": 0.0,        # timestamp of last real message (for backoff)
-}
+# Multi-channel relay queues: channel_name → relay state
+# Each Claude Code workspace gets its own channel via workspace_register().
+_relay_channels: dict = {}
+_relay_msg_counter = 0
 
 # Adaptive backoff: server adjusts effective wait based on time since last message
 _RELAY_BACKOFF_TIERS = [
@@ -1535,6 +1566,20 @@ _RELAY_BACKOFF_TIERS = [
     (300,  15),  # last message 2-5 min ago → 15s (recent activity)
     (None, 30),  # last message > 5 min ago → 30s (idle)
 ]
+
+
+def _get_relay(channel: str = "") -> dict:
+    """Get or create a relay channel. Uses active workspace if no channel specified."""
+    ch = channel or _active_workspace or "default"
+    if ch not in _relay_channels:
+        _relay_channels[ch] = {
+            "enabled": False,
+            "inbox": deque(maxlen=50),
+            "outbox": deque(maxlen=50),
+            "inbox_event": None,
+            "last_message_at": 0.0,
+        }
+    return _relay_channels[ch]
 
 
 @mcp.tool()
@@ -1547,24 +1592,26 @@ async def voice_relay_mode(
     Args:
         action: 'on' to enable, 'off' to disable, 'status' to check
     """
+    relay = _get_relay()
+    ch = _active_workspace or "default"
     if action == "on":
-        _voice_relay["enabled"] = True
-        _voice_relay["inbox"].clear()
-        _voice_relay["outbox"].clear()
-        _voice_relay["last_message_at"] = _time.time()  # start in fast-poll tier
+        relay["enabled"] = True
+        relay["inbox"].clear()
+        relay["outbox"].clear()
+        relay["last_message_at"] = _time.time()
         return (
-            "Voice relay mode ENABLED. You will now receive messages from the voice frontend.\n"
+            f"Voice relay mode ENABLED on channel '{ch}'.\n"
             "Poll with voice_relay_check() to see incoming messages.\n"
             "Respond with voice_relay_respond(message_id, text).\n"
             "Disable with voice_relay_mode('off') when back at your station."
         )
     elif action == "off":
-        _voice_relay["enabled"] = False
-        return "Voice relay mode DISABLED."
+        relay["enabled"] = False
+        return f"Voice relay mode DISABLED on channel '{ch}'."
     elif action == "status":
-        enabled = _voice_relay["enabled"]
-        inbox_count = len(_voice_relay["inbox"])
-        return f"Voice relay: {'ENABLED' if enabled else 'DISABLED'}, {inbox_count} pending messages"
+        enabled = relay["enabled"]
+        inbox_count = len(relay["inbox"])
+        return f"Voice relay [{ch}]: {'ENABLED' if enabled else 'DISABLED'}, {inbox_count} pending messages"
     return "Invalid action. Use 'on', 'off', or 'status'."
 
 
@@ -1582,35 +1629,36 @@ async def voice_relay_check(
     Args:
         wait: Max seconds to wait for a message (default 15, max 30)
     """
-    if not _voice_relay["enabled"]:
+    relay = _get_relay()
+    if not relay["enabled"]:
         return "(voice relay mode is not enabled)"
 
     # Adaptive backoff: use time since last message to determine effective wait
-    last_msg = _voice_relay["last_message_at"]
+    last_msg = relay["last_message_at"]
     idle_secs = _time.time() - last_msg if last_msg > 0 else 999
-    effective_wait = _RELAY_BACKOFF_TIERS[-1][1]  # default to longest
+    effective_wait = _RELAY_BACKOFF_TIERS[-1][1]
     for threshold, wait_secs in _RELAY_BACKOFF_TIERS:
         if threshold is None or idle_secs < threshold:
             effective_wait = wait_secs
             break
 
     # If inbox is empty, long-poll until a message arrives or timeout
-    if not _voice_relay["inbox"]:
-        evt = _voice_relay.get("inbox_event")
+    if not relay["inbox"]:
+        evt = relay.get("inbox_event")
         if evt is None:
             evt = _asyncio.Event()
-            _voice_relay["inbox_event"] = evt
+            relay["inbox_event"] = evt
         evt.clear()
         try:
             await _asyncio.wait_for(evt.wait(), timeout=effective_wait)
         except _asyncio.TimeoutError:
             pass
 
-    if not _voice_relay["inbox"]:
+    if not relay["inbox"]:
         return "(no messages)"
 
-    lines = [f"## Incoming Voice Messages ({len(_voice_relay['inbox'])} pending)\n"]
-    for msg in _voice_relay["inbox"]:
+    lines = [f"## Incoming Voice Messages ({len(relay['inbox'])} pending)\n"]
+    for msg in relay["inbox"]:
         age = int(_time.time() - msg["timestamp"])
         lines.append(
             f"  [{msg['id']}] ({age}s ago) from {msg.get('source', 'voice')}: "
@@ -1634,12 +1682,13 @@ async def voice_relay_respond(
         message_id: The id from voice_relay_check()
         text: Your response (keep it terse, voice-appropriate)
     """
-    if not _voice_relay["enabled"]:
+    relay = _get_relay()
+    if not relay["enabled"]:
         return "(voice relay mode is not enabled)"
 
     # Find and remove the message from inbox
     found = None
-    for msg in _voice_relay["inbox"]:
+    for msg in relay["inbox"]:
         if msg["id"] == message_id:
             found = msg
             break
@@ -1647,10 +1696,10 @@ async def voice_relay_respond(
     if not found:
         return f"Message id={message_id} not found in inbox"
 
-    _voice_relay["inbox"].remove(found)
+    relay["inbox"].remove(found)
 
     # Add to outbox for voice frontend to pick up
-    _voice_relay["outbox"].append({
+    relay["outbox"].append({
         "id": message_id,
         "reply_to": found["text"][:100],
         "text": text,
@@ -1684,77 +1733,106 @@ async def endpoint_voice_relay_submit(request: Request) -> JSONResponse:
     Body (JSON):
         text    : str  (the transcribed voice message)
         source  : str  (optional, e.g. 'voice', 'slack', 'shell')
+        channel : str  (optional, relay channel name — default 'default')
 
     Returns immediately. Claude Code picks up via voice_relay_check().
     """
-    if not _voice_relay["enabled"]:
-        return JSONResponse({"error": "Voice relay not enabled"}, status_code=503)
-
     try:
         payload = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
+    channel = payload.get("channel", "default")
+    relay = _get_relay(channel)
+
+    if not relay["enabled"]:
+        return JSONResponse({"error": f"Voice relay not enabled on channel '{channel}'"}, status_code=503)
+
     text = payload.get("text", "").strip()
     if not text:
         return JSONResponse({"error": "Missing 'text'"}, status_code=400)
 
-    _voice_relay["msg_counter"] += 1
+    global _relay_msg_counter
+    _relay_msg_counter += 1
     msg = {
-        "id": _voice_relay["msg_counter"],
+        "id": _relay_msg_counter,
         "text": text,
         "source": payload.get("source", "voice"),
         "timestamp": _time.time(),
     }
-    _voice_relay["inbox"].append(msg)
-    _voice_relay["last_message_at"] = _time.time()
-    log.info(f"voice_relay: inbound msg #{msg['id']} from {msg['source']}: {text[:80]}")
+    relay["inbox"].append(msg)
+    relay["last_message_at"] = _time.time()
+    log.info(f"voice_relay[{channel}]: inbound msg #{msg['id']} from {msg['source']}: {text[:80]}")
 
     # Wake any long-polling voice_relay_check() call
-    evt = _voice_relay.get("inbox_event")
+    evt = relay.get("inbox_event")
     if evt:
         evt.set()
 
-    return JSONResponse({"status": "queued", "message_id": msg["id"]})
+    return JSONResponse({"status": "queued", "message_id": msg["id"], "channel": channel})
 
 
 async def endpoint_voice_relay_poll(request: Request) -> JSONResponse:
     """Voice frontend polls for Claude Code's response.
 
     Query params:
-        wait  : int  (optional, seconds to long-poll, default 0 = instant)
+        wait    : int  (optional, seconds to long-poll, default 0 = instant)
+        channel : str  (optional, relay channel name — default 'default')
 
     Returns the oldest outbox message, or empty if none.
     """
-    if not _voice_relay["enabled"]:
-        return JSONResponse({"error": "Voice relay not enabled"}, status_code=503)
+    channel = request.query_params.get("channel", "default")
+    relay = _get_relay(channel)
+
+    if not relay["enabled"]:
+        return JSONResponse({"error": f"Voice relay not enabled on channel '{channel}'"}, status_code=503)
 
     wait = int(request.query_params.get("wait", "0"))
 
     # Long-poll: wait up to N seconds for a response
-    if wait > 0 and not _voice_relay["outbox"]:
+    if wait > 0 and not relay["outbox"]:
         deadline = _time.time() + min(wait, 30)
-        while _time.time() < deadline and not _voice_relay["outbox"]:
+        while _time.time() < deadline and not relay["outbox"]:
             await _asyncio.sleep(0.5)
 
-    if not _voice_relay["outbox"]:
+    if not relay["outbox"]:
         return JSONResponse({"status": "empty"})
 
-    msg = _voice_relay["outbox"].popleft()
+    msg = relay["outbox"].popleft()
     return JSONResponse({
         "status": "ok",
         "message_id": msg["id"],
         "reply_to": msg.get("reply_to", ""),
         "text": msg["text"],
+        "channel": channel,
     })
 
 
 async def endpoint_voice_relay_status(request: Request) -> JSONResponse:
-    """Check voice relay status."""
+    """Check voice relay status. Accepts ?channel= param or returns all channels."""
+    channel = request.query_params.get("channel", "")
+    if channel:
+        relay = _get_relay(channel)
+        return JSONResponse({
+            "channel": channel,
+            "enabled": relay["enabled"],
+            "inbox_count": len(relay["inbox"]),
+            "outbox_count": len(relay["outbox"]),
+        })
+    # No channel specified — return all active channels
+    channels = {}
+    for ch, relay in _relay_channels.items():
+        if relay["enabled"]:
+            channels[ch] = {
+                "enabled": True,
+                "inbox_count": len(relay["inbox"]),
+                "outbox_count": len(relay["outbox"]),
+            }
+    # For backwards compat, also return top-level "enabled" if any channel is active
+    any_enabled = any(r["enabled"] for r in _relay_channels.values()) if _relay_channels else False
     return JSONResponse({
-        "enabled": _voice_relay["enabled"],
-        "inbox_count": len(_voice_relay["inbox"]),
-        "outbox_count": len(_voice_relay["outbox"]),
+        "enabled": any_enabled,
+        "channels": channels,
     })
 
 

@@ -24,7 +24,8 @@
     "plugin_tmux",
     "plugin_claude_vscode_sessions",
     "plugin_sms_proxy",
-    "plugin_mcp_direct"
+    "plugin_mcp_direct",
+    "plugin_email_yahoo"
   ],
   "plugin_config": {
     "plugin_memory_vector_qdrant": {

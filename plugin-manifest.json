@@ -354,6 +354,19 @@
         "tmux_history_limit"
       ]
     },
+    "plugin_email_yahoo": {
+      "type": "data_tool",
+      "file": "plugin_email_yahoo.py",
+      "description": "Yahoo email triage: scan INBOX, classify via rules+LLM, log decisions, notify on important",
+      "dependencies": [],
+      "env_vars": [
+        "YAHOO_EMAIL",
+        "YAHOO_APP_PASSWORD"
+      ],
+      "config_files": [],
+      "priority": 600,
+      "tools": []
+    },
     "plugin_mcp_direct": {
       "type": "client_interface",
       "file": "plugin_mcp_direct.py",

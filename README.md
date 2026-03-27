@@ -497,9 +497,9 @@ open-webui   ─HTTP──►  ┌───────────────�
 LM Studio    ─HTTP──►  │ routes.py                │    FriendliAI serverless
                        │                          │    llama.cpp / Ollama
 Slack ─Socket Mode──►  │ agents.py (agentic_lc)   │
-api_client   ─HTTP──►  │   LangChain bind_tools() │
-Agent B ──────HTTP──►  │   ChatOpenAI             │──► MySQL
-                       │   ChatGoogleGenerativeAI │──► Google Drive
+iOS SMS ──────HTTP──►  │   LangChain bind_tools() │
+api_client   ─HTTP──►  │   ChatOpenAI             │──► MySQL
+Agent B ──────HTTP──►  │   ChatGoogleGenerativeAI │──► Google Drive
                        │ plugin_*.py              │──► Web search APIs
                        └──────────────────────────┘──► Qdrant + nomic-embed-text
                                     │ agent_call tool

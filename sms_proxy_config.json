@@ -1,0 +1,8 @@
+{
+    "llmem_gw_url": "http://YOUR_SERVER_IP:8767",
+    "poll_interval": 2,
+    "outbound_poll_interval": 3,
+    "allowed_numbers": [],
+    "blocked_numbers": [],
+    "max_message_age": 60
+}

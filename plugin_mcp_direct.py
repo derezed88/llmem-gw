@@ -27,7 +27,7 @@ import os
 import logging
 from typing import List, Any, Dict
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
 from starlette.requests import Request
@@ -57,23 +57,36 @@ mcp = FastMCP(
 _DEFAULT_DB = os.getenv("MCP_DIRECT_DB", "mymcp")
 _CLIENT_ID_PREFIX = "claude-code"
 
-# Workspace registry: name → {database, channel, registered_at}
-# Populated by workspace_register() at session start.
-_workspaces: dict = {}
-_active_workspace: str = "default"  # current workspace name
+# Workspace registry: MCP session_id → {name, database, channel}
+# Each Claude Code workspace gets its own MCP SSE session.
+_session_workspaces: dict = {}  # mcp_session_id → workspace config
+_workspaces: dict = {}          # workspace_name → workspace config (for relay lookups)
+
+
+def _get_workspace_for_session() -> dict:
+    """Get workspace config for the current MCP session, or default."""
+    try:
+        ctx = mcp.get_context()
+        if ctx and ctx.session:
+            sid = id(ctx.session)
+            if sid in _session_workspaces:
+                return _session_workspaces[sid]
+    except Exception:
+        pass
+    return {"name": "default", "database": _DEFAULT_DB, "channel": "default"}
 
 
 def _set_context(database: str = ""):
     """Set database and client context for tool execution."""
     from database import set_db_override
     from state import current_client_id
-    # Use workspace-specific DB if registered, else default
-    db = database or _workspaces.get(_active_workspace, {}).get("database", _DEFAULT_DB)
+    ws = _get_workspace_for_session()
+    db = database or ws.get("database", _DEFAULT_DB)
     set_db_override(db)
     cid = current_client_id.get("")
-    ws = _active_workspace
+    ws_name = ws.get("name", "default")
     if not cid or not cid.startswith(_CLIENT_ID_PREFIX):
-        current_client_id.set(f"{_CLIENT_ID_PREFIX}-{ws}")
+        current_client_id.set(f"{_CLIENT_ID_PREFIX}-{ws_name}")
 
 
 @mcp.tool()
@@ -91,13 +104,20 @@ async def workspace_register(
               Also used as the voice relay channel name.
         database: MySQL database to use (e.g. 'mymcp', 'gedmath', 'gedreading')
     """
-    global _active_workspace
-    _workspaces[name] = {
+    ws_config = {
+        "name": name,
         "database": database,
         "channel": name,
         "registered_at": __import__("time").time(),
     }
-    _active_workspace = name
+    _workspaces[name] = ws_config
+    # Map this MCP session to the workspace
+    try:
+        ctx = mcp.get_context()
+        if ctx and ctx.session:
+            _session_workspaces[id(ctx.session)] = ws_config
+    except Exception:
+        pass
     _set_context()
     return f"Workspace '{name}' registered → database={database}, relay channel={name}"
 
@@ -1569,8 +1589,8 @@ _RELAY_BACKOFF_TIERS = [
 
 
 def _get_relay(channel: str = "") -> dict:
-    """Get or create a relay channel. Uses active workspace if no channel specified."""
-    ch = channel or _active_workspace or "default"
+    """Get or create a relay channel. Uses session workspace if no channel specified."""
+    ch = channel or _get_workspace_for_session().get("channel", "default")
     if ch not in _relay_channels:
         _relay_channels[ch] = {
             "enabled": False,
@@ -1593,7 +1613,7 @@ async def voice_relay_mode(
         action: 'on' to enable, 'off' to disable, 'status' to check
     """
     relay = _get_relay()
-    ch = _active_workspace or "default"
+    ch = _get_workspace_for_session().get("channel", "default")
     if action == "on":
         relay["enabled"] = True
         relay["inbox"].clear()

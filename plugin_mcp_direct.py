@@ -1695,8 +1695,9 @@ async def voice_relay_respond(
 ) -> str:
     """Respond to a voice relay message. The response will be spoken by the voice frontend.
 
-    Keep responses SHORT and conversational — they'll be spoken aloud via TTS.
-    No markdown, no code blocks, no long explanations.
+    Format responses according to your workspace rules (CLAUDE.md).
+    For voice-only workspaces: keep it short and conversational.
+    For chat/GED workspaces: use full markdown, math, and formatting.
 
     Args:
         message_id: The id from voice_relay_check()

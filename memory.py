@@ -267,9 +267,9 @@ async def save_memory(
     """Insert a new short-term memory row. Returns new row id, or 0 if duplicate/error."""
     if not _mem_plugin_cfg().get("enabled", True):
         return 0
-    topic = topic.replace("'", "''")[:255]
-    content = content.replace("'", "''")
-    session_id = (session_id or "").replace("'", "''")[:255]
+    topic = topic.replace("\\", "\\\\").replace("'", "''")[:255]
+    content = content.replace("\\", "\\\\").replace("'", "''")
+    session_id = (session_id or "").replace("\\", "\\\\").replace("'", "''")[:255]
     source = source if source in ("session", "user", "directive", "assistant") else "session"
     importance = max(1, min(10, int(importance)))
     mem_type = type if type in _MEMORY_TYPES else "context"
@@ -525,9 +525,9 @@ async def save_lt_memory(
     """Insert directly into long-term memory. Returns new LT row id, or 0 on error/duplicate."""
     if not _mem_plugin_cfg().get("enabled", True):
         return 0
-    topic      = topic.replace("'", "''")[:255]
-    content    = content.replace("'", "''")
-    session_id = (session_id or "").replace("'", "''")[:255]
+    topic      = topic.replace("\\", "\\\\").replace("'", "''")[:255]
+    content    = content.replace("\\", "\\\\").replace("'", "''")
+    session_id = (session_id or "").replace("\\", "\\\\").replace("'", "''")[:255]
     source     = source if source in ("session", "user", "directive", "assistant") else "session"
     importance = max(1, min(10, int(importance)))
 
@@ -594,9 +594,9 @@ async def save_cognition(
     if origin not in _COGNITION_ORIGINS:
         log.warning(f"save_cognition: unknown origin {origin!r}, falling back to 'reflection'")
         origin = "reflection"
-    topic      = topic.replace("'", "''")[:255]
-    content    = content.replace("'", "''")
-    session_id = (session_id or "").replace("'", "''")[:255]
+    topic      = topic.replace("\\", "\\\\").replace("'", "''")[:255]
+    content    = content.replace("\\", "\\\\").replace("'", "''")
+    session_id = (session_id or "").replace("\\", "\\\\").replace("'", "''")[:255]
     source     = source if source in ("session", "user", "directive", "assistant") else "session"
     importance = max(1, min(10, int(importance)))
 
@@ -1658,7 +1658,7 @@ async def refresh_self_summary(llm_call_fn=None) -> str:
 
     try:
         all_rows = await _fd(
-            f"SELECT id, loop, topic, content, importance FROM {_COGNITION()} "
+            f"SELECT id, `loop`, topic, content, importance FROM {_COGNITION()} "
             f"WHERE origin IN ('reflection', 'tool_failure', 'goal_health') "
             f"AND topic != 'self-summary' "
             f"ORDER BY importance DESC, id DESC LIMIT 40"

@@ -1580,12 +1580,23 @@ import time as _time
 _relay_channels: dict = {}
 _relay_msg_counter = 0
 
+# Concurrent polling cap — limits how many voice_relay_check() calls can
+# long-poll simultaneously.  Excess callers yield immediately with "(busy)".
+# Prevents event loop starvation when 6+ Claude Code sessions poll at once.
+_MAX_CONCURRENT_POLLS = 4
+_active_polls = 0
+
 # Adaptive backoff: server adjusts effective wait based on time since last message
 _RELAY_BACKOFF_TIERS = [
     (120,  5),   # last message < 2 min ago → 5s effective wait (active conversation)
     (300,  15),  # last message 2-5 min ago → 15s (recent activity)
     (None, 30),  # last message > 5 min ago → 30s (idle)
 ]
+
+# Idle timeout: after this many consecutive empty polls, auto-disable relay
+# to stop Claude Code from burning tokens on an idle session.
+# Frontends auto-restart the workspace on next user interaction.
+_RELAY_MAX_EMPTY_POLLS = 40
 
 
 def _get_relay(channel: str = "") -> dict:
@@ -1598,6 +1609,7 @@ def _get_relay(channel: str = "") -> dict:
             "outbox": deque(maxlen=50),
             "inbox_event": None,
             "last_message_at": 0.0,
+            "empty_polls": 0,
         }
     return _relay_channels[ch]
 
@@ -1619,6 +1631,7 @@ async def voice_relay_mode(
         relay["inbox"].clear()
         relay["outbox"].clear()
         relay["last_message_at"] = _time.time()
+        relay["empty_polls"] = 0
         return (
             f"Voice relay mode ENABLED on channel '{ch}'.\n"
             "Poll with voice_relay_check() to see incoming messages.\n"
@@ -1649,9 +1662,22 @@ async def voice_relay_check(
     Args:
         wait: Max seconds to wait for a message (default 15, max 30)
     """
+    global _active_polls
     relay = _get_relay()
     if not relay["enabled"]:
-        return "(voice relay mode is not enabled)"
+        await _asyncio.sleep(2)
+        return "(voice relay mode is not enabled — STOP POLLING and exit the loop)"
+
+    # Concurrent polling cap — prevent event loop starvation when many
+    # Claude Code sessions poll at once.  Excess callers get a short backoff
+    # instead of a long block, keeping the event loop responsive for Slack etc.
+    if _active_polls >= _MAX_CONCURRENT_POLLS:
+        await _asyncio.sleep(1)
+        # Still check inbox in case a message arrived
+        if relay["inbox"]:
+            pass  # fall through to message delivery below
+        else:
+            return "(no messages — polling slots full, retrying soon)"
 
     # Adaptive backoff: use time since last message to determine effective wait
     last_msg = relay["last_message_at"]
@@ -1664,19 +1690,34 @@ async def voice_relay_check(
 
     # If inbox is empty, long-poll until a message arrives or timeout
     if not relay["inbox"]:
-        evt = relay.get("inbox_event")
-        if evt is None:
-            evt = _asyncio.Event()
-            relay["inbox_event"] = evt
-        evt.clear()
+        _active_polls += 1
         try:
-            await _asyncio.wait_for(evt.wait(), timeout=effective_wait)
-        except _asyncio.TimeoutError:
-            pass
+            evt = relay.get("inbox_event")
+            if evt is None:
+                evt = _asyncio.Event()
+                relay["inbox_event"] = evt
+            evt.clear()
+            try:
+                await _asyncio.wait_for(evt.wait(), timeout=effective_wait)
+            except _asyncio.TimeoutError:
+                pass
+        finally:
+            _active_polls -= 1
 
     if not relay["inbox"]:
+        relay["empty_polls"] = relay.get("empty_polls", 0) + 1
+        if relay["empty_polls"] >= _RELAY_MAX_EMPTY_POLLS:
+            relay["enabled"] = False
+            ch = _get_workspace_for_session().get("channel", "default")
+            return (
+                f"(idle_timeout — relay auto-disabled on channel '{ch}' after "
+                f"{_RELAY_MAX_EMPTY_POLLS} empty polls to conserve tokens. "
+                "STOP POLLING. The frontend will auto-restart on next user interaction.)"
+            )
         return "(no messages)"
 
+    # Messages available — reset idle counter
+    relay["empty_polls"] = 0
     lines = [f"## Incoming Voice Messages ({len(relay['inbox'])} pending)\n"]
     for msg in relay["inbox"]:
         age = int(_time.time() - msg["timestamp"])
@@ -1834,11 +1875,15 @@ async def endpoint_voice_relay_status(request: Request) -> JSONResponse:
     channel = request.query_params.get("channel", "")
     if channel:
         relay = _get_relay(channel)
+        empty = relay.get("empty_polls", 0)
         return JSONResponse({
             "channel": channel,
             "enabled": relay["enabled"],
             "inbox_count": len(relay["inbox"]),
             "outbox_count": len(relay["outbox"]),
+            "empty_polls": empty,
+            "idle_limit": _RELAY_MAX_EMPTY_POLLS,
+            "polls_remaining": max(0, _RELAY_MAX_EMPTY_POLLS - empty) if relay["enabled"] else 0,
         })
     # No channel specified — return all active channels
     channels = {}
@@ -1877,6 +1922,52 @@ async def endpoint_voice_relay_disable(request: Request) -> JSONResponse:
         _relay_channels[channel]["inbox"].clear()
         _relay_channels[channel]["outbox"].clear()
     return JSONResponse({"status": "disabled", "channel": channel})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Health check — used by bash scripts to detect stale MCP connections
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+async def endpoint_mcp_health(request: Request) -> JSONResponse:
+    """Check if a workspace's MCP + relay pipeline is operational.
+
+    Used by start scripts to decide warm restart vs cold restart.
+    "healthy" means the relay channel is enabled — i.e. a Claude Code session
+    successfully called voice_relay_mode("on") over MCP.  This is the
+    strongest proof of a working SSE connection without requiring explicit
+    workspace_register() (which only GED subjects use).
+
+    Query params:
+        channel : str  (relay channel name, e.g. 'ged-math' or 'default')
+    """
+    channel = request.query_params.get("channel", "default")
+
+    # Check workspace registration (optional — only GED subjects use it)
+    ws_registered = channel in _workspaces
+    ws_info = _workspaces.get(channel, {})
+
+    # Check relay state — this is the primary health signal.
+    # If relay is enabled, Claude Code has a working MCP SSE connection
+    # and successfully called voice_relay_mode("on").
+    relay = _relay_channels.get(channel, {})
+    relay_enabled = relay.get("enabled", False)
+
+    # Check if any MCP session is explicitly mapped to this workspace
+    mcp_session_found = False
+    for sid, ws in _session_workspaces.items():
+        if ws.get("channel") == channel:
+            mcp_session_found = True
+            break
+
+    return JSONResponse({
+        "channel": channel,
+        "workspace_registered": ws_registered,
+        "mcp_session": mcp_session_found,
+        "relay_enabled": relay_enabled,
+        "registered_at": ws_info.get("registered_at"),
+        "healthy": relay_enabled,
+    })
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1923,29 +2014,38 @@ async def endpoint_ged_start(request: Request) -> JSONResponse:
     if relay["enabled"]:
         return JSONResponse({"status": "already_running", "channel": channel})
 
-    # Launch via start script
+    # Launch via start script — fire-and-forget so we don't block the event loop.
+    # The script handles its own prompt detection and relay activation;
+    # we just poll _relay_channels until it comes up.
     if not os.path.exists(script):
         return JSONResponse({"error": f"Start script not found: {script}"}, status_code=500)
 
-    import subprocess
+    cmd = [script, arg] if arg else [script]
     try:
-        cmd = [script, arg] if arg else [script]
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=45,
+        proc = await _asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.PIPE,
         )
-        log.info(f"workspace_start: launched {channel}: {result.stdout.strip()}")
-        if result.returncode != 0:
-            log.warning(f"ged_start: stderr: {result.stderr.strip()}")
+        log.info(f"workspace_start: launched {channel} (pid {proc.pid})")
     except Exception as e:
         return JSONResponse({"error": f"Launch failed: {e}"}, status_code=500)
 
-    # Poll until relay comes up
-    # Fast checks first (warm restart takes ~5s), then slower (cold start takes ~60s)
+    # Poll until relay comes up or the script exits with an error.
+    # Fast checks first (warm restart ~5s), then slower (cold start ~55s).
     for i in range(60):
         await _asyncio.sleep(0.5 if i < 20 else 1.0)
         relay = _get_relay(channel)
         if relay["enabled"]:
             return JSONResponse({"status": "started", "channel": channel})
+        # If the script already exited with an error, stop waiting
+        if proc.returncode is not None and proc.returncode != 0:
+            stderr = (await proc.stderr.read()).decode().strip() if proc.stderr else ""
+            log.warning(f"workspace_start: {channel} script failed (rc={proc.returncode}): {stderr}")
+            return JSONResponse({
+                "error": f"Start script exited with code {proc.returncode}",
+                "detail": stderr,
+            }, status_code=500)
 
     return JSONResponse({
         "status": "timeout",
@@ -2066,6 +2166,7 @@ class Plugin(BasePlugin):
         routes.append(Route("/voice_relay/status", endpoint_voice_relay_status, methods=["GET"]))
         routes.append(Route("/ged/start", endpoint_ged_start, methods=["POST"]))
         routes.append(Route("/voice_relay/disable", endpoint_voice_relay_disable, methods=["POST"]))
+        routes.append(Route("/mcp/health", endpoint_mcp_health, methods=["GET"]))
         return routes
 
     def get_config(self) -> dict:

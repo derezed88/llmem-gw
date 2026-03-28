@@ -1857,6 +1857,99 @@ async def endpoint_voice_relay_status(request: Request) -> JSONResponse:
     })
 
 
+async def endpoint_voice_relay_disable(request: Request) -> JSONResponse:
+    """Disable a relay channel and clear its queues.
+
+    Body (JSON):
+        channel : str  (relay channel name)
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    channel = payload.get("channel", "")
+    if not channel:
+        return JSONResponse({"error": "Missing channel"}, status_code=400)
+
+    if channel in _relay_channels:
+        _relay_channels[channel]["enabled"] = False
+        _relay_channels[channel]["inbox"].clear()
+        _relay_channels[channel]["outbox"].clear()
+    return JSONResponse({"status": "disabled", "channel": channel})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GED workspace auto-launcher
+# ═══════════════════════════════════════════════════════════════════════════
+
+_GED_START_SCRIPT = os.path.expanduser("~/projects/samaritan-ged/ged-start.sh")
+
+# Map channel names to ged-start.sh subject argument
+_GED_CHANNEL_TO_SUBJECT = {
+    "ged-math": "math",
+    "ged-reading": "reading",
+    "ged-writing": "writing",
+    "ged-science": "science",
+    "ged-social": "social",
+}
+
+
+async def endpoint_ged_start(request: Request) -> JSONResponse:
+    """Start a GED Claude Code workspace on demand.
+
+    Body (JSON):
+        channel : str  (relay channel name, e.g. 'ged-math')
+
+    Launches the workspace in tmux if not already running.
+    Polls until the relay is enabled (up to 30s).
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    channel = payload.get("channel", "")
+    subject = _GED_CHANNEL_TO_SUBJECT.get(channel)
+    if not subject:
+        return JSONResponse({"error": f"Unknown channel: {channel}"}, status_code=400)
+
+    # Check if already running
+    relay = _get_relay(channel)
+    if relay["enabled"]:
+        return JSONResponse({"status": "already_running", "channel": channel})
+
+    # Launch via ged-start.sh
+    if not os.path.exists(_GED_START_SCRIPT):
+        return JSONResponse({"error": "ged-start.sh not found"}, status_code=500)
+
+    import subprocess
+    try:
+        result = subprocess.run(
+            [_GED_START_SCRIPT, subject],
+            capture_output=True, text=True, timeout=15,
+        )
+        log.info(f"ged_start: launched {subject}: {result.stdout.strip()}")
+        if result.returncode != 0:
+            log.warning(f"ged_start: stderr: {result.stderr.strip()}")
+    except Exception as e:
+        return JSONResponse({"error": f"Launch failed: {e}"}, status_code=500)
+
+    # Poll until relay comes up
+    # Fast checks first (warm restart takes ~5s), then slower (cold start takes ~60s)
+    for i in range(60):
+        await _asyncio.sleep(0.5 if i < 20 else 1.0)
+        relay = _get_relay(channel)
+        if relay["enabled"]:
+            return JSONResponse({"status": "started", "channel": channel})
+
+    return JSONResponse({
+        "status": "timeout",
+        "channel": channel,
+        "message": "Workspace launched but relay not yet enabled. May need more time.",
+    })
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Conversation logging endpoint (called by Claude Code hook)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1967,6 +2060,8 @@ class Plugin(BasePlugin):
         routes.append(Route("/voice_relay/submit", endpoint_voice_relay_submit, methods=["POST"]))
         routes.append(Route("/voice_relay/poll", endpoint_voice_relay_poll, methods=["GET"]))
         routes.append(Route("/voice_relay/status", endpoint_voice_relay_status, methods=["GET"]))
+        routes.append(Route("/ged/start", endpoint_ged_start, methods=["POST"]))
+        routes.append(Route("/voice_relay/disable", endpoint_voice_relay_disable, methods=["POST"]))
         return routes
 
     def get_config(self) -> dict:

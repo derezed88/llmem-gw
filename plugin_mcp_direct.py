@@ -1927,7 +1927,7 @@ async def endpoint_ged_start(request: Request) -> JSONResponse:
     try:
         result = subprocess.run(
             [_GED_START_SCRIPT, subject],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=45,
         )
         log.info(f"ged_start: launched {subject}: {result.stdout.strip()}")
         if result.returncode != 0:

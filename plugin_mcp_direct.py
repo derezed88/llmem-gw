@@ -1884,25 +1884,27 @@ async def endpoint_voice_relay_disable(request: Request) -> JSONResponse:
 # ═══════════════════════════════════════════════════════════════════════════
 
 _GED_START_SCRIPT = os.path.expanduser("~/projects/samaritan-ged/ged-start.sh")
+_CLAUDE_START_SCRIPT = os.path.expanduser("~/projects/samaritan-work/claude-start.sh")
 
-# Map channel names to ged-start.sh subject argument
-_GED_CHANNEL_TO_SUBJECT = {
-    "ged-math": "math",
-    "ged-reading": "reading",
-    "ged-writing": "writing",
-    "ged-science": "science",
-    "ged-social": "social",
+# Map channel names to launch scripts and arguments
+_CHANNEL_LAUNCHERS = {
+    "ged-math":    (_GED_START_SCRIPT, "math"),
+    "ged-reading": (_GED_START_SCRIPT, "reading"),
+    "ged-writing": (_GED_START_SCRIPT, "writing"),
+    "ged-science": (_GED_START_SCRIPT, "science"),
+    "ged-social":  (_GED_START_SCRIPT, "social"),
+    "default":     (_CLAUDE_START_SCRIPT, None),
 }
 
 
 async def endpoint_ged_start(request: Request) -> JSONResponse:
-    """Start a GED Claude Code workspace on demand.
+    """Start a Claude Code workspace on demand.
 
     Body (JSON):
-        channel : str  (relay channel name, e.g. 'ged-math')
+        channel : str  (relay channel name, e.g. 'ged-math' or 'default')
 
     Launches the workspace in tmux if not already running.
-    Polls until the relay is enabled (up to 30s).
+    Polls until the relay is enabled.
     """
     try:
         payload = await request.json()
@@ -1910,26 +1912,28 @@ async def endpoint_ged_start(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
     channel = payload.get("channel", "")
-    subject = _GED_CHANNEL_TO_SUBJECT.get(channel)
-    if not subject:
+    launcher = _CHANNEL_LAUNCHERS.get(channel)
+    if not launcher:
         return JSONResponse({"error": f"Unknown channel: {channel}"}, status_code=400)
+
+    script, arg = launcher
 
     # Check if already running
     relay = _get_relay(channel)
     if relay["enabled"]:
         return JSONResponse({"status": "already_running", "channel": channel})
 
-    # Launch via ged-start.sh
-    if not os.path.exists(_GED_START_SCRIPT):
-        return JSONResponse({"error": "ged-start.sh not found"}, status_code=500)
+    # Launch via start script
+    if not os.path.exists(script):
+        return JSONResponse({"error": f"Start script not found: {script}"}, status_code=500)
 
     import subprocess
     try:
+        cmd = [script, arg] if arg else [script]
         result = subprocess.run(
-            [_GED_START_SCRIPT, subject],
-            capture_output=True, text=True, timeout=45,
+            cmd, capture_output=True, text=True, timeout=45,
         )
-        log.info(f"ged_start: launched {subject}: {result.stdout.strip()}")
+        log.info(f"workspace_start: launched {channel}: {result.stdout.strip()}")
         if result.returncode != 0:
             log.warning(f"ged_start: stderr: {result.stderr.strip()}")
     except Exception as e:

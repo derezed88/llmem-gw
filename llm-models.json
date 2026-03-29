@@ -23,7 +23,6 @@
       ],
       "system_prompt_folder": "system_prompt/000_default",
       "temperature": 1.0,
-      "top_p": 1.0,
       "top_k": null,
       "openai_responses_api": true,
       "token_selection_setting": "default"
@@ -76,7 +75,6 @@
       ],
       "system_prompt_folder": "system_prompt/000_default",
       "temperature": 1.0,
-      "top_p": 1.0,
       "top_k": null,
       "openai_responses_api": true,
       "token_selection_setting": "default"
@@ -846,7 +844,6 @@
       "llm_tools": [],
       "system_prompt_folder": "none",
       "temperature": 0.3,
-      "top_p": 0.9,
       "top_k": null,
       "max_tokens": 8192,
       "token_selection_setting": "custom",
@@ -910,7 +907,6 @@
       "llm_tools": [],
       "system_prompt_folder": "none",
       "temperature": 0.4,
-      "top_p": 0.9,
       "top_k": null,
       "max_tokens": 4096,
       "token_selection_setting": "custom",

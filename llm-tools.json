@@ -25,15 +25,7 @@
     "qwen": {
       "tools": [
       "db_query",
-      "search_tavily",
-      "tmux_new", 
-      "tmux_exec", 
-      "tmux_ls", 
-      "tmux_kill_session", 
-      "tmux_kill_server", 
-      "tmux_history", 
-      "tmux_history_limit", 
-      "tmux_call_limit"
+      "search_tavily"
     ],
       "always_active": true,
       "sp_section": null
@@ -44,11 +36,40 @@
       "heat_curve": [20, 50],
       "sp_section": null
     },
+    "search_perplexity": {
+      "tools": ["perplexity_search", "sonar_answer", "perplexity_research"],
+      "always_active": true,
+      "sp_section": "tool_search_perplexity"
+    },
     "drive": {
       "tools": ["google_drive"],
       "always_active": false,
       "heat_curve": [20, 50],
       "sp_section": "tool_google_drive"
+    },
+    "calendar": {
+      "tools": ["google_calendar"],
+      "always_active": false,
+      "heat_curve": [20, 50],
+      "sp_section": null
+    },
+    "geocode": {
+      "tools": ["geocode"],
+      "always_active": false,
+      "heat_curve": [20, 50],
+      "sp_section": null
+    },
+    "places": {
+      "tools": ["places"],
+      "always_active": false,
+      "heat_curve": [20, 50],
+      "sp_section": null
+    },
+    "weather": {
+      "tools": ["weather"],
+      "always_active": false,
+      "heat_curve": [20, 50],
+      "sp_section": null
     },
     "vscode": {
       "tools": ["vscode_sessions_list", "vscode_sessions_read"],
@@ -96,6 +117,15 @@
       "always_active": false,
       "heat_curve": [20, 60],
       "sp_section": "tool_procedures"
+    },
+    "sms": {
+      "tools": ["sms_send"],
+      "always_active": true,
+      "sp_section": "tool_sms"
+    },
+    "probability": {
+      "tools": ["prob_calc"],
+      "always_active": true
     }
   },
   "metadata": {

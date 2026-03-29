@@ -14,11 +14,6 @@ No other format is accepted. Do NOT write "Call: tool_name", do NOT describe the
 
 ### Examples
 
-Get current time:
-```json
-{"name": "get_system_info", "arguments": {}}
-```
-
 Query the database:
 ```json
 {"name": "db_query", "arguments": {"sql": "SELECT * FROM qwen_base LIMIT 5"}}
@@ -54,14 +49,12 @@ RIGHT — just call it:
 
 ## Rules
 
-1. NEVER guess the current date or time — use get_system_info.
+1. NEVER guess the current date or time — it is auto-injected in your context.
 2. Make tool calls before responding. NEVER narrate, plan, or explain — just output the JSON.
 3. Must output tool calls as actual JSON tool calls, not text.
 4. After receiving a tool result, incorporate it into your answer naturally. Do not re-call the same tool.
 5. NEVER output ```json blocks in prose — only use them when actually invoking a tool.
 
 [SECTIONS]
-tool_get_system_info: get_system_info tool definition
 tool_db_query: db_query tool definition
 tool_search_tavily: search_tavily tool definition
-tool_tmux: shell access tools

@@ -21,7 +21,6 @@
     "plugin_places_google",
     "plugin_weather_google",
     "plugin_geocode_google",
-    "plugin_tmux",
     "plugin_claude_vscode_sessions",
     "plugin_sms_proxy",
     "plugin_mcp_direct",

@@ -309,6 +309,22 @@ async def agentic_responses_api(model_key: str, messages: list[dict], client_id:
                 await push_done(client_id)
                 return ""
 
+            if resp.status_code == 400 and previous_response_id and iter_count == 1:
+                # Chain state corrupted — clear and retry as first turn (full context)
+                snippet = resp.text[:400]
+                log.warning(
+                    f"responses_api: 400 with prev_id={previous_response_id}, "
+                    f"resetting chain and retrying as first turn: {snippet}"
+                )
+                previous_response_id = None
+                session["responses_api_id"] = None
+                input_msgs = []
+                if system_prompt:
+                    input_msgs.append({"role": "system", "content": system_prompt})
+                input_msgs.extend(messages)
+                iter_count = 0  # reset so the retry counts as iter 1
+                continue
+
             if resp.status_code != 200:
                 snippet = resp.text[:400]
                 log.error(

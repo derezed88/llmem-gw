@@ -317,6 +317,27 @@ async def cogn_status() -> str:
     except Exception:
         pass
 
+    # --- Emotion inference stats ---
+    try:
+        from emotions import get_emotion_stats, _emotion_cfg
+        ecfg = _emotion_cfg()
+        es = get_emotion_stats()
+        lines.append("**Emotion Inference**")
+        lines.append(
+            f"  enabled={'ON' if ecfg['enabled'] else 'OFF'}  "
+            f"scans={es['scans_run']}  analyzed={es['memories_analyzed']}  "
+            f"stored={es['emotions_stored']}  below_threshold={es['below_threshold']}"
+        )
+        lines.append(
+            f"  avg_confidence={es['avg_confidence']}  "
+            f"last={es.get('last_scan_at', 'never')}"
+        )
+        if es.get("last_error"):
+            lines.append(f"  last_error: {es['last_error']}")
+        lines.append("")
+    except Exception:
+        pass
+
     # --- Drives ---
     try:
         from memory import load_drives
@@ -420,7 +441,7 @@ async def cogn_control(
             'clear_flags' — retract all open contradiction flags
             'reset_feedback' — reset feedback streak for a loop (target=loop name)
             'set_interval' — set loop interval in minutes (target=loop name, value=minutes)
-        target: Loop name ('contradiction', 'prospective', 'reflection', 'temporal')
+        target: Loop name ('contradiction', 'prospective', 'reflection', 'temporal', 'emotions')
                 or goal ID (for approve/reject)
         value: Interval value for set_interval (minutes)
     """
@@ -463,16 +484,30 @@ async def cogn_control(
             "run_fn": lambda: __import__("temporal_inference").run_temporal_inference,
             "label": "Temporal inference",
         },
+        "emotions": {
+            "flag": "inference_enabled",
+            "trig_fn": lambda: __import__("emotions").trigger_now,
+            "run_fn": lambda: __import__("emotions").run_scan,
+            "label": "Emotion inference",
+        },
     }
 
     if action == "loop_on" and target in _loop_map:
-        from contradiction import set_runtime_override
-        set_runtime_override(_loop_map[target]["flag"], True)
+        if target == "emotions":
+            from emotions import set_runtime_override as _emo_ovr
+            _emo_ovr(_loop_map[target]["flag"], True)
+        else:
+            from contradiction import set_runtime_override
+            set_runtime_override(_loop_map[target]["flag"], True)
         return f"{_loop_map[target]['label']}: ON"
 
     if action == "loop_off" and target in _loop_map:
-        from contradiction import set_runtime_override
-        set_runtime_override(_loop_map[target]["flag"], False)
+        if target == "emotions":
+            from emotions import set_runtime_override as _emo_ovr
+            _emo_ovr(_loop_map[target]["flag"], False)
+        else:
+            from contradiction import set_runtime_override
+            set_runtime_override(_loop_map[target]["flag"], False)
         return f"{_loop_map[target]['label']}: OFF"
 
     if action == "loop_run" and target in _loop_map:
@@ -504,11 +539,16 @@ async def cogn_control(
                 "contradiction": "contradiction_interval_m",
                 "prospective": "prospective_interval_m",
                 "reflection": "reflection_interval_m",
+                "emotions": "inference_interval_m",
             }
             key = _interval_keys.get(target)
             if not key:
                 return f"Interval setting not supported for {target}"
-            set_runtime_override(key, minutes)
+            if target == "emotions":
+                from emotions import set_runtime_override as _emo_ovr
+                _emo_ovr(key, minutes)
+            else:
+                set_runtime_override(key, minutes)
             return f"{target} interval set to {minutes}m"
         except ValueError:
             return f"Invalid interval value: {value}"
@@ -580,6 +620,71 @@ async def cogn_control(
         f"loop_run, approve_goal, reject_goal, clear_flags, reset_feedback, set_interval"
     )
 
+async def _load_emotion_context() -> str:
+    """Build a concise emotional tone summary from recent samaritan_emotions data."""
+    from database import fetch_dicts
+
+    lines = []
+    try:
+        # Recent emotional tone (last 24h)
+        recent = await fetch_dicts(
+            "SELECT emotion_label, COUNT(*) as cnt, "
+            "ROUND(AVG(intensity),2) as avg_int, ROUND(AVG(confidence),2) as avg_conf "
+            "FROM samaritan_emotions "
+            "WHERE created_at >= NOW() - INTERVAL 24 HOUR "
+            "GROUP BY emotion_label ORDER BY cnt DESC LIMIT 8"
+        )
+        if recent:
+            top = ", ".join(
+                f"{r['emotion_label']} ({r['cnt']}×, int={r['avg_int']})"
+                for r in recent
+            )
+            lines.append(f"**Last 24h**: {top}")
+
+        # Emotional trend — compare last 24h dominant emotion vs prior 7 days
+        trend = await fetch_dicts(
+            "SELECT "
+            "  (SELECT emotion_label FROM samaritan_emotions "
+            "   WHERE created_at >= NOW() - INTERVAL 24 HOUR "
+            "   GROUP BY emotion_label ORDER BY COUNT(*) DESC LIMIT 1) AS recent_dominant, "
+            "  (SELECT emotion_label FROM samaritan_emotions "
+            "   WHERE created_at BETWEEN NOW() - INTERVAL 7 DAY AND NOW() - INTERVAL 24 HOUR "
+            "   GROUP BY emotion_label ORDER BY COUNT(*) DESC LIMIT 1) AS prior_dominant, "
+            "  (SELECT ROUND(AVG(intensity),2) FROM samaritan_emotions "
+            "   WHERE created_at >= NOW() - INTERVAL 24 HOUR) AS recent_avg_int, "
+            "  (SELECT ROUND(AVG(intensity),2) FROM samaritan_emotions "
+            "   WHERE created_at BETWEEN NOW() - INTERVAL 7 DAY AND NOW() - INTERVAL 24 HOUR) AS prior_avg_int"
+        )
+        if trend and trend[0].get("recent_dominant"):
+            t = trend[0]
+            recent_d = t.get("recent_dominant", "?")
+            prior_d = t.get("prior_dominant")
+            recent_i = t.get("recent_avg_int", 0)
+            prior_i = t.get("prior_avg_int")
+            if prior_d and prior_d != recent_d:
+                lines.append(f"**Shift**: dominant tone moved from {prior_d} → {recent_d}")
+            if prior_i and recent_i:
+                delta = float(recent_i) - float(prior_i)
+                if abs(delta) >= 0.1:
+                    direction = "↑" if delta > 0 else "↓"
+                    lines.append(f"**Intensity**: {direction} {abs(delta):.2f} vs prior week")
+
+        # Overall stats
+        total = await fetch_dicts(
+            "SELECT COUNT(*) as total FROM samaritan_emotions"
+        )
+        if total:
+            lines.append(f"**Total emotions tracked**: {total[0]['total']}")
+
+    except Exception as e:
+        return ""
+
+    if not lines:
+        return ""
+
+    return "## Emotional Context\n\n" + "\n".join(f"  {l}" for l in lines)
+
+
 @mcp.tool()
 async def load_context(
     query: str = "",
@@ -637,6 +742,9 @@ async def load_context(
     # Temporal patterns
     if include_temporal:
         tasks["temporal"] = asyncio.create_task(load_temporal_context())
+
+    # Emotional context — recent emotional tone from samaritan_emotions
+    tasks["emotions"] = asyncio.create_task(_load_emotion_context())
 
     # Collect results (2s deadline — degrade gracefully if Qdrant is slow)
     done, pending = await asyncio.wait(tasks.values(), timeout=3.0)
@@ -1270,9 +1378,10 @@ async def procedure_recall(
 
 @mcp.tool()
 async def db_query(sql: str) -> str:
-    """Execute a SQL query against the MySQL database (SELECT/INSERT/UPDATE/DELETE).
+    """Execute a SQL query against the MySQL database.
 
-    The database is the mymcp system-of-record. DDL (CREATE/ALTER/DROP) is blocked.
+    The database is the mymcp system-of-record. All SQL is permitted
+    including DDL (CREATE/ALTER/DROP TABLE) for schema evolution.
 
     Args:
         sql: SQL statement to execute
@@ -1360,19 +1469,44 @@ async def google_calendar(
 async def weather(
     location: str,
     forecast_type: str = "current",
+    days: int = 5,
+    hours: int = 24,
 ) -> str:
     """Get weather data for a location.
 
     Args:
-        location: Place name (e.g. 'San Francisco, CA') — auto-geocoded
+        location: Place name (e.g. 'San Francisco, CA') — auto-geocoded to coordinates
         forecast_type: 'current', 'daily', 'hourly', or 'alerts'
+        days: Number of forecast days (daily only, max 10, default 5)
+        hours: Number of forecast hours (hourly only, max 240, default 24)
     """
     _set_context()
     try:
         from weather_google import run_weather_op
-        return await run_weather_op(location=location, forecast_type=forecast_type)
-    except ImportError:
-        return "Weather plugin not available"
+        from geocode_google import _cache_lookup, _geocode
+        import asyncio
+
+        # Geocode location string to lat/lng
+        cached = _cache_lookup(location)
+        if cached:
+            lat, lng = cached["latitude"], cached["longitude"]
+        else:
+            geo_result = await asyncio.to_thread(_geocode, location)
+            # Re-lookup cache after geocoding (it saves to cache)
+            cached = _cache_lookup(location)
+            if not cached:
+                return f"Could not geocode '{location}': {geo_result}"
+            lat, lng = cached["latitude"], cached["longitude"]
+
+        return await run_weather_op(
+            operation=forecast_type,
+            latitude=float(lat),
+            longitude=float(lng),
+            days=days,
+            hours=hours,
+        )
+    except ImportError as e:
+        return f"Weather plugin not available: {e}"
     except Exception as e:
         return f"Weather error: {e}"
 
@@ -1390,19 +1524,42 @@ async def places(
     Args:
         query: Search query (e.g. 'coffee shops near downtown')
         operation: 'text_search', 'nearby_search', 'place_details'
-        location: Center point for nearby_search (e.g. 'San Francisco')
+        location: Center point for nearby_search (e.g. 'San Francisco') — auto-geocoded
         radius: Search radius in meters (for nearby_search)
         place_id: For place_details
     """
     _set_context()
     try:
         from places_google import run_places_op
+        from geocode_google import _cache_lookup, _geocode
+        import asyncio
+
+        # Map MCP operation names to run_places_op operation names
+        op_map = {"text_search": "search", "nearby_search": "nearby", "place_details": "details"}
+        mapped_op = op_map.get(operation, operation)
+
+        # Geocode location string to lat/lng if provided
+        lat, lng = 0.0, 0.0
+        if location:
+            cached = _cache_lookup(location)
+            if cached:
+                lat, lng = float(cached["latitude"]), float(cached["longitude"])
+            else:
+                geo_result = await asyncio.to_thread(_geocode, location)
+                cached = _cache_lookup(location)
+                if cached:
+                    lat, lng = float(cached["latitude"]), float(cached["longitude"])
+
         return await run_places_op(
-            query=query, operation=operation, location=location,
-            radius=radius, place_id=place_id,
+            operation=mapped_op,
+            latitude=lat,
+            longitude=lng,
+            radius=float(radius),
+            query=query,
+            place_id=place_id,
         )
-    except ImportError:
-        return "Places plugin not available"
+    except ImportError as e:
+        return f"Places plugin not available: {e}"
     except Exception as e:
         return f"Places error: {e}"
 
@@ -1721,10 +1878,19 @@ async def voice_relay_check(
     lines = [f"## Incoming Voice Messages ({len(relay['inbox'])} pending)\n"]
     for msg in relay["inbox"]:
         age = int(_time.time() - msg["timestamp"])
-        lines.append(
+        line = (
             f"  [{msg['id']}] ({age}s ago) from {msg.get('source', 'voice')}: "
             f"{msg['text']}"
         )
+        # Append voice prosody/emotion metadata if present (from xAI STT)
+        if msg.get("emotion"):
+            em = msg["emotion"]
+            line += (
+                f"\n    [voice prosody: emotion={em.get('emotion', '?')}, "
+                f"confidence={em.get('confidence', '?')}, "
+                f"prosody=\"{em.get('prosody', '')}\"]"
+            )
+        lines.append(line)
     lines.append("\nRespond with voice_relay_respond(message_id=N, text='your response')")
     return "\n".join(lines)
 
@@ -1822,6 +1988,9 @@ async def endpoint_voice_relay_submit(request: Request) -> JSONResponse:
         "source": payload.get("source", "voice"),
         "timestamp": _time.time(),
     }
+    # Pass through emotion/prosody metadata from xAI STT if present
+    if payload.get("emotion"):
+        msg["emotion"] = payload["emotion"]
     relay["inbox"].append(msg)
     relay["last_message_at"] = _time.time()
     log.info(f"voice_relay[{channel}]: inbound msg #{msg['id']} from {msg['source']}: {text[:80]}")
@@ -2009,10 +2178,33 @@ async def endpoint_ged_start(request: Request) -> JSONResponse:
 
     script, arg = launcher
 
-    # Check if already running
-    relay = _get_relay(channel)
-    if relay["enabled"]:
-        return JSONResponse({"status": "already_running", "channel": channel})
+    # Check if already running — dispatch channels use tmux check, relay channels check relay
+    if channel in _DISPATCH_TMUX_SESSIONS:
+        dispatch = _get_dispatch(channel)
+        tmux_session = dispatch["tmux_session"]
+        proc_check = await _asyncio.create_subprocess_exec(
+            "tmux", "has-session", "-t", tmux_session,
+            stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
+        )
+        if await proc_check.wait() == 0:
+            # tmux exists — check if Claude is alive
+            proc_pane = await _asyncio.create_subprocess_exec(
+                "tmux", "list-panes", "-t", tmux_session, "-F", "#{pane_pid}",
+                stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc_pane.communicate()
+            pane_pid = stdout.decode().strip().split("\n")[0]
+            if pane_pid:
+                proc_pg = await _asyncio.create_subprocess_exec(
+                    "pgrep", "-P", pane_pid, "-f", "claude",
+                    stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
+                )
+                if await proc_pg.wait() == 0:
+                    return JSONResponse({"status": "already_running", "channel": channel})
+    else:
+        relay = _get_relay(channel)
+        if relay["enabled"]:
+            return JSONResponse({"status": "already_running", "channel": channel})
 
     # Launch via start script — fire-and-forget so we don't block the event loop.
     # The script handles its own prompt detection and relay activation;
@@ -2031,13 +2223,37 @@ async def endpoint_ged_start(request: Request) -> JSONResponse:
     except Exception as e:
         return JSONResponse({"error": f"Launch failed: {e}"}, status_code=500)
 
-    # Poll until relay comes up or the script exits with an error.
+    # Poll until ready or the script exits with an error.
     # Fast checks first (warm restart ~5s), then slower (cold start ~55s).
     for i in range(60):
         await _asyncio.sleep(0.5 if i < 20 else 1.0)
-        relay = _get_relay(channel)
-        if relay["enabled"]:
-            return JSONResponse({"status": "started", "channel": channel})
+
+        # Check readiness: dispatch channels check tmux, relay channels check relay
+        if channel in _DISPATCH_TMUX_SESSIONS:
+            tmux_sess = _get_dispatch(channel)["tmux_session"]
+            chk = await _asyncio.create_subprocess_exec(
+                "tmux", "has-session", "-t", tmux_sess,
+                stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
+            )
+            if await chk.wait() == 0:
+                p2 = await _asyncio.create_subprocess_exec(
+                    "tmux", "list-panes", "-t", tmux_sess, "-F", "#{pane_pid}",
+                    stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
+                )
+                out, _ = await p2.communicate()
+                ppid = out.decode().strip().split("\n")[0]
+                if ppid:
+                    p3 = await _asyncio.create_subprocess_exec(
+                        "pgrep", "-P", ppid, "-f", "claude",
+                        stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
+                    )
+                    if await p3.wait() == 0:
+                        return JSONResponse({"status": "started", "channel": channel})
+        else:
+            relay = _get_relay(channel)
+            if relay["enabled"]:
+                return JSONResponse({"status": "started", "channel": channel})
+
         # If the script already exited with an error, stop waiting
         if proc.returncode is not None and proc.returncode != 0:
             stderr = (await proc.stderr.read()).decode().strip() if proc.stderr else ""
@@ -2050,7 +2266,207 @@ async def endpoint_ged_start(request: Request) -> JSONResponse:
     return JSONResponse({
         "status": "timeout",
         "channel": channel,
-        "message": "Workspace launched but relay not yet enabled. May need more time.",
+        "message": "Workspace launched but not yet ready. May need more time.",
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RC-style tmux dispatch (replaces voice relay polling for Claude mode)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_dispatch_channels: Dict[str, dict] = {}
+
+_DISPATCH_TMUX_SESSIONS = {
+    "default":     "samaritan-work",
+    "ged-math":    "ged:math",
+    "ged-reading": "ged:reading",
+    "ged-writing": "ged:writing",
+    "ged-science": "ged:science",
+    "ged-social":  "ged:social",
+}
+
+
+_dispatch_locks: Dict[str, _asyncio.Lock] = {}
+
+def _get_dispatch(channel: str = "default") -> dict:
+    if channel not in _dispatch_channels:
+        _dispatch_channels[channel] = {
+            "pending_prompt": None,
+            "response_event": None,
+            "response_text": None,
+            "last_submit_at": 0.0,
+            "tmux_session": _DISPATCH_TMUX_SESSIONS.get(channel, "samaritan-work"),
+        }
+        _dispatch_locks[channel] = _asyncio.Lock()
+    return _dispatch_channels[channel]
+
+
+def _format_dispatch_prompt(text: str, source: str = "voice",
+                            emotion: dict = None) -> str:
+    """Format user text with source/emotion metadata prefix for Claude."""
+    prefix = f"[{source}"
+    if emotion:
+        em_label = emotion.get("emotion", "neutral")
+        em_conf = emotion.get("confidence", "")
+        prefix += f"|emotion:{em_label}"
+        if em_conf:
+            prefix += f"({em_conf})"
+        prosody = emotion.get("prosody", "")
+        if prosody:
+            prefix += f"|prosody:{prosody}"
+    prefix += "]"
+    return f"{prefix} {text}"
+
+
+async def endpoint_claude_submit(request: Request) -> JSONResponse:
+    """Submit a message to Claude Code via tmux send-keys.
+
+    Body: { text, source, emotion, channel }
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    text = payload.get("text", "").strip()
+    source = payload.get("source", "voice")
+    emotion = payload.get("emotion")
+    channel = payload.get("channel", "default")
+
+    if not text:
+        return JSONResponse({"error": "Missing text"}, status_code=400)
+
+    dispatch = _get_dispatch(channel)
+    tmux_session = dispatch["tmux_session"]
+
+    # Check tmux session is alive
+    proc = await _asyncio.create_subprocess_exec(
+        "tmux", "has-session", "-t", tmux_session,
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    if await proc.wait() != 0:
+        return JSONResponse(
+            {"error": f"tmux session '{tmux_session}' not found"},
+            status_code=503,
+        )
+
+    # Format prompt with metadata prefix
+    prompt = _format_dispatch_prompt(text, source, emotion)
+
+    # Prepare response capture
+    dispatch["response_text"] = None
+    dispatch["response_event"] = _asyncio.Event()
+    dispatch["pending_prompt"] = text
+    dispatch["last_submit_at"] = _time.time()
+
+    # Send to tmux (literal mode to avoid escaping issues)
+    proc = await _asyncio.create_subprocess_exec(
+        "tmux", "send-keys", "-l", "-t", tmux_session, prompt,
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    rc = await proc.wait()
+    if rc != 0:
+        return JSONResponse({"error": "tmux send-keys failed"}, status_code=503)
+
+    # Send Enter separately (send-keys -l doesn't interpret special keys)
+    proc2 = await _asyncio.create_subprocess_exec(
+        "tmux", "send-keys", "-t", tmux_session, "Enter",
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    await proc2.wait()
+
+    log.info(f"dispatch: sent to {tmux_session} ch={channel} src={source} "
+             f"emotion={emotion.get('emotion') if emotion else 'none'} "
+             f"text={text[:60]}")
+
+    return JSONResponse({"status": "submitted", "channel": channel})
+
+
+async def endpoint_claude_poll(request: Request) -> JSONResponse:
+    """Poll for Claude's response after a tmux dispatch.
+
+    Query params: wait (seconds), channel
+    """
+    channel = request.query_params.get("channel", "default")
+    wait = min(int(request.query_params.get("wait", "10")), 30)
+
+    dispatch = _get_dispatch(channel)
+    lock = _dispatch_locks.get(channel, _asyncio.Lock())
+
+    # Atomic consume: only one poller gets the response
+    async def _try_consume():
+        async with lock:
+            if dispatch["response_text"]:
+                text = dispatch["response_text"]
+                dispatch["response_text"] = None
+                return text
+        return None
+
+    # Check if response already available
+    text = await _try_consume()
+    if text:
+        return JSONResponse({"status": "ok", "text": text})
+
+    # Long-poll: wait on event if active, otherwise just sleep for the wait period.
+    # This prevents the background poller from flooding when no dispatch is pending.
+    evt = dispatch.get("response_event")
+    if evt and not evt.is_set():
+        try:
+            await _asyncio.wait_for(evt.wait(), timeout=wait)
+        except _asyncio.TimeoutError:
+            pass
+    else:
+        # No active dispatch — sleep to throttle background polling
+        await _asyncio.sleep(wait)
+
+    text = await _try_consume()
+    if text:
+        return JSONResponse({"status": "ok", "text": text})
+
+    return JSONResponse({"status": "empty"})
+
+
+async def endpoint_claude_status(request: Request) -> JSONResponse:
+    """Check if Claude Code is alive in its tmux session."""
+    channel = request.query_params.get("channel", "default")
+    dispatch = _get_dispatch(channel)
+    tmux_session = dispatch["tmux_session"]
+
+    # Check tmux session exists
+    proc = await _asyncio.create_subprocess_exec(
+        "tmux", "has-session", "-t", tmux_session,
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    tmux_alive = (await proc.wait() == 0)
+
+    # Check if Claude process is running inside the pane
+    claude_alive = False
+    if tmux_alive:
+        proc2 = await _asyncio.create_subprocess_exec(
+            "tmux", "list-panes", "-t", tmux_session, "-F", "#{pane_pid}",
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await proc2.communicate()
+        pane_pid = stdout.decode().strip().split("\n")[0]
+        if pane_pid:
+            proc3 = await _asyncio.create_subprocess_exec(
+                "pgrep", "-P", pane_pid, "-f", "claude",
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.PIPE,
+            )
+            claude_alive = (await proc3.wait() == 0)
+
+    return JSONResponse({
+        "channel": channel,
+        "tmux_session": tmux_session,
+        "tmux_alive": tmux_alive,
+        "claude_alive": claude_alive,
+        "enabled": claude_alive,  # backward compat with frontend relay check
     })
 
 
@@ -2076,11 +2492,16 @@ async def endpoint_conv_log(request: Request) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
-    user_text = payload.get("user_text", "").strip()
+    user_text_raw = payload.get("user_text", "").strip()
     assistant_text = payload.get("assistant_text", "").strip()
 
-    if not user_text and not assistant_text:
+    if not user_text_raw and not assistant_text:
         return JSONResponse({"status": "skipped", "reason": "empty"})
+
+    # Strip dispatch prefix for memory storage, but keep raw for dispatch matching
+    # Match any dispatch prefix: [voice|...], [typed], [chat-ged], etc.
+    _dp_match = _re.match(r'^\[[a-z][\w-]*[^\]]*\]\s*', user_text_raw)
+    user_text = user_text_raw[_dp_match.end():] if _dp_match else user_text_raw
 
     # Filter automated loop/relay polling noise — these are not real conversation.
     # Kept here (next to the relay code that generates the noise) rather than in
@@ -2120,11 +2541,61 @@ async def endpoint_conv_log(request: Request) -> JSONResponse:
             f"conv_log: topic={topic} user_id={user_id} asst_id={asst_id} "
             f"session={session_id}"
         )
+
+        # Write live emotion tag if provided (from Claude Code inline inference)
+        emotion_written = False
+        user_emotion = payload.get("user_emotion")
+        if user_emotion and user_id:
+            try:
+                from emotions import _write_emotion, CORE_EMOTIONS
+                emotion_item = {
+                    "memory_id": user_id,
+                    "_memory_table": "shortterm",
+                    "core_emotion": user_emotion.get("core_emotion", ""),
+                    "emotion_label": user_emotion.get("emotion_label", ""),
+                    "intensity": user_emotion.get("intensity", 0.5),
+                    "confidence": 0.9,  # high confidence — inferred live with full context
+                    "context": "live inference by Claude Code with conversation context",
+                }
+                emotion_written = await _write_emotion(emotion_item, confidence_threshold=0.0)
+                if emotion_written:
+                    log.info(f"conv_log: live emotion '{user_emotion.get('emotion_label')}' written for user_id={user_id}")
+            except Exception as e:
+                log.warning(f"conv_log: emotion write failed: {e}")
+
+        # Signal dispatch channel if a pending prompt is waiting for a response.
+        # Only match conv_logs that contain the dispatch prefix (proves it came from
+        # the tmux dispatch, not from VS Code or another session).
+        if _dp_match:
+            for ch_name, dispatch in _dispatch_channels.items():
+                if (dispatch.get("pending_prompt")
+                        and dispatch.get("response_event")
+                        and dispatch["last_submit_at"] > 0
+                        and _time.time() - dispatch["last_submit_at"] < 120
+                        and dispatch["pending_prompt"][:50] in user_text):
+                    # Strip topic tag from assistant_text before delivering
+                    clean_asst = _re.sub(r'^<<[^>]*>>', '', assistant_text).strip()
+                    # Skip truly empty responses (tool-call noise with no text)
+                    if not clean_asst:
+                        log.info(f"dispatch: skipping empty response for '{ch_name}'")
+                        continue
+                    log.info(f"dispatch: raw asst_text={assistant_text[:100]!r} clean={clean_asst[:100]!r}")
+                    dispatch["response_text"] = clean_asst
+                    dispatch["pending_prompt"] = None
+                    dispatch["last_submit_at"] = 0  # prevent re-match
+                    evt = dispatch["response_event"]
+                    if evt:
+                        evt.set()
+                    log.info(f"dispatch: response captured for channel '{ch_name}' "
+                             f"({len(clean_asst)} chars)")
+                    break
+
         return JSONResponse({
             "status": "ok",
             "user_id": user_id,
             "asst_id": asst_id,
             "topic": topic,
+            "emotion_written": emotion_written,
         })
     except Exception as e:
         log.error(f"conv_log error: {e}")
@@ -2166,6 +2637,9 @@ class Plugin(BasePlugin):
         routes.append(Route("/voice_relay/status", endpoint_voice_relay_status, methods=["GET"]))
         routes.append(Route("/ged/start", endpoint_ged_start, methods=["POST"]))
         routes.append(Route("/voice_relay/disable", endpoint_voice_relay_disable, methods=["POST"]))
+        routes.append(Route("/claude/submit", endpoint_claude_submit, methods=["POST"]))
+        routes.append(Route("/claude/poll", endpoint_claude_poll, methods=["GET"]))
+        routes.append(Route("/claude/status", endpoint_claude_status, methods=["GET"]))
         routes.append(Route("/mcp/health", endpoint_mcp_health, methods=["GET"]))
         return routes
 

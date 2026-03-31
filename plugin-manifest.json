@@ -296,6 +296,44 @@
         "google_calendar"
       ]
     },
+    "plugin_keep_google": {
+      "type": "data_tool",
+      "file": "plugin_keep_google.py",
+      "description": "Google Keep note management (list, get, create, delete)",
+      "dependencies": [
+        "google-auth",
+        "google-auth-oauthlib",
+        "google-api-python-client"
+      ],
+      "env_vars": [],
+      "config_files": [
+        "credentials.json",
+        "token_keep.json"
+      ],
+      "priority": 212,
+      "tools": [
+        "google_keep"
+      ]
+    },
+    "plugin_tasks_google": {
+      "type": "data_tool",
+      "file": "plugin_tasks_google.py",
+      "description": "Google Tasks management (task lists, tasks, subtasks, completion)",
+      "dependencies": [
+        "google-auth",
+        "google-auth-oauthlib",
+        "google-api-python-client"
+      ],
+      "env_vars": [],
+      "config_files": [
+        "credentials.json",
+        "token_tasks.json"
+      ],
+      "priority": 213,
+      "tools": [
+        "google_tasks"
+      ]
+    },
     "plugin_places_google": {
       "type": "data_tool",
       "file": "plugin_places_google.py",

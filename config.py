@@ -23,6 +23,16 @@ CALENDAR_TOKEN_FILE = os.path.join(BASE_DIR, "token_calendar.json")
 CALENDAR_CREDS_FILE = DRIVE_CREDS_FILE  # same OAuth app
 CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
+# Google Keep
+KEEP_TOKEN_FILE = os.path.join(BASE_DIR, "token_keep.json")
+KEEP_CREDS_FILE = DRIVE_CREDS_FILE  # same OAuth app
+KEEP_SCOPES = ["https://www.googleapis.com/auth/keep"]
+
+# Google Tasks
+TASKS_TOKEN_FILE = os.path.join(BASE_DIR, "token_tasks.json")
+TASKS_CREDS_FILE = DRIVE_CREDS_FILE  # same OAuth app
+TASKS_SCOPES = ["https://www.googleapis.com/auth/tasks"]
+
 # Logging (setup early so load_llm_registry can use it)
 logging.basicConfig(
     level=logging.INFO,

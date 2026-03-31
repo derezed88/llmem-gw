@@ -53,6 +53,18 @@
       "heat_curve": [20, 50],
       "sp_section": null
     },
+    "tasks": {
+      "tools": ["google_tasks"],
+      "always_active": false,
+      "heat_curve": [20, 50],
+      "sp_section": null
+    },
+    "keep": {
+      "tools": ["google_keep"],
+      "always_active": false,
+      "heat_curve": [20, 50],
+      "sp_section": null
+    },
     "geocode": {
       "tools": ["geocode"],
       "always_active": false,

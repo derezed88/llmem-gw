@@ -1466,6 +1466,60 @@ async def google_calendar(
 
 
 @mcp.tool()
+async def google_tasks(
+    operation: str,
+    tasklist_id: str = "@default",
+    task_id: str = "",
+    title: str = "",
+    notes: str = "",
+    status: str = "",
+    due: str = "",
+    due_min: str = "",
+    due_max: str = "",
+    parent: str = "",
+    previous: str = "",
+    show_completed: bool = True,
+    show_hidden: bool = False,
+    max_results: int = 100,
+) -> str:
+    """Google Tasks operations.
+
+    Args:
+        operation: Task list ops: 'list_tasklists', 'create_tasklist', 'delete_tasklist', 'update_tasklist'.
+                   Task ops: 'list_tasks', 'get_task', 'create_task', 'update_task',
+                   'complete_task', 'delete_task', 'move_task', 'clear_completed'.
+        tasklist_id: Task list ID (default '@default' = primary list). Use list_tasklists to discover.
+        task_id: Task ID. Required for get/update/complete/delete/move.
+        title: Title for task or task list (max 1024 chars). Required for create ops.
+        notes: Task notes/description (max 8192 chars). For create_task/update_task.
+        status: 'needsAction' or 'completed'. For update_task.
+        due: Due date (YYYY-MM-DD or RFC 3339). For create_task/update_task.
+        due_min: Lower bound due date filter (RFC 3339). For list_tasks.
+        due_max: Upper bound due date filter (RFC 3339). For list_tasks.
+        parent: Parent task ID for subtasks. For create_task/move_task.
+        previous: Previous sibling task ID for ordering. For create_task/move_task.
+        show_completed: Include completed tasks (default true). For list_tasks.
+        show_hidden: Include hidden tasks (default false). For list_tasks.
+        max_results: Max tasks to return (default 100). For list_tasks.
+    """
+    _set_context()
+    try:
+        from tasks_google import run_tasks_op
+        return await run_tasks_op(
+            operation=operation, tasklist_id=tasklist_id,
+            task_id=task_id, title=title, notes=notes,
+            status=status, due=due, due_min=due_min, due_max=due_max,
+            parent=parent, previous=previous,
+            show_completed=show_completed, show_hidden=show_hidden,
+            max_results=max_results,
+        )
+    except ImportError:
+        return "Google Tasks plugin not available"
+    except Exception as e:
+        return f"Tasks error: {e}"
+
+
+@mcp.tool()
 async def weather(
     location: str,
     forecast_type: str = "current",

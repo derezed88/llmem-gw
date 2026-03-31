@@ -218,12 +218,27 @@ def update_chat_activity() -> None:
     was_idle = (_time.time() - _last_chat_ts) > 600  # was idle > 10 min
     _last_chat_ts = _time.time()
     if was_idle:
-        # Wake backed-off tasks so they resume at base interval
-        for _mod, _fn in [("contradiction", "trigger_now"),
-                          ("prospective", "trigger_now"),
-                          ("reflection", "trigger_now"),
-                          ("temporal_inference", "trigger_now"),
-                          ("memreview_auto", "trigger_now")]:
+        # Wake backed-off tasks so they resume at base interval.
+        # Check each loop's enabled flag before waking to avoid
+        # triggering disabled loops (e.g. reflection when off).
+        _wake_targets = [
+            ("contradiction", "trigger_now", "contradiction_enabled"),
+            ("prospective",   "trigger_now", "prospective_enabled"),
+            ("reflection",    "trigger_now", "reflection_enabled"),
+            ("temporal_inference", "trigger_now", "inference_enabled"),
+            ("memreview_auto", "trigger_now", None),  # no cogn flag
+        ]
+        # Load cogn config once
+        try:
+            import json as _json, os as _os
+            _ppath = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "plugins-enabled.json")
+            with open(_ppath) as _f:
+                _cogn_cfg = _json.load(_f).get("plugin_config", {}).get("proactive_cognition", {})
+        except Exception:
+            _cogn_cfg = {}
+        for _mod, _fn, _flag in _wake_targets:
+            if _flag and not _cogn_cfg.get(_flag, False):
+                continue  # loop is disabled in config — don't wake it
             try:
                 import importlib
                 m = importlib.import_module(_mod)
@@ -341,6 +356,14 @@ async def push_notif(client_id: str, text: str):
     """Push an async notification event to a session's SSE queue."""
     (await get_queue(client_id)).put_nowait({"t": "notif", "d": text.replace("\n", "\\n")})
 
+async def push_progress(client_id: str, stage: str, elapsed: int):
+    """Push an interim progress event to the client's SSE queue.
+    stage: current activity description (e.g. 'thinking', 'executing db_query')
+    elapsed: seconds since request started
+    """
+    msg = f"Still working… {stage}" if stage else "Still working…"
+    (await get_queue(client_id)).put_nowait({"t": "progress", "d": msg.replace("\n", "\\n")})
+
 async def push_close(client_id: str):
     """Signal the SSE generator to terminate, then remove the queue.
 
@@ -353,6 +376,94 @@ async def push_close(client_id: str):
         # Don't delete the queue yet — the generator needs to read the
         # sentinel first.  It will be garbage-collected when the generator
         # exits and no more references remain.
+
+
+# ---------------------------------------------------------------------------
+# Progress ticker infrastructure
+# Per-client stage tracking for progress_response_freq
+# ---------------------------------------------------------------------------
+_progress_stages: dict[str, str] = {}  # client_id -> current stage description
+_progress_tasks: dict[str, asyncio.Task] = {}  # client_id -> ticker task
+_progress_start: dict[str, float] = {}  # client_id -> monotonic start time
+_progress_stages_enabled: dict[str, bool] = {}  # client_id -> push on every stage change
+_progress_reset_events: dict[str, asyncio.Event] = {}  # client_id -> ticker reset signal
+
+
+async def set_progress_stage(client_id: str, stage: str):
+    """Update the current processing stage for a client (called from agents.py).
+    If progress_response_stages is enabled, also pushes immediately on change
+    and resets the heartbeat timer so you don't get a duplicate shortly after."""
+    prev = _progress_stages.get(client_id)
+    _progress_stages[client_id] = stage
+    if _progress_stages_enabled.get(client_id) and stage != prev:
+        import time as _time
+        start = _progress_start.get(client_id, _time.monotonic())
+        elapsed = int(_time.monotonic() - start)
+        await push_progress(client_id, stage, elapsed)
+        # Reset the heartbeat timer so the next tick starts fresh
+        ev = _progress_reset_events.get(client_id)
+        if ev:
+            ev.set()
+
+
+def clear_progress_stage(client_id: str):
+    """Clear progress tracking for a client."""
+    _progress_stages.pop(client_id, None)
+
+
+async def _progress_ticker(client_id: str, freq: int):
+    """Background task that pushes progress events every `freq` seconds.
+    Resets its countdown when a stage-transition push fires."""
+    reset_ev = asyncio.Event()
+    _progress_reset_events[client_id] = reset_ev
+    try:
+        while True:
+            # Wait for freq seconds OR a reset signal (whichever comes first)
+            reset_ev.clear()
+            try:
+                await asyncio.wait_for(reset_ev.wait(), timeout=freq)
+                # Reset fired — stage push already sent, restart countdown
+                continue
+            except asyncio.TimeoutError:
+                pass  # Normal tick — push heartbeat
+            import time as _time
+            start = _progress_start.get(client_id, _time.monotonic())
+            elapsed = int(_time.monotonic() - start)
+            stage = _progress_stages.get(client_id, "")
+            await push_progress(client_id, stage, elapsed)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        _progress_reset_events.pop(client_id, None)
+
+
+def start_progress_ticker(client_id: str, freq: int, stages: bool = False) -> asyncio.Task | None:
+    """Start a progress ticker for a client.
+    freq: seconds between heartbeat pushes (0/None = no heartbeat).
+    stages: if True, also push on every stage transition.
+    Returns the ticker task, or None if freq is falsy.
+    """
+    import time as _time
+    stop_progress_ticker(client_id)  # cancel any existing ticker
+    _progress_start[client_id] = _time.monotonic()
+    _progress_stages_enabled[client_id] = stages
+    if not freq or freq <= 0:
+        return None  # stages-only mode (no heartbeat), tracking is still active
+    task = asyncio.ensure_future(_progress_ticker(client_id, freq))
+    _progress_tasks[client_id] = task
+    return task
+
+
+def stop_progress_ticker(client_id: str):
+    """Cancel and clean up the progress ticker for a client."""
+    task = _progress_tasks.pop(client_id, None)
+    if task and not task.done():
+        task.cancel()
+    clear_progress_stage(client_id)
+    _progress_start.pop(client_id, None)
+    _progress_stages_enabled.pop(client_id, None)
+    _progress_reset_events.pop(client_id, None)
+
 
 # ---------------------------------------------------------------------------
 # Gate infrastructure

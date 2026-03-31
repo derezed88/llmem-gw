@@ -5,10 +5,13 @@ Provides xai_search tool for web search via xAI's x_search tool (Grok).
 Requires XAI_API_KEY in .env.
 """
 
+import logging
 from typing import Dict, Any, Optional
 from pydantic import BaseModel, Field
 from langchain_core.tools import StructuredTool
 from plugin_loader import BasePlugin
+
+logger = logging.getLogger("AISvc")
 
 
 class _XaiSearchArgs(BaseModel):
@@ -90,6 +93,8 @@ async def _run_xai_search(api_key: str, query: str, model: str = "grok-4-1-fast-
     if not api_key:
         return "xAI search client not initialized. Check XAI_API_KEY in .env."
 
+    search_result = {"text": "", "tokens_in": 0, "tokens_out": 0}
+
     def _sync_search():
         from xai_sdk import Client
         from xai_sdk.chat import user
@@ -107,7 +112,13 @@ async def _run_xai_search(api_key: str, query: str, model: str = "grok-4-1-fast-
             pass  # consume stream to completion
 
         if response is None:
-            return f"No response from xAI for: {query}"
+            search_result["text"] = f"No response from xAI for: {query}"
+            return search_result["text"]
+
+        # Capture token usage if available
+        if hasattr(response, 'usage') and response.usage:
+            search_result["tokens_in"] = getattr(response.usage, 'prompt_tokens', 0) or 0
+            search_result["tokens_out"] = getattr(response.usage, 'completion_tokens', 0) or 0
 
         lines = [f"xAI search results for: {query}\n"]
 
@@ -130,10 +141,31 @@ async def _run_xai_search(api_key: str, query: str, model: str = "grok-4-1-fast-
         elif not content:
             lines.append("No results found.")
 
-        return "\n".join(lines)
+        search_result["text"] = "\n".join(lines)
+        return search_result["text"]
 
     try:
+        logger.info(f"xai_search: querying {model} for: {query}")
         result = await asyncio.get_event_loop().run_in_executor(None, _sync_search)
+        logger.info(f"xai_search: completed for: {query}")
+
+        # Log cost event
+        from cost_events import log_cost_event, estimate_xai_cost
+        tokens_in = search_result["tokens_in"]
+        tokens_out = search_result["tokens_out"]
+        cost = estimate_xai_cost(model, tokens_in, tokens_out)
+        await log_cost_event(
+            provider="xai",
+            service=model,
+            tool_name="search_xai",
+            cost_usd=cost,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            unit="tokens",
+            notes="estimated" if (tokens_in == 0 and tokens_out == 0) else None,
+        )
+
         return result
     except Exception as e:
+        logger.error(f"xai_search: error for '{query}': {e}")
         return f"xAI search error: {e}"

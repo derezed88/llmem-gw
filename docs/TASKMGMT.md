@@ -38,17 +38,15 @@ Complete lifecycle documentation for the three-layer task management system:
                            │ approved + target=model
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                   THREE-TIER EXECUTOR                        │
+│                    TWO-TIER EXECUTOR                          │
 │  plan_engine.execute_task_step()                             │
 │                                                              │
 │  Tier 1: Direct tool call (zero LLM cost)                   │
 │    get_tool_executor() → executor_fn(**mapped_args)          │
 │         ↓ on failure                                         │
-│  Tier 2: Primary executor (model_roles["plan_executor"])     │
-│    llm_call(mode="tool") → samaritan-execution (gpt-4o-mini)│
-│         ↓ on failure                                         │
-│  Tier 3: Fallback executor (model_roles["plan_executor_     │
-│           fallback"]) → friendli-qwen3-executor (Qwen3-235B)│
+│  Tier 2: LLM executor (model_roles["plan_executor"])         │
+│    llm_call(mode="tool") → samaritan-execution (DeepSeek-V3.2)│
+│    Provider failover via backup_models → gpt-4o-execution    │
 │                                                              │
 │  executor column = "direct" | "<model_key>" (audit trail)   │
 └─────────────────────────────────────────────────────────────┘
@@ -129,7 +127,7 @@ Plans use a **self-referencing hierarchy** within `samaritan_plans`:
 | `target` | hint for decomposer | `'model'`, `'human'`, or `'investigate'` |
 | `approval` | `'proposed'` | `'proposed'` (needs review) or `'auto'` |
 | `tool_call` | `NULL` | JSON: `{"tool": "db_query", "args": {"sql": "SELECT..."}}` |
-| `executor` | `NULL` | Written at execution: `'direct'`, `'samaritan-execution'`, or `'friendli-qwen3-executor'` |
+| `executor` | `NULL` | Written at execution: `'direct'` or `'<model_key>'` (e.g. `'samaritan-execution'`) |
 | `result` | completion/failure notes | execution output text |
 
 ### 2.1 Concept Steps
@@ -180,13 +178,13 @@ Plans can exist without a goal. `goal_id=0` means the plan is standalone — use
 | Setting | Value |
 |---------|-------|
 | Model key | `plan-decomposer` |
-| Model ID | `claude-sonnet-4-6` |
+| Model ID | `claude-haiku-4-5-20251001` |
 | Temperature | 0.2 |
-| Cost | $3 / $15 per 1M tokens (input/output) |
+| Cost | $1 / $5 per 1M tokens (input/output) |
 | Tools | none (pure text/JSON generation) |
 | Memory | disabled (`conv_log: false`, `memory_scan: false`) |
 
-**Why Sonnet 4.6**: Upgraded from Haiku 4.5 to eliminate model-name hallucinations in `tool_call` specs. Structured decomposition requires strong instruction-following and accurate JSON generation — Sonnet 4.6 produces significantly more reliable tool call specifications.
+**Why Haiku 4.5**: Structured decomposition requires instruction-following and JSON generation, not deep reasoning. Haiku is 3x cheaper than Sonnet ($1/$5 vs $3/$15 per 1M tokens) with sufficient quality for this task.
 
 ### 3.2 Decomposition Flow
 
@@ -293,19 +291,20 @@ Configured in `llm-models.json` under `model_roles`:
 
 ```json
 "model_roles": {
-    "plan_executor":           "samaritan-execution",
-    "plan_executor_fallback":  "friendli-qwen3-executor"
+    "plan_executor": "samaritan-execution"
 }
 ```
 
 | Role | Model Key | Model ID | Cost (in/out per 1M) | Purpose |
 |------|-----------|----------|----------------------|---------|
-| Primary | `samaritan-execution` | gpt-4o-mini | $0.15 / $0.60 | Fast, reliable tool caller |
-| Fallback | `friendli-qwen3-executor` | Qwen3-235B-A22B | $0.20 / $0.80 | Provider redundancy |
+| Primary | `samaritan-execution` | DeepSeek-V3.2 (FriendliAI) | $0.50 / $1.50 | Reliable tool caller |
+| Backup | `gpt-4o-execution` | gpt-4o-mini (OpenAI) | $0.15 / $0.60 | Provider failover via `backup_models` |
+
+Provider failover is handled by `backup_models` on the `samaritan-execution` model config in `llm-models.json` — not a separate role. `llm_call()` in `agents.py` automatically retries with `backup_models[0]` on timeout or exception.
 
 Roles are read at execution time via `config.get_model_role()` — changing the model in the JSON takes effect immediately without code changes.
 
-### 5.2 Three-Tier Execution Flow
+### 5.2 Two-Tier Execution Flow
 
 ```
 plan_engine.execute_task_step(task_step_id)
@@ -323,18 +322,14 @@ plan_engine.execute_task_step(task_step_id)
   │     ├─ SUCCESS → executor='direct', status='done' → cascade check
   │     └─ FAILURE → log warning, fall through to Tier 2
   │
-  ├─ 5. TIER 2: Primary LLM executor (plan_executor role)
+  ├─ 5. TIER 2: LLM executor (plan_executor role)
   │     _try_llm_executors() → _llm_execute_tool()
   │     llm_call(model=samaritan-execution, mode='tool', tool=tool_name)
   │     ├─ SUCCESS → executor='samaritan-execution', status='done' → cascade
-  │     └─ FAILURE → log warning, fall through to Tier 3
+  │     ├─ FAILURE → backup_models failover in llm_call → gpt-4o-execution
+  │     └─ ALL FAILED → return None
   │
-  ├─ 6. TIER 3: Fallback LLM executor (plan_executor_fallback role)
-  │     _llm_execute_tool(model=friendli-qwen3-executor, ...)
-  │     ├─ SUCCESS → executor='friendli-qwen3-executor', status='done' → cascade
-  │     └─ FAILURE → all tiers exhausted
-  │
-  └─ 7. ALL FAILED → _fail_task() → propagate up
+  └─ 6. ALL FAILED → _fail_task() → propagate up
          error = "All executors failed. Direct: <err>"
 ```
 
@@ -372,8 +367,8 @@ The `executor` column records which tier actually executed the step:
 | Value | Meaning |
 |-------|---------|
 | `'direct'` | Tier 1 — Python function called directly, zero LLM cost |
-| `'samaritan-execution'` | Tier 2 — gpt-4o-mini executed via llm_call |
-| `'friendli-qwen3-executor'` | Tier 3 — Qwen3-235B fallback via llm_call |
+| `'samaritan-execution'` | Tier 2 — DeepSeek-V3.2 (FriendliAI) executed via llm_call |
+| `'gpt-4o-execution'` | Tier 2 backup — gpt-4o-mini (OpenAI) via backup_models failover |
 
 This enables cost attribution and reliability analysis — query `SELECT executor, COUNT(*) FROM samaritan_plans WHERE step_type='task' AND status='done' GROUP BY executor` to see execution distribution.
 
@@ -792,7 +787,7 @@ INFO execute_task_step: id=297 tool=search_tavily executor=samaritan-execution (
 | `reflection.py` | Cognition loop: goal completion detection, goal health, proposals |
 | `agents.py:llm_call()` | LLM-to-LLM delegation used by Tier 2/3 executors (`mode='tool'`) |
 | `config.py:get_model_role()` | Reads `model_roles` from `llm-models.json` for executor routing |
-| `llm-models.json` | `plan-decomposer` (Haiku 4.5), `model_roles` (plan_executor, plan_executor_fallback) |
+| `llm-models.json` | `plan-decomposer` (Haiku 4.5), `model_roles.plan_executor` → `samaritan-execution` (+ `backup_models` failover) |
 | `migrations/006_plan_decomposition.sql` | Schema: step_type, parent_id, target, executor, tool_call, result, approval |
 | `migrations/005_goal_health.sql` | Schema: attempt_count, failure_count, abandon_reason on goals |
 | `test_plan_engine.py` | 8-group integration test suite |
@@ -813,4 +808,4 @@ INFO execute_task_step: id=297 tool=search_tavily executor=samaritan-execution (
 
 6. **LLM executor requires active session**: Tier 2/3 use `llm_call()` which reads `current_client_id` ContextVar. If no session context is set (e.g., background reflection calling plan execution), the LLM executor may not push SSE tokens to any client. Tool execution still works — only the display feedback is affected.
 
-7. **Fallback model tool binding**: The fallback executor model (`friendli-qwen3-executor`) must use **literal tool names** (e.g., `"db_query"`, `"search_tavily"`) in `llm_tools`, not toolset group names. Toolset groups have `always_active: false` with heat curves — fresh sessions get 0 tools bound. Literal names bypass the hot/cold subscription system.
+7. **Executor model tool binding**: Executor models (`samaritan-execution`, `gpt-4o-execution`) must use **literal tool names** (e.g., `"db_query"`, `"search_tavily"`) in `llm_tools`, not toolset group names. Toolset groups have `always_active: false` with heat curves — fresh sessions get 0 tools bound. Literal names bypass the hot/cold subscription system.

@@ -18,7 +18,7 @@ from typing import Dict, List, Tuple, Optional
 from dotenv import load_dotenv
 
 # Load .env file
-load_dotenv()
+load_dotenv(override=True)
 
 
 # ANSI color codes

@@ -1,7 +1,7 @@
 {
   "targets": [
     {
-      "session_id": 103,
+      "session_id": 116,
       "events": [
         "belief_saved",
         "contradiction_detected",
@@ -9,17 +9,26 @@
         "goal_blocked",
         "goal_completed",
         "goal_created",
+        "goal_plan_proposed",
+        "goal_step_waiting_user",
         "goal_updated",
         "prospective_reminder",
         "task_completed",
         "task_created",
         "task_updated",
         "temporal_pattern_inferred",
-        "tool_called",
-        "goal_plan_proposed",
-        "goal_step_waiting_user"
+        "tool_called"
       ],
-      "quiet_minutes": 10
+      "quiet_minutes": 10,
+      "client_id_prefix": "slack-"
+    },
+    {
+      "session_id": 498020,
+      "events": [
+        "email_important"
+      ],
+      "quiet_minutes": 0,
+      "client_id_prefix": "slack-C0AE37B3PC4-"
     }
   ]
 }

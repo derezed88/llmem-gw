@@ -82,6 +82,7 @@ class SearchTavilyPlugin(BasePlugin):
 async def _run_tavily_search(client, query: str, search_depth: str = "basic") -> str:
     """Run a Tavily search and return formatted results."""
     import asyncio
+    from cost_events import log_cost_event, TAVILY_PRICING
 
     if client is None:
         return "Tavily search client not initialized. Check TAVILY_API_KEY in .env."
@@ -95,6 +96,17 @@ async def _run_tavily_search(client, query: str, search_depth: str = "basic") ->
 
     try:
         response = await asyncio.get_event_loop().run_in_executor(None, _sync_search)
+
+        cost = TAVILY_PRICING.get(search_depth, TAVILY_PRICING["basic"])
+        await log_cost_event(
+            provider="tavily",
+            service="search-api",
+            tool_name="search_tavily",
+            cost_usd=cost,
+            unit="api_call",
+            unit_count=1,
+            notes=f"search_depth={search_depth}",
+        )
 
         lines = [f"Tavily search results for: {query}\n"]
 

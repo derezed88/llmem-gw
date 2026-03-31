@@ -3,7 +3,7 @@ import json
 import logging
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 # Paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -17,6 +17,11 @@ PLUGINS_ENABLED_FILE = os.path.join(BASE_DIR, "plugins-enabled.json")
 # Google Drive
 DRIVE_FOLDER_ID = os.getenv("FOLDER_ID")
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+# Google Calendar
+CALENDAR_TOKEN_FILE = os.path.join(BASE_DIR, "token_calendar.json")
+CALENDAR_CREDS_FILE = DRIVE_CREDS_FILE  # same OAuth app
+CALENDAR_SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
 # Logging (setup early so load_llm_registry can use it)
 logging.basicConfig(
@@ -147,6 +152,10 @@ def load_llm_registry():
                 "allow_text_mode": config.get('allow_text_mode', True),
                 "xai_responses_api": config.get('xai_responses_api', False),
                 "openai_responses_api": config.get('openai_responses_api', False),
+                "retry_on_503": config.get('retry_on_503', None),
+                "backup_models": config.get('backup_models', []),
+                "progress_response_freq": config.get('progress_response_freq', None),
+                "progress_response_stages": config.get('progress_response_stages', False),
             }
 
         return registry

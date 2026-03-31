@@ -60,6 +60,10 @@ _SELF_SUMMARY_EVERY_N = 5
 
 _wake_event: asyncio.Event | None = None
 
+# Watermark: highest ST id processed in the last reflection run.
+# Skip cycle if fewer than reflection_min_new_rows new rows since last run.
+_last_processed_st_id: int = 0
+
 _PLUGINS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins-enabled.json")
 
 
@@ -92,11 +96,12 @@ def _rcogn_cfg() -> dict:
     base = {
         "enabled":               raw.get("enabled",               False),
         "reflection_enabled":    raw.get("reflection_enabled",    True),
-        "reflection_interval_m": int(raw.get("reflection_interval_m", 60)),
+        "reflection_interval_m": int(raw.get("reflection_interval_m", 240)),
         "reflection_model":      raw.get("reflection_model",      ""),
         "reflection_turn_limit": int(raw.get("reflection_turn_limit",  40)),
         "reflection_min_turns":  int(raw.get("reflection_min_turns",   5)),
         "reflection_max_memories": int(raw.get("reflection_max_memories", 6)),
+        "reflection_min_new_rows": int(raw.get("reflection_min_new_rows", 20)),
         # Goal health pass — quit logic thresholds
         "goal_health_enabled":          raw.get("goal_health_enabled", True),
         "goal_health_failure_replan":    int(raw.get("goal_health_failure_replan", 3)),
@@ -747,7 +752,29 @@ async def run_reflection() -> dict:
     min_turns    = cfg["reflection_min_turns"]
     max_memories = cfg["reflection_max_memories"]
 
+    min_new_rows = cfg["reflection_min_new_rows"]
+
     from database import set_db_override, list_managed_databases, fetch_dicts as _fd_refl
+
+    # ── Watermark gate: skip entire cycle if not enough new ST rows ──
+    global _last_processed_st_id
+    try:
+        from memory import _ST
+        _wm_rows = await _fd_refl(
+            f"SELECT MAX(id) AS max_id, COUNT(*) AS new_count FROM {_ST()} "
+            f"WHERE id > {_last_processed_st_id} AND source IN ('user', 'assistant')"
+        )
+        _wm_max = (_wm_rows[0].get("max_id") or 0) if _wm_rows else 0
+        _wm_count = (_wm_rows[0].get("new_count") or 0) if _wm_rows else 0
+        if _wm_count < min_new_rows:
+            log.info(
+                f"reflection: watermark skip — {_wm_count} new rows since id={_last_processed_st_id} "
+                f"(need {min_new_rows})"
+            )
+            return {"turns": 0, "saved": 0, "skipped": 0, "error": None,
+                    "skipped_reason": f"watermark: {_wm_count} < {min_new_rows} new rows"}
+    except Exception as e:
+        log.debug(f"reflection: watermark check failed ({e}), proceeding anyway")
 
     t_start = time.monotonic()
     summary = {"turns": 0, "saved": 0, "skipped": 0, "error": None}
@@ -883,6 +910,10 @@ async def run_reflection() -> dict:
         summary["skipped_reason"] = "all databases stale"
         return summary
 
+    # Advance watermark so next cycle skips already-processed rows
+    if _wm_max > 0:
+        _last_processed_st_id = _wm_max
+
     duration = time.monotonic() - t_start
     _stats["runs"]             += 1
     _stats["last_run_at"]       = datetime.now(timezone.utc).isoformat()
@@ -966,6 +997,18 @@ async def reflection_task() -> None:
 
     global _wake_event
     _wake_event = asyncio.Event()
+
+    # Skip immediate run on startup — wait one full interval first.
+    # Prevents reflection from firing on every server restart.
+    _startup_cfg = _rcogn_cfg()
+    _startup_delay = max(_startup_cfg.get("reflection_interval_m", 30), 5) * 60
+    log.info(f"reflection_task: startup delay {_startup_delay // 60}m before first run")
+    try:
+        await asyncio.wait_for(_wake_event.wait(), timeout=_startup_delay)
+        log.info("reflection_task: woken early during startup delay")
+        _wake_event.clear()
+    except asyncio.TimeoutError:
+        pass
 
     while True:
         cfg = _rcogn_cfg()

@@ -634,6 +634,29 @@ class SlackClientPlugin(BasePlugin):
                     notif_text = item.get("d", "").replace("\\n", "\n")
                     await self._send_slack_message(channel_id, thread_ts, notif_text)
 
+                elif item_type == "progress":
+                    # Progress update — update the heartbeat message in-place
+                    # so the user sees "Still working… <stage>" like voice does.
+                    progress_text = item.get("d", "Still working…")
+                    if heartbeat_ts:
+                        await _update_heartbeat(f"_{progress_text}_")
+                    elif not first_token_received:
+                        # No heartbeat message yet — post one now
+                        try:
+                            resp = await self.slack_client.chat_postMessage(
+                                channel=channel_id,
+                                thread_ts=thread_ts,
+                                text=f"_{progress_text}_",
+                            )
+                            heartbeat_ts = resp.get("ts")
+                        except Exception as e:
+                            log.warning(f"Progress post error: {e}")
+
+                elif item_type == "flush":
+                    # Intermediate flush between tool iterations — ignore on Slack
+                    # (shell.py uses this to clear its reply buffer mid-turn)
+                    pass
+
                 elif item_type == "gate":
                     # Gate request - inform user that approval is needed
                     await _stop_heartbeat()

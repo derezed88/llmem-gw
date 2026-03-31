@@ -493,6 +493,29 @@ CREATE TABLE IF NOT EXISTS `{prefix}tool_stats` (
     KEY `idx_last_called` (`last_called`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+CREATE TABLE IF NOT EXISTS `{prefix}emotions` (
+    `id`            INT(11)      NOT NULL AUTO_INCREMENT,
+    `memory_table`  ENUM('shortterm','longterm','episodic') NULL,
+    `memory_id`     INT(11)      NULL,
+    `angry`         DECIMAL(3,2) DEFAULT 0.00,
+    `sad`           DECIMAL(3,2) DEFAULT 0.00,
+    `disgusted`     DECIMAL(3,2) DEFAULT 0.00,
+    `happy`         DECIMAL(3,2) DEFAULT 0.00,
+    `surprised`     DECIMAL(3,2) DEFAULT 0.00,
+    `bad`           DECIMAL(3,2) DEFAULT 0.00,
+    `fearful`       DECIMAL(3,2) DEFAULT 0.00,
+    `emotion_label` VARCHAR(50)  NULL,
+    `intensity`     DECIMAL(3,2) DEFAULT 0.50,
+    `confidence`    DECIMAL(3,2) DEFAULT 0.50,
+    `source`        ENUM('inferred','stated','corrected') DEFAULT 'inferred',
+    `context`       TEXT         NULL,
+    `created_at`    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    KEY `idx_created` (`created_at`),
+    KEY `idx_memory` (`memory_table`, `memory_id`),
+    KEY `idx_label` (`emotion_label`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 CREATE TABLE IF NOT EXISTS `{prefix}cognition` (
     `id`            INT(11)      NOT NULL AUTO_INCREMENT,
     `origin`        ENUM(

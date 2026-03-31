@@ -17,6 +17,12 @@ Supported providers:
   - xAI (api.x.ai):    xai_responses_api=true    — content type: output_text
   - OpenAI (api.openai.com): openai_responses_api=true — content type: output_text
 
+Retry / fallback (503 at-capacity):
+  - retry_on_503: {"max_retries": N, "backoff": [s1, s2, ...]} — retry with countdown
+  - backup_models: ["model-key", ...] — ordered fallback list on retry exhaustion
+  - Background probe re-checks primary every 60s; auto-restores when healthy
+  - While probe is running, dispatch skips primary and routes to backup directly
+
 Integration:
   - dispatch_llm() in agents.py calls agentic_responses_api() when is_responses_api() is True
   - config.py whitelist includes xai_responses_api and openai_responses_api
@@ -26,10 +32,67 @@ Integration:
 import asyncio
 import json
 import os
+import re
+import time
 
 import httpx
 
 from config import LLM_REGISTRY, LIVE_LIMITS, MAX_TOOL_ITERATIONS, BASE_DIR, log
+
+
+# ---------------------------------------------------------------------------
+# GED post-turn hook: detect quiz scores without a corresponding DB write
+# ---------------------------------------------------------------------------
+
+# Matches quiz/assessment result patterns:
+#   "You got 5 out of 5", "got 7 out of 10", "scored 8 out of 10",
+#   "score: 8/10", "perfect score", "5 out of 5!"
+# Avoids false positives on math fractions by requiring "got/scored/score" context
+# or the "N out of N" phrasing (fractions use "N/N" or LaTeX).
+_GED_SCORE_RE = re.compile(
+    r"(?:got|scored?)\s+\d+\s+out\s+of\s+\d+|perfect\s+score",
+    re.IGNORECASE,
+)
+
+_GED_SCORE_NUDGE = (
+    "[SYSTEM] Your response above reports quiz/assessment scores but you did NOT "
+    "call llm_call to write them to the database. Lee's #ged dashboard will show "
+    "\"No progress\" unless you persist the scores NOW.\n\n"
+    "You MUST call llm_call(model=\"samaritan-execution\", ...) with the appropriate "
+    "INSERT/UPDATE SQL for the topic scores table and quiz results table BEFORE "
+    "continuing. Do this now — do not respond to Lee until the writes are done."
+)
+
+
+# ---------------------------------------------------------------------------
+# 503 fallback state — module-level, shared across all sessions
+# ---------------------------------------------------------------------------
+
+# model_key → {"backup": "backup-model-key", "since": epoch, "probe_task": Task|None}
+_fallback_state: dict[str, dict] = {}
+
+# Probe interval: how often (seconds) the background task pings the primary
+_PROBE_INTERVAL = 60
+
+
+def is_model_in_fallback(model_key: str) -> bool:
+    """Return True if this model is currently in fallback due to 503."""
+    return model_key in _fallback_state
+
+
+def get_fallback_model(model_key: str) -> str | None:
+    """Return the active backup model key, or None if not in fallback."""
+    state = _fallback_state.get(model_key)
+    return state["backup"] if state else None
+
+
+def clear_fallback(model_key: str):
+    """Remove fallback state and cancel probe for a model."""
+    state = _fallback_state.pop(model_key, None)
+    if state and state.get("probe_task"):
+        state["probe_task"].cancel()
+    if state:
+        log.info(f"fallback: cleared fallback state for {model_key}")
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +206,112 @@ def _extract_text(content) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Background probe — restores primary model when it comes back
+# ---------------------------------------------------------------------------
+
+async def _probe_primary(model_key: str):
+    """Periodically ping the primary model's API until it responds 200.
+
+    On success: clear fallback state and notify all sessions using this model.
+    """
+    cfg = LLM_REGISTRY.get(model_key, {})
+    api_key = cfg.get("key") or ""
+    url = _responses_api_url(cfg)
+    provider = _provider_label(cfg)
+
+    log.info(f"probe: started for {model_key} ({provider}), interval={_PROBE_INTERVAL}s")
+
+    while model_key in _fallback_state:
+        await asyncio.sleep(_PROBE_INTERVAL)
+
+        if model_key not in _fallback_state:
+            break  # cleared externally
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15)) as http:
+                resp = await http.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": cfg.get("model_id", ""),
+                        "input": [{"role": "user", "content": "ping"}],
+                        "max_output_tokens": 1,
+                        "store": False,
+                    },
+                )
+
+            if resp.status_code == 200:
+                log.info(f"probe: {model_key} ({provider}) is back — restoring as primary")
+                _restore_primary(model_key)
+                return
+            else:
+                log.info(
+                    f"probe: {model_key} still unavailable "
+                    f"(HTTP {resp.status_code}), next check in {_PROBE_INTERVAL}s"
+                )
+        except Exception as exc:
+            log.info(f"probe: {model_key} ping failed ({exc}), next check in {_PROBE_INTERVAL}s")
+
+    log.info(f"probe: stopped for {model_key} (fallback cleared externally)")
+
+
+def _restore_primary(model_key: str):
+    """Restore all sessions that were on fallback back to the primary model."""
+    from state import sessions, push_tok
+
+    state = _fallback_state.pop(model_key, None)
+    if not state:
+        return
+
+    backup_key = state.get("backup", "?")
+    elapsed = int(time.time() - state.get("since", 0))
+
+    # Find sessions currently on the backup model and restore them
+    restored = 0
+    for cid, sess in sessions.items():
+        if sess.get("_fallback_primary") == model_key:
+            sess["model"] = model_key
+            sess["responses_api_id"] = None  # fresh chain on restored primary
+            del sess["_fallback_primary"]
+            restored += 1
+            # Notify async — fire and forget
+            asyncio.ensure_future(push_tok(
+                cid,
+                f"\n[{_provider_label(LLM_REGISTRY.get(model_key, {}))} recovered — "
+                f"restored to {model_key} (was on {backup_key} for {elapsed}s)]\n",
+            ))
+
+    log.info(
+        f"fallback: restored {restored} session(s) from {backup_key} → {model_key} "
+        f"(down for {elapsed}s)"
+    )
+
+
+def _activate_fallback(model_key: str, backup_key: str, client_id: str):
+    """Switch a session to backup and start the background probe if not already running."""
+    from state import sessions
+
+    session = sessions.get(client_id, {})
+    session["_fallback_primary"] = model_key
+    session["model"] = backup_key
+    session["responses_api_id"] = None  # fresh chain on backup
+
+    if model_key not in _fallback_state:
+        probe_task = asyncio.ensure_future(_probe_primary(model_key))
+        _fallback_state[model_key] = {
+            "backup": backup_key,
+            "since": time.time(),
+            "probe_task": probe_task,
+        }
+        log.info(f"fallback: {model_key} → {backup_key}, probe started")
+    else:
+        log.info(f"fallback: {model_key} → {backup_key} (probe already running)")
+
+
+# ---------------------------------------------------------------------------
 # Main agentic loop
 # ---------------------------------------------------------------------------
 
@@ -177,7 +346,7 @@ async def agentic_responses_api(model_key: str, messages: list[dict], client_id:
         _memory_feature,
     )
     from prompt import load_prompt_for_folder
-    from state import sessions, push_tok, push_done
+    from state import sessions, push_tok, push_done, set_progress_stage, start_progress_ticker, stop_progress_ticker
 
     cfg = LLM_REGISTRY.get(model_key, {})
     session = sessions.get(client_id, {})
@@ -186,6 +355,13 @@ async def agentic_responses_api(model_key: str, messages: list[dict], client_id:
     _suppress = session.get("tool_suppress", False)
     _provider = _provider_label(cfg)
     _url = _responses_api_url(cfg)
+
+    # Start progress ticker if configured
+    _progress_freq = cfg.get("progress_response_freq")
+    _progress_stages = cfg.get("progress_response_stages", False)
+    if _progress_freq or _progress_stages:
+        start_progress_ticker(client_id, _progress_freq, stages=_progress_stages)
+        await set_progress_stage(client_id, "preparing")
 
     # ---- Active tools (mirrors agentic_lc behaviour) ----
     _active_tools = _compute_active_tools(model_key, client_id)
@@ -251,6 +427,23 @@ async def agentic_responses_api(model_key: str, messages: list[dict], client_id:
             f"(full context)"
         )
 
+    # ---- Guard: drop empty-content messages (e.g. silent voice turn) ----
+    input_msgs = [
+        m for m in input_msgs
+        if m.get("type") == "function_call_output"  # tool results — always keep
+        or (m.get("content") or "").strip()
+    ]
+    if not input_msgs:
+        log.info("responses_api: empty input after filtering — silent turn, skipping API call")
+        stop_progress_ticker(client_id)
+        await push_done(client_id)
+        return ""
+
+    # ---- GED post-turn hook state ----
+    _is_ged_model = model_key.startswith("ged-") and model_key not in ("ged-planner", "ged-quiz-gen")
+    _saw_llm_call = False
+    _ged_nudge_sent = False
+
     # ---- Tool loop ----
     max_iters = LIVE_LIMITS.get("max_tool_iterations", MAX_TOOL_ITERATIONS)
     iter_count = 0
@@ -259,6 +452,8 @@ async def agentic_responses_api(model_key: str, messages: list[dict], client_id:
         while max_iters == -1 or iter_count < max_iters:
             iter_count += 1
 
+            if _progress_freq or _progress_stages:
+                await set_progress_stage(client_id, "waiting for LLM")
             if not _suppress:
                 await push_tok(client_id, "\n[thinking…]\n")
 
@@ -290,24 +485,81 @@ async def agentic_responses_api(model_key: str, messages: list[dict], client_id:
                 f"prev_id={previous_response_id} input_items={len(input_msgs)}"
             )
 
-            # ---- HTTP call with timeout ----
-            try:
-                async with asyncio.timeout(invoke_timeout + 5):
-                    resp = await http.post(
-                        _url,
-                        headers={
-                            "Authorization": f"Bearer {api_key}",
-                            "Content-Type": "application/json",
-                        },
-                        json=payload,
+            # ---- HTTP call with timeout + 503 retry ----
+            _retry_cfg = cfg.get("retry_on_503") or {}
+            _max_retries = _retry_cfg.get("max_retries", 0) if iter_count == 1 else 0
+            _backoff = _retry_cfg.get("backoff", [])
+            _backup_models = cfg.get("backup_models") or []
+            resp = None
+
+            for _attempt in range(_max_retries + 1):
+                try:
+                    async with asyncio.timeout(invoke_timeout + 5):
+                        resp = await http.post(
+                            _url,
+                            headers={
+                                "Authorization": f"Bearer {api_key}",
+                                "Content-Type": "application/json",
+                            },
+                            json=payload,
+                        )
+                except asyncio.TimeoutError:
+                    await push_tok(
+                        client_id,
+                        f"\n[{_provider} Responses API timeout after {invoke_timeout}s]\n",
                     )
-            except asyncio.TimeoutError:
+                    stop_progress_ticker(client_id)
+                    await push_done(client_id)
+                    return ""
+                except httpx.TransportError as exc:
+                    log.warning(
+                        f"responses_api: transport error from {_provider} "
+                        f"(attempt {_attempt + 1}/{_max_retries + 1}): {exc!r}"
+                    )
+                    if _attempt >= _max_retries:
+                        await push_tok(
+                            client_id,
+                            f"\n[{_provider} connection error: {type(exc).__name__} — retrying may help]\n",
+                        )
+                        stop_progress_ticker(client_id)
+                        await push_done(client_id)
+                        return ""
+                    # fall through to 503 retry logic below
+                    continue
+
+                if resp.status_code != 503 or _attempt >= _max_retries:
+                    break  # not a 503, or retries exhausted
+
+                # 503 — retry with countdown notification
+                wait_secs = _backoff[_attempt] if _attempt < len(_backoff) else _backoff[-1] if _backoff else 10
+                log.warning(
+                    f"responses_api: 503 from {_provider} (attempt {_attempt + 1}/{_max_retries}), "
+                    f"retrying in {wait_secs}s"
+                )
                 await push_tok(
                     client_id,
-                    f"\n[{_provider} Responses API timeout after {invoke_timeout}s]\n",
+                    f"\n[{_provider} at capacity — retrying in {wait_secs}s...]\n",
                 )
-                await push_done(client_id)
-                return ""
+                await asyncio.sleep(wait_secs)
+
+            if resp.status_code == 503 and _backup_models:
+                # All retries exhausted — activate fallback
+                backup_key = _backup_models[0]
+                if backup_key in LLM_REGISTRY:
+                    log.warning(
+                        f"responses_api: 503 retries exhausted for {model_key}, "
+                        f"falling back to {backup_key}"
+                    )
+                    await push_tok(
+                        client_id,
+                        f"\n[{_provider} unavailable — switching to {backup_key}]\n",
+                    )
+                    _activate_fallback(model_key, backup_key, client_id)
+                    stop_progress_ticker(client_id)
+                    # Re-dispatch through the backup model
+                    from agents import dispatch_llm
+                    result = await dispatch_llm(backup_key, messages, client_id)
+                    return result
 
             if resp.status_code == 400 and previous_response_id and iter_count == 1:
                 # Chain state corrupted — clear and retry as first turn (full context)
@@ -322,6 +574,17 @@ async def agentic_responses_api(model_key: str, messages: list[dict], client_id:
                 if system_prompt:
                     input_msgs.append({"role": "system", "content": system_prompt})
                 input_msgs.extend(messages)
+                # Re-apply empty content guard
+                input_msgs = [
+                    m for m in input_msgs
+                    if m.get("type") == "function_call_output"
+                    or (m.get("content") or "").strip()
+                ]
+                if not input_msgs:
+                    log.info("responses_api: empty input after chain-reset filter — skipping")
+                    stop_progress_ticker(client_id)
+                    await push_done(client_id)
+                    return ""
                 iter_count = 0  # reset so the retry counts as iter 1
                 continue
 
@@ -334,6 +597,7 @@ async def agentic_responses_api(model_key: str, messages: list[dict], client_id:
                     client_id,
                     f"\n[{_provider} API error {resp.status_code}: {snippet}]\n",
                 )
+                stop_progress_ticker(client_id)
                 await push_done(client_id)
                 return ""
 
@@ -359,10 +623,32 @@ async def agentic_responses_api(model_key: str, messages: list[dict], client_id:
 
             # ---- Final answer ----
             if not tool_calls:
+                # GED post-turn hook: if response has quiz scores but no llm_call
+                # was used to persist them, nudge the model to write before finishing.
+                if (
+                    _is_ged_model
+                    and not _ged_nudge_sent
+                    and not _saw_llm_call
+                    and text_response
+                    and _GED_SCORE_RE.search(text_response)
+                ):
+                    _ged_nudge_sent = True
+                    log.info(
+                        f"responses_api: GED score-write nudge for model={model_key} "
+                        f"client={client_id} — scores detected without llm_call"
+                    )
+                    # Stream the tutor's text to Lee, then inject the nudge
+                    await push_tok(client_id, text_response)
+                    input_msgs = [
+                        {"role": "user", "content": _GED_SCORE_NUDGE},
+                    ]
+                    continue  # re-enter the loop so the model can make the write call
+
                 if _memory_scan and text_response:
                     await _scan_and_save_memories(text_response, client_id, model_key)
                 if text_response:
                     await push_tok(client_id, text_response)
+                stop_progress_ticker(client_id)
                 await push_done(client_id)
                 return text_response
 
@@ -370,6 +656,10 @@ async def agentic_responses_api(model_key: str, messages: list[dict], client_id:
             tool_result_items: list[dict] = []
             for tc in tool_calls:
                 t_name = tc.get("name", "")
+                if t_name == "llm_call":
+                    _saw_llm_call = True
+                if _progress_freq or _progress_stages:
+                    await set_progress_stage(client_id, f"running {t_name}")
                 t_args_raw = tc.get("arguments", "{}")
                 t_call_id = tc.get("call_id", "")
 
@@ -402,6 +692,7 @@ async def agentic_responses_api(model_key: str, messages: list[dict], client_id:
         f"responses_api: max iterations ({max_iters}) reached, model={model_key}"
     )
     await push_tok(client_id, "\n[max tool iterations reached]\n")
+    stop_progress_ticker(client_id)
     await push_done(client_id)
     return ""
 

@@ -78,10 +78,11 @@ Each step has:
 - For synthesis/summarization, use `summarizer-gemini` with `mode="text"`
 - Sequential dependencies use placeholder descriptions, resolved at runtime
 
-### Execution Chain (2 Tiers)
+### Execution Chain (3 Tiers)
 
 1. **Direct executor** — parse `tool_call` JSON, look up the Python executor function via `get_tool_executor()`, map arguments, and call directly. Zero LLM cost. This is the happy path for most steps.
-2. **LLM executor** — LLM-based execution via `model_roles["plan_executor"]` (`samaritan-execution`). Only invoked if Tier 1 throws an exception. The LLM receives the tool name, args, step description, and the direct-execution error, then calls the tool via `llm_call(mode="tool")` with the ability to adapt arguments or recover. Provider failover is handled by `backup_models` on the model config (→ `gpt-4o-execution`) — no separate fallback role needed.
+2. **Primary executor** — LLM-based execution via `model_roles["plan_executor"]`. Only invoked if Tier 1 throws an exception. The LLM receives the tool name, args, step description, and the direct-execution error, then calls the tool via `llm_call(mode="tool")` with the ability to adapt arguments or recover.
+3. **Fallback executor** — LLM-based execution via `model_roles["plan_executor_fallback"]`. Only invoked if Tier 2 also fails. Same pattern, different model. Last resort before the step is marked failed.
 
 **When Tier 1 fails and escalates to Tier 2** — examples:
 
@@ -512,7 +513,8 @@ All cognitive model assignments are centralized in the `model_roles` section of 
 | `extractor` | `extractor-gemini` | Content extraction |
 | `judge` | `judge-gemini` | LLM-as-judge gates |
 | `plan_decomposer` | `plan-decomposer` | Goal → concept → task decomposition |
-| `plan_executor` | `samaritan-execution` | Plan step execution (backup via `backup_models` → `gpt-4o-execution`) |
+| `plan_executor` | `samaritan-execution` | Plan step execution (primary) |
+| `plan_executor_fallback` | `friendli-qwen3-executor` | Plan step execution (fallback) |
 | `contradiction` | `qwen25-cogn` | Contradiction scanning |
 | `prospective` | `qwen25-cogn` | Prospective reminder evaluation |
 | `reflection` | `summarizer-gemini` | Reflection loop |

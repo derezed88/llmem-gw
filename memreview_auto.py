@@ -129,11 +129,23 @@ async def memreview_auto_task() -> None:
     global _wake_event
     _wake_event = asyncio.Event()
 
-    register_timer("memreview_auto", "6h")
+    cfg = _cfg()
+    initial_sleep = max(300, cfg["interval_h"] * 3600)
 
-    # Initial delay — let the system warm up
-    timer_sleep("memreview_auto", 300)
-    await asyncio.sleep(300)
+    if not is_auto_enabled():
+        from timer_registry import timer_disabled
+        timer_disabled("memreview_auto")
+    else:
+        register_timer("memreview_auto", f"{cfg['interval_h']}h")
+
+    # Defer first run to the full interval — avoids expensive LLM calls on every restart
+    timer_sleep("memreview_auto", initial_sleep)
+    _wake_event.clear()
+    try:
+        await asyncio.wait_for(_wake_event.wait(), timeout=initial_sleep)
+        _wake_event.clear()
+    except asyncio.TimeoutError:
+        pass
 
     while True:
         t0 = None

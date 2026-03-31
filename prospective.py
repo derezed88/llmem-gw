@@ -343,6 +343,14 @@ async def prospective_task() -> None:
     global _wake_event
     _wake_event = asyncio.Event()
 
+    # Skip immediate run on startup — wait before first run
+    log.info("prospective_task: startup delay 5m before first run")
+    try:
+        await asyncio.wait_for(_wake_event.wait(), timeout=300)
+        _wake_event.clear()
+    except asyncio.TimeoutError:
+        pass
+
     while True:
         cfg = _pcogn_cfg()
 

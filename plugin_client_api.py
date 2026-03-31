@@ -176,6 +176,8 @@ async def endpoint_api_stream(request: Request):
                 # Intermediate flush: shell.py uses this to display tool results mid-turn.
                 # api_client ignores it (only stops on "done") so the stream stays open.
                 yield {"event": "flush", "data": "{}"}
+            elif t == "progress":
+                yield {"event": "progress", "data": json.dumps({"text": item["d"].replace("\\n", "\n")})}
             elif t == "err":
                 yield {"event": "error", "data": json.dumps({"message": item["d"].replace("\\n", "\n")})}
 

@@ -3079,7 +3079,8 @@ async def cmd_timers(client_id: str, arg: str = ""):
         lines = [f"## Timer: {arg}  {icon} {t['status']}\n"]
         lines.append(f"  interval  : {t['interval_desc']}")
         lines.append(f"  last_run  : {_fmt_ts(t['last_run_at'])}")
-        lines.append(f"  next_run  : {_fmt_ts(t['next_run_at'])}")
+        next_run_str = "-" if t["status"] == "running" else _fmt_ts(t["next_run_at"])
+        lines.append(f"  next_run  : {next_run_str}")
         lines.append(f"  run_count : {t['run_count']}")
         lines.append(f"  last_dur  : {_fmt_dur(t['last_duration_s'])}")
         lines.append(f"  last_error: {t['last_error'] or '-'}")
@@ -3267,11 +3268,12 @@ async def cmd_timers(client_id: str, arg: str = ""):
             icon = _STATUS_ICON.get(t["status"], "?")
             status_str = f"{icon} {t['status']}"
             err_suffix = "  ✗" if t.get("last_error") else ""
+            next_run_str = "-" if t["status"] == "running" else _fmt_ts(t["next_run_at"])
             lines.append(
                 f"{name:<{col_w[0]}} {status_str:<{col_w[1]}} "
                 f"{t['interval_desc']:<{col_w[2]}} "
                 f"{_fmt_ts(t['last_run_at']):<{col_w[3]}} "
-                f"{_fmt_ts(t['next_run_at']):<{col_w[4]}} "
+                f"{next_run_str:<{col_w[4]}} "
                 f"{t['run_count']:>{col_w[5]}} "
                 f"{_fmt_dur(t['last_duration_s']):<{col_w[6]}}"
                 f"{err_suffix}"
@@ -5119,121 +5121,331 @@ async def cmd_stream(client_id: str, arg: str, session: dict):
     await conditional_push_done(client_id)
 
 
-# ── !claude — route session through Claude Code via MCP Direct relay ────
+# ── !claude — route session through Claude Code via tmux dispatch ───────
 
 _MCP_DIRECT_URL = os.environ.get("MCP_DIRECT_URL", "http://localhost:8769")
+_CLAUDE_START_SCRIPT = os.path.expanduser("~/projects/samaritan-work/claude-start.sh")
+
+# Track claude_mode at the channel level (not per-message session) so it
+# persists across Slack messages in the same channel/DM.
+_claude_mode_channels: set = set()
+
+
+def _claude_mode_prefix(client_id: str) -> str:
+    """Extract channel prefix from client_id (e.g. 'slack-C0AE37B3PC4')."""
+    parts = client_id.split("-")
+    return "-".join(parts[:2]) if len(parts) >= 2 else client_id
+
+
+def _is_claude_mode(client_id: str, session: dict) -> bool:
+    return session.get("claude_mode") or _claude_mode_prefix(client_id) in _claude_mode_channels
+
+
+def _set_claude_mode(client_id: str, session: dict, on: bool):
+    session["claude_mode"] = on
+    prefix = _claude_mode_prefix(client_id)
+    if on:
+        _claude_mode_channels.add(prefix)
+    else:
+        _claude_mode_channels.discard(prefix)
+
+
+_THREAD_START_SCRIPT = os.path.expanduser(
+    "~/projects/samaritan-work/claude-thread-start.sh"
+)
+
+
+def _thread_channel_for(client_id: str) -> str:
+    """Derive dispatch channel from client_id.
+
+    slack-C0AE37B3PC4-1774701122.553459 → slack-thread-553459
+    Anything else (shell, voice, rc) → "default"
+    """
+    parts = (client_id or "").split("-")
+    if len(parts) >= 3 and parts[0] == "slack":
+        ts_part = parts[-1]
+        short = ts_part.split(".")[-1] if "." in ts_part else ts_part[-6:]
+        return f"slack-thread-{short}"
+    return "default"
+
+
+async def _ensure_claude_session(channel: str = "default") -> tuple:
+    """Check if Claude Code tmux session is alive; spawn if not.
+
+    Returns (ok: bool, message: str).
+    """
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=3) as http:
+            r = await http.get(
+                f"{_MCP_DIRECT_URL}/claude/status",
+                params={"channel": channel},
+            )
+            status = r.json()
+        if status.get("claude_alive"):
+            return True, "Claude Code session is running."
+    except Exception as e:
+        return False, f"Cannot reach MCP Direct (port 8769): {e}"
+
+    # Not running — spawn it
+    if channel.startswith("slack-thread-"):
+        # Thread sessions are spawned on-demand in endpoint_claude_submit.
+        # Just confirm ready here — the first real message will trigger spawn.
+        return True, "Thread session ready — will start on your first message (~15s)."
+    proc = await asyncio.create_subprocess_exec(
+        "bash", _CLAUDE_START_SCRIPT,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        return False, f"Failed to spawn Claude Code session: {stderr.decode().strip()}"
+
+    # Verify it came up
+    await asyncio.sleep(2)
+    try:
+        async with httpx.AsyncClient(timeout=5) as http:
+            r = await http.get(
+                f"{_MCP_DIRECT_URL}/claude/status",
+                params={"channel": channel},
+            )
+            status = r.json()
+        if status.get("claude_alive"):
+            return True, "Claude Code session spawned and ready."
+        return True, "Claude Code session spawned (warming up)."
+    except Exception:
+        return True, "Claude Code session spawned (status check inconclusive)."
+
+
+async def _restart_claude_session(channel: str = "default") -> tuple:
+    """Kill and respawn the Claude Code tmux session (fresh MCP connection).
+
+    Returns (ok: bool, message: str).
+    """
+    import httpx
+    import logging
+    log = logging.getLogger("AISvc")
+
+    try:
+        async with httpx.AsyncClient(timeout=3) as http:
+            r = await http.get(
+                f"{_MCP_DIRECT_URL}/claude/status",
+                params={"channel": channel},
+            )
+            status = r.json()
+            tmux_session = status.get("tmux_session", "samaritan-work")
+    except Exception as e:
+        log.warning(f"!claude restart: status check failed: {e}")
+        tmux_session = "samaritan-work"
+
+    log.info(f"!claude restart: killing tmux session '{tmux_session}'")
+
+    # Kill existing session
+    proc = await asyncio.create_subprocess_exec(
+        "tmux", "kill-session", "-t", tmux_session,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    log.info(f"!claude restart: kill rc={proc.returncode} err={stderr.decode().strip()}")
+    await asyncio.sleep(2)
+
+    # Respawn via appropriate start script
+    if channel.startswith("slack-thread-"):
+        start_script = _THREAD_START_SCRIPT
+        script_args = [tmux_session]
+    else:
+        start_script = _CLAUDE_START_SCRIPT
+        script_args = []
+    log.info(f"!claude restart: running {start_script} {' '.join(script_args)}")
+    proc = await asyncio.create_subprocess_exec(
+        "bash", start_script, *script_args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    log.info(f"!claude restart: start rc={proc.returncode} "
+             f"stdout={stdout.decode().strip()[:200]} err={stderr.decode().strip()[:200]}")
+    if proc.returncode != 0:
+        return False, f"Failed to respawn: {stderr.decode().strip()}"
+
+    # Verify
+    await asyncio.sleep(3)
+    try:
+        async with httpx.AsyncClient(timeout=5) as http:
+            r = await http.get(
+                f"{_MCP_DIRECT_URL}/claude/status",
+                params={"channel": channel},
+            )
+            status = r.json()
+        if status.get("claude_alive"):
+            return True, "Claude Code session restarted with fresh MCP connection."
+        return True, "Claude Code session restarted (warming up)."
+    except Exception:
+        return True, "Claude Code session restarted (status check inconclusive)."
 
 
 async def cmd_claude(client_id: str, arg: str, session: dict):
     """
-    !claude [on|off|status]
+    !claude [on|off|status|restart]
 
     Toggle Claude Code relay mode. When on, all user text is routed through
-    the MCP Direct voice relay to Claude Code instead of the LLM pipeline.
+    tmux dispatch to Claude Code instead of the LLM pipeline.
     Works on all frontends (shell, Slack, API, open-webui).
-    Requires Claude Code to have voice relay mode enabled.
+    Auto-spawns a Claude Code tmux session if one isn't running.
     """
     sub = arg.strip().lower()
 
     if sub in ("off", "exit", "default"):
-        session["claude_mode"] = False
+        _set_claude_mode(client_id, session, False)
         await push_tok(client_id, "Claude mode OFF — back to normal LLM pipeline.\n")
         await conditional_push_done(client_id)
         return
 
+    if sub == "restart":
+        _set_claude_mode(client_id, session, True)  # set early so queued messages dispatch
+        await push_tok(client_id, "Restarting Claude Code session...\n")
+        ok, msg = await _restart_claude_session(_thread_channel_for(client_id))
+        await push_tok(client_id, f"{msg}\n")
+        if ok:
+            await push_tok(client_id, "Claude mode ON.\n")
+        else:
+            _set_claude_mode(client_id, session, False)
+            await push_tok(client_id, "Claude mode OFF (restart failed).\n")
+        await conditional_push_done(client_id)
+        return
+
     if sub == "status":
-        enabled = session.get("claude_mode", False)
+        enabled = _is_claude_mode(client_id, session)
         try:
             import httpx
             async with httpx.AsyncClient(timeout=3) as http:
-                r = await http.get(f"{_MCP_DIRECT_URL}/voice_relay/status")
-                relay = r.json()
+                r = await http.get(f"{_MCP_DIRECT_URL}/claude/status")
+                status = r.json()
         except Exception:
-            relay = {"enabled": False, "error": "unreachable"}
-        channels = relay.get("channels", {})
-        ch_lines = ""
-        if channels:
-            ch_lines = "\n".join(
-                f"  [{ch}]: inbox={info.get('inbox_count',0)} outbox={info.get('outbox_count',0)}"
-                for ch, info in channels.items()
-            )
+            status = {"claude_alive": False, "error": "unreachable"}
         await push_tok(client_id,
             f"Claude mode: {'ON' if enabled else 'OFF'}\n"
-            f"Relay server: {'enabled' if relay.get('enabled') else 'not enabled'}\n"
-            f"Active channels:\n{ch_lines or '  (none)'}\n")
+            f"tmux session: {status.get('tmux_session', '?')}\n"
+            f"tmux alive: {status.get('tmux_alive', False)}\n"
+            f"Claude alive: {status.get('claude_alive', False)}\n")
         await conditional_push_done(client_id)
         return
 
-    # Default: on
-    # Check relay availability first
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=3) as http:
-            r = await http.get(f"{_MCP_DIRECT_URL}/voice_relay/status")
-            relay = r.json()
-        if not relay.get("enabled"):
-            await push_tok(client_id,
-                "Cannot enable Claude mode — voice relay is not active.\n"
-                "Run 'enter voice relay mode' in Claude Code first.\n")
-            await conditional_push_done(client_id)
-            return
-    except Exception as e:
-        await push_tok(client_id,
-            f"Cannot reach MCP Direct (port 8769): {e}\n"
-            f"Is llmem-gw running with plugin_mcp_direct?\n")
+    # Default: on — set flag early so queued messages dispatch even if
+    # _ensure_claude_session is still running when the next message arrives.
+    _set_claude_mode(client_id, session, True)
+    await push_tok(client_id, "Checking Claude Code session...\n")
+    ok, msg = await _ensure_claude_session(_thread_channel_for(client_id))
+    if not ok:
+        _set_claude_mode(client_id, session, False)
+        await push_tok(client_id, f"{msg}\n")
         await conditional_push_done(client_id)
         return
 
-    session["claude_mode"] = True
     await push_tok(client_id,
+        f"{msg}\n"
         "Claude mode ON — all input now routes to Claude Code.\n"
         "Use !claude off to return to normal.\n")
     await conditional_push_done(client_id)
 
 
-async def _claude_relay_dispatch(client_id: str, text: str, session: dict):
-    """Route user text through MCP Direct voice relay to Claude Code."""
-    import httpx
+_CLAUDE_SLASH_COMMANDS = {"claude-effort", "claude-model", "claude-config"}
 
-    await push_tok(client_id, "")  # keep connection alive
+
+async def _claude_slash_passthrough(client_id: str, text: str):
+    """Send a slash command to Claude Code and return its output directly."""
+    import httpx
     try:
-        # Submit to relay
         async with httpx.AsyncClient(timeout=10) as http:
             r = await http.post(
-                f"{_MCP_DIRECT_URL}/voice_relay/submit",
-                json={"text": text, "source": session.get("model", "llmem-gw")},
+                f"{_MCP_DIRECT_URL}/claude/slash",
+                json={"command": text},
+            )
+            data = r.json()
+        if r.status_code == 200 and data.get("output"):
+            await push_tok(client_id, f"{data['output']}\n")
+        elif r.status_code == 200:
+            await push_tok(client_id, f"Command sent (no output captured).\n")
+        else:
+            await push_tok(client_id, f"Slash command error: {data.get('error', 'unknown')}\n")
+    except Exception as e:
+        await push_tok(client_id, f"Slash command relay failed: {e}\n")
+    await conditional_push_done(client_id)
+
+
+async def _claude_relay_dispatch(client_id: str, text: str, session: dict):
+    """Route user text to Claude Code via tmux dispatch.
+
+    Response is delivered asynchronously: conv_log → push_tok(client_id).
+    The Slack consumer waits on its queue with heartbeat messages.
+    """
+    import httpx
+
+    # Intercept Claude Code commands (!effort, !model, !config) — Slack blocks
+    # "/" prefix client-side, so users type "!" instead. Convert to "/" before
+    # passing to the Claude Code CLI, which only understands "/" commands.
+    if text.startswith("!"):
+        cmd_word = text.lstrip("!").split()[0].lower()
+        if cmd_word in _CLAUDE_SLASH_COMMANDS:
+            # Strip "claude-" prefix: !claude-model grok41 → /model grok41
+            slash_text = "/" + text.lstrip("!")[len("claude-"):]
+            await _claude_slash_passthrough(client_id, slash_text)
+            return
+
+    # Derive dispatch channel from client_id thread suffix so each Slack thread
+    # gets its own tmux session. client_id = "slack-C0AE37B3PC4-1774701122.553459"
+    # → channel = "slack-thread-553459" (last 6 digits, stable + short)
+    # Falls back to "default" for non-thread client_ids.
+    _thread_channel = "default"
+    _cid_parts = client_id.split("-") if client_id else []
+    if len(_cid_parts) >= 3:
+        _ts_part = _cid_parts[-1]  # e.g. "1774701122.553459"
+        _short = _ts_part.split(".")[-1] if "." in _ts_part else _ts_part[-6:]
+        _thread_channel = f"slack-thread-{_short}"
+
+    submit_payload = {
+        "text": text,
+        "source": session.get("model", "slack"),
+        "client_id": client_id,
+        "channel": _thread_channel,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            r = await http.post(
+                f"{_MCP_DIRECT_URL}/claude/submit",
+                json=submit_payload,
             )
             if r.status_code == 503:
-                session["claude_mode"] = False
-                await push_tok(client_id,
-                    "Claude relay no longer active — switching back to normal mode.\n")
-                await conditional_push_done(client_id)
-                return
-            r.raise_for_status()
-
-        # Long-poll for response (up to 60s)
-        deadline = asyncio.get_event_loop().time() + 60
-        response = None
-        while asyncio.get_event_loop().time() < deadline:
-            async with httpx.AsyncClient(timeout=15) as http:
-                r = await http.get(
-                    f"{_MCP_DIRECT_URL}/voice_relay/poll",
-                    params={"wait": "10"},
+                # Session not available — try to auto-spawn
+                await push_tok(client_id, "Claude session starting up — hold on...\n")
+                ok, msg = await _ensure_claude_session()
+                if not ok:
+                    _set_claude_mode(client_id, session, False)
+                    await push_tok(client_id,
+                        f"Failed to spawn: {msg}\nSwitching back to normal mode.\n")
+                    await conditional_push_done(client_id)
+                    return
+                # Retry submit after spawn
+                await push_tok(client_id, "Session ready — sending message...\n")
+                r = await http.post(
+                    f"{_MCP_DIRECT_URL}/claude/submit",
+                    json=submit_payload,
                 )
-                data = r.json()
-                if data.get("status") == "ok":
-                    response = data
-                    break
-
-        if response:
-            await push_tok(client_id, response["text"])
-        else:
-            await push_tok(client_id, "(Claude Code did not respond in time)")
+                if r.status_code != 200:
+                    _set_claude_mode(client_id, session, False)
+                    await push_tok(client_id,
+                        "Claude relay failed after spawn — switching back to normal mode.\n")
+                    await conditional_push_done(client_id)
+                    return
+            r.raise_for_status()
+        # Response delivered async via conv_log → push_tok(client_id)
+        # Do NOT push_done here — Slack consumer waits on its queue
 
     except Exception as e:
         await push_tok(client_id, f"Claude relay error: {e}")
-
-    await conditional_push_done(client_id)
+        await conditional_push_done(client_id)
 
 
 async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip: str = None):
@@ -5338,8 +5550,9 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
     lines = stripped.split('\n')
     command_lines = [line.strip() for line in lines if line.strip().startswith('!')]
 
-    # If we have multiple command lines, process them sequentially
-    if len(command_lines) > 1:
+    # If we have command lines mixed with other text, process commands first
+    non_command_lines = [line for line in lines if line.strip() and not line.strip().startswith('!')]
+    if len(command_lines) > 1 or (len(command_lines) == 1 and non_command_lines):
         # Enable batch mode to suppress push_done in individual commands
         _batch_mode[client_id] = True
         try:
@@ -5582,9 +5795,9 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
         return
 
     # ── Claude Code relay mode ──────────────────────────────────────────
-    # When !claude is active for this session, route text through the MCP
-    # Direct voice relay to Claude Code instead of the LLM pipeline.
-    if session.get("claude_mode"):
+    # When !claude is active for this channel/session, route text through
+    # tmux dispatch to Claude Code instead of the LLM pipeline.
+    if _is_claude_mode(client_id, session):
         await _claude_relay_dispatch(client_id, stripped, session)
         return
 
@@ -5625,6 +5838,21 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
     from state import update_chat_activity
     update_chat_activity()
     model_cfg = LLM_REGISTRY.get(session["model"], {})
+
+    # Extract GPS location from structured payload field (preferred) or
+    # fall back to regex-stripping inline [GPS: ...] tags for backward compat
+    _gps_data = None
+    _raw_loc = raw_payload.get("location")
+    if _raw_loc and isinstance(_raw_loc, dict):
+        _gps_data = {
+            "lat": float(_raw_loc.get("latitude", 0)),
+            "lon": float(_raw_loc.get("longitude", 0)),
+            "accuracy_m": float(_raw_loc["accuracy_m"]) if _raw_loc.get("accuracy_m") is not None else None,
+        }
+    else:
+        from memory import strip_gps
+        stripped, _gps_data = strip_gps(stripped)
+
     session["history"].append({"role": "user", "content": stripped})
     session["history"] = _run_history_chain(session["history"], session, model_cfg)
 
@@ -5649,6 +5877,10 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
             _sess_mem = session.get("memory_enabled", None)
             _model_mem = model_cfg.get("memory_enabled", None)
             log.debug(f"conv_log gate: conv_log={model_cfg.get('conv_log')} sess_mem={_sess_mem} model_mem={_model_mem} model={session['model']}")
+            # Capture a shared timestamp for ST memory and location rows
+            from datetime import datetime, timezone as _tz
+            _shared_ts = datetime.now(_tz.utc).strftime("%Y-%m-%d %H:%M:%S")
+
             if model_cfg.get("conv_log") and (_model_mem is None or _model_mem) and (_sess_mem is None or _sess_mem):
                 try:
                     from memory import save_conversation_turn
@@ -5658,12 +5890,29 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
                         assistant_text=final,
                         session_id=client_id,
                         memory_types_enabled=model_cfg.get("memory_types_enabled", False),
+                        created_at=_shared_ts,
                     )
                     if _topic:
                         session["current_topic"] = _topic
                 except Exception as _cl_err:
                     import logging as _log
                     _log.getLogger("routes").warning(f"conv_log save failed: {_cl_err}")
+
+            # Save GPS location if present (always, regardless of conv_log)
+            if _gps_data:
+                try:
+                    from memory import save_location
+                    set_model_context(session.get("model", ""))
+                    await save_location(
+                        lat=_gps_data["lat"],
+                        lon=_gps_data["lon"],
+                        accuracy_m=_gps_data["accuracy_m"],
+                        session_id=client_id,
+                        created_at=_shared_ts,
+                    )
+                except Exception as _loc_err:
+                    import logging as _log
+                    _log.getLogger("routes").warning(f"save_location failed: {_loc_err}")
         else:
             # Remove dangling user message if LLM returned empty — prevents consecutive
             # user turns in history, which causes Gemini to return empty on next request

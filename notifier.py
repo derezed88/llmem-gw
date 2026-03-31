@@ -60,6 +60,8 @@ ALL_EVENTS: list[str] = [
     "tool_called",
     "goal_plan_proposed",
     "goal_step_waiting_user",
+    "sms_received",
+    "email_important",
 ]
 
 _targets: list[dict] = []
@@ -86,6 +88,7 @@ def _load() -> None:
                 "session_id": int(t["session_id"]),
                 "events": set(t.get("events", ALL_EVENTS)),
                 "quiet_minutes": int(t.get("quiet_minutes", 10)),
+                "client_id_prefix": t.get("client_id_prefix", ""),
             }
             for t in data.get("targets", [])
         ]
@@ -102,6 +105,7 @@ def _save() -> None:
                     "session_id": t["session_id"],
                     "events": sorted(t["events"]),
                     "quiet_minutes": t["quiet_minutes"],
+                    **({"client_id_prefix": t["client_id_prefix"]} if t.get("client_id_prefix") else {}),
                 }
                 for t in _targets
             ]
@@ -162,6 +166,44 @@ def add_target(session_id: int, events: list[str] | None = None, quiet_minutes: 
     _save()
     ev_str = "all events" if evt == set(ALL_EVENTS) else f"{len(evt)} events"
     return f"Notifier: session {session_id} added ({ev_str}, quiet={quiet_minutes}m)"
+
+
+def add_target_prefix(prefix: str, events: list[str] | None = None, quiet_minutes: int = 10) -> str:
+    """Register a client_id prefix as a notification target.
+
+    All sessions whose client_id starts with prefix will receive notifications.
+    If a target with this prefix already exists, its event list is updated.
+    Persisted to notifier.json so it survives restarts.
+    """
+    # Use a synthetic session_id derived from prefix hash (stable across restarts)
+    synthetic_id = abs(hash(prefix)) % 900000 + 100000
+    evt = set(events) & set(ALL_EVENTS) if events else set(ALL_EVENTS)
+
+    for t in _targets:
+        if t.get("client_id_prefix") == prefix:
+            t["events"] = evt
+            t["quiet_minutes"] = quiet_minutes
+            _save()
+            return f"Notifier: prefix '{prefix}' updated ({len(evt)} events, quiet={quiet_minutes}m)"
+
+    _targets.append({
+        "session_id": synthetic_id,
+        "events": evt,
+        "quiet_minutes": quiet_minutes,
+        "client_id_prefix": prefix,
+    })
+    _save()
+    return f"Notifier: prefix '{prefix}' registered (id={synthetic_id}, {len(evt)} events, quiet={quiet_minutes}m)"
+
+
+def remove_target_prefix(prefix: str) -> str:
+    """Remove a prefix-based notification target."""
+    for t in _targets[:]:
+        if t.get("client_id_prefix") == prefix:
+            _targets.remove(t)
+            _save()
+            return f"Notifier: prefix '{prefix}' removed"
+    return f"Notifier: prefix '{prefix}' not found"
 
 
 def remove_target(session_id: int) -> str:
@@ -270,7 +312,16 @@ async def fire_event(event_type: str, summary: str, detail: str = "") -> None:
         shorthand_id: int = target["session_id"]
         quiet_seconds: int = target["quiet_minutes"] * 60
 
-        client_id = get_session_by_shorthand(shorthand_id)
+        # Resolve client_id: prefer client_id_prefix match, fall back to shorthand_id
+        client_id = None
+        prefix = target.get("client_id_prefix", "")
+        if prefix:
+            for cid in sessions:
+                if cid.startswith(prefix):
+                    client_id = cid
+                    break
+        if not client_id:
+            client_id = get_session_by_shorthand(shorthand_id)
         if not client_id or client_id not in sessions:
             _pending.setdefault(shorthand_id, []).append(
                 {"event_type": event_type, "summary": summary, "detail": detail, "ts": ts}

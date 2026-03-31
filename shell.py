@@ -470,6 +470,12 @@ async def sse_listener():
                             state.redraw_event.set()
                             continue
 
+                        # ---- progress update ------------------------------
+                        if current_event == "progress":
+                            await state.set_status(raw.replace("\\n", " "))
+                            current_event = "message"
+                            continue
+
                         # ---- error ----------------------------------------
                         if current_event == "error":
                             try:

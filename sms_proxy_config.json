@@ -1,5 +1,5 @@
 {
-    "llmem_gw_url": "http://YOUR_SERVER_IP:8767",
+    "llmem_gw_url": "http://192.168.10.111:8767",
     "poll_interval": 2,
     "outbound_poll_interval": 3,
     "allowed_numbers": [],

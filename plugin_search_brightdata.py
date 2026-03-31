@@ -109,6 +109,7 @@ def _clean_google_results(data: dict) -> list:
 async def _run_brightdata_search(api_key: str, query: str, engine: str = "google") -> str:
     """Run a Bright Data SERP search via the Web Unlocker API."""
     import httpx
+    from cost_events import log_cost_event, BRIGHTDATA_PRICING
 
     if not api_key:
         return "Bright Data search: BRIGHTDATA_API_KEY not configured."
@@ -134,6 +135,16 @@ async def _run_brightdata_search(api_key: str, query: str, engine: str = "google
 
         if resp.status_code != 200:
             return f"Bright Data search error (HTTP {resp.status_code}): {resp.text[:400]}"
+
+        await log_cost_event(
+            provider="brightdata",
+            service="serp-api",
+            tool_name="search_brightdata",
+            cost_usd=BRIGHTDATA_PRICING["serp"],
+            unit="api_call",
+            unit_count=1,
+            notes=f"engine={engine}",
+        )
 
         if is_google:
             try:

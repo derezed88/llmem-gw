@@ -59,8 +59,23 @@ def _drive_create_file(name: str, content: str, folder_id: str) -> str:
     return f"Created '{name}' — id: {file.get('id')}"
 
 def _drive_read_file(file_id: str) -> str:
-    data, _mime, _name = _drive_download_bytes(file_id)
-    return data.decode("utf-8")
+    data, mime, name = _drive_download_bytes(file_id)
+    # Binary files (PDFs, images, etc.) can't be decoded as text
+    if not mime.startswith("text/") and mime not in (
+        "application/json", "application/xml", "application/javascript",
+    ):
+        return (
+            f"Cannot read binary file '{name}' (mime={mime}) as text. "
+            f"Use the file_extract tool with file_id='{file_id}' instead — "
+            f"it handles PDFs, images, and other binary formats via Gemini."
+        )
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return (
+            f"Cannot decode '{name}' as UTF-8 text. "
+            f"Use the file_extract tool with file_id='{file_id}' instead."
+        )
 
 
 _GOOGLE_APPS_EXPORT = {

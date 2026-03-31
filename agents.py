@@ -18,7 +18,7 @@ from langchain_core.messages import (
 import time
 
 from config import log, MAX_TOOL_ITERATIONS, LLM_REGISTRY, RATE_LIMITS, LIVE_LIMITS, LLM_TOOLSETS, LLM_TOOLSET_META, TOOL_CALL_LOG_DEFAULT, save_llm_model_field
-from state import push_tok, push_done, push_flush, push_err, current_client_id, sessions, wait_for_gate, resolve_gate, has_pending_gate, update_session_token_stats
+from state import push_tok, push_done, push_flush, push_err, current_client_id, sessions, wait_for_gate, resolve_gate, has_pending_gate, update_session_token_stats, set_progress_stage, start_progress_ticker, stop_progress_ticker
 from prompt import load_prompt_for_folder
 from database import execute_sql, set_model_context, set_db_override, get_db_override
 from tools import (
@@ -1361,6 +1361,13 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
     Tool schema format (OpenAI dicts) and executor registry are unchanged —
     this is purely an LLM abstraction swap.
     """
+    # Start progress ticker if model has progress_response_freq configured
+    _mcfg = LLM_REGISTRY.get(model_key, {})
+    _progress_freq = _mcfg.get("progress_response_freq")
+    _progress_stages = _mcfg.get("progress_response_stages", False)
+    if _progress_freq or _progress_stages:
+        start_progress_ticker(client_id, _progress_freq, stages=_progress_stages)
+        await set_progress_stage(client_id, "preparing")
     try:
         set_model_context(model_key)
         _stream_level = sessions.get(client_id, {}).get("stream_level", 0)
@@ -1427,6 +1434,8 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
         _iter_count = 0
         while _max_iters == -1 or _iter_count < _max_iters:
             _iter_count += 1
+            if _progress_freq or _progress_stages:
+                await set_progress_stage(client_id, "waiting for LLM")
             if not _suppress:
                 await push_tok(client_id, "\n[thinking…]\n")
             # Inject fresh sysinfo right before each LLM invocation so the
@@ -1521,6 +1530,8 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
                 if forced_calls:
                     tool_results = []
                     for tool_name, tool_args, _call_id in forced_calls:
+                        if _progress_freq or _progress_stages:
+                            await set_progress_stage(client_id, f"running {tool_name}")
                         if not _suppress:
                             await push_tok(client_id, f"\n[catcher] Detected bare {tool_name} call…\n")
                         result = await execute_tool(client_id, tool_name, tool_args)
@@ -1737,6 +1748,8 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
             has_non_agent_call_output = False
             _tools_used_this_turn: set[str] = set()
             for tc in ai_msg.tool_calls:
+                if _progress_freq or _progress_stages:
+                    await set_progress_stage(client_id, f"running {tc['name']}")
                 is_streaming_agent_call = (
                     tc["name"] == "agent_call"
                     and tc["args"].get("stream", True)
@@ -1775,6 +1788,8 @@ async def agentic_lc(model_key: str, messages: list[dict], client_id: str) -> st
     except Exception as exc:
         await push_err(client_id, str(exc))
         return ""
+    finally:
+        stop_progress_ticker(client_id)
 
 async def llm_call(
     model: str,
@@ -1912,6 +1927,49 @@ async def llm_call(
                 )
                 result = _content_to_str(response.content)
 
+                # Log per-call cost for Gemini and xAI models
+                _usage = getattr(response, "usage_metadata", None) or {}
+                _tokens_in = _usage.get("input_tokens", 0) or 0
+                _tokens_out = _usage.get("output_tokens", 0) or 0
+                _model_id = cfg.get("model_id", "")
+                _model_type = cfg.get("type", "")
+                if _model_type == "GEMINI":
+                    try:
+                        from cost_events import log_cost_event, estimate_gemini_cost
+                        _cost = estimate_gemini_cost(_model_id, _tokens_in, _tokens_out)
+                        asyncio.ensure_future(log_cost_event(
+                            provider="google",
+                            service=_model_id,
+                            tool_name="llm_call",
+                            model_key=model,
+                            client_id=client_id,
+                            cost_usd=_cost,
+                            tokens_in=_tokens_in,
+                            tokens_out=_tokens_out,
+                            unit="tokens",
+                            notes="estimated" if (_tokens_in == 0 and _tokens_out == 0) else None,
+                        ))
+                    except Exception:
+                        pass
+                elif _model_type == "OPENAI" and ("xai" in cfg.get("host", "").lower() or "grok" in _model_id.lower()):
+                    try:
+                        from cost_events import log_cost_event, estimate_xai_cost
+                        _cost = estimate_xai_cost(_model_id, _tokens_in, _tokens_out)
+                        asyncio.ensure_future(log_cost_event(
+                            provider="xai",
+                            service=_model_id,
+                            tool_name="llm_call",
+                            model_key=model,
+                            client_id=client_id,
+                            cost_usd=_cost,
+                            tokens_in=_tokens_in,
+                            tokens_out=_tokens_out,
+                            unit="tokens",
+                            notes="estimated" if (_tokens_in == 0 and _tokens_out == 0) else None,
+                        ))
+                    except Exception:
+                        pass
+
                 _sess = sessions.get(client_id, {})
                 if not _sess.get("tool_suppress", False):
                     preview_len = _sess.get("tool_preview_length", 500)
@@ -2000,9 +2058,10 @@ async def llm_call(
                         last_result = str(await execute_tool(client_id, tc["name"], tc["args"]))
                         tool_msgs.append(ToolMessage(content=last_result, tool_call_id=tc["id"]))
 
-                    turn2_msgs = messages + [ai_msg] + tool_msgs
-                    final_msg: AIMessage = await llm.ainvoke(turn2_msgs)
-                    return _content_to_str(final_msg.content) or last_result
+                    # Return raw tool result directly — the caller (reasoning
+                    # model) needs exact output including IDs and status codes.
+                    # Skip Turn 2 LLM rewrite which loses structured data.
+                    return last_result
 
                 result = await asyncio.wait_for(_run_tool(), timeout=timeout)
 
@@ -2016,14 +2075,59 @@ async def llm_call(
                     await push_tok(client_id, f"[llm_call ◀] {model}/{tool}:\n{preview}\n")
                 return result
 
-            except asyncio.TimeoutError:
-                msg = f"ERROR: llm_call timed out after {timeout}s for model '{model}'."
-                await push_tok(client_id, f"[llm_call ✗] {model}/{tool}: timeout after {timeout}s\n")
-                return msg
-            except Exception as exc:
-                msg = f"ERROR: llm_call failed for model '{model}', tool '{tool}': {exc}"
-                await push_tok(client_id, f"[llm_call ✗] {model}/{tool}: {exc}\n")
-                log.error(f"llm_call error: model={model} tool={tool} client={client_id} exc={exc}")
+            except (asyncio.TimeoutError, Exception) as exc:
+                is_timeout = isinstance(exc, asyncio.TimeoutError)
+                err_label = f"timeout after {timeout}s" if is_timeout else str(exc)
+                log.error(f"llm_call error: model={model} tool={tool} client={client_id} exc={err_label}")
+
+                # ---- backup_models fallback for tool mode ----
+                _backup_models = cfg.get("backup_models") or []
+                if _backup_models:
+                    backup_key = _backup_models[0]
+                    if backup_key in LLM_REGISTRY:
+                        log.warning(
+                            f"llm_call: {model} failed ({err_label}), falling back to {backup_key}"
+                        )
+                        await push_tok(
+                            client_id,
+                            f"[llm_call ⚠] {model} failed — retrying with {backup_key}…\n",
+                        )
+                        try:
+                            async def _run_backup():
+                                from langchain_core.tools import StructuredTool as _ST2
+                                lc_tool2 = _ST2.from_function(
+                                    coroutine=executor,
+                                    name=tool_schema["function"]["name"],
+                                    description=tool_schema["function"].get("description", ""),
+                                )
+                                llm2 = _build_lc_llm(backup_key)
+                                llm2_with_tool = llm2.bind_tools([lc_tool2])
+                                ai_msg2: AIMessage = await llm2_with_tool.ainvoke(messages)
+                                if not ai_msg2.tool_calls:
+                                    return _content_to_str(ai_msg2.content)
+                                tool_msgs2 = []
+                                last2 = ""
+                                for tc2 in ai_msg2.tool_calls:
+                                    last2 = str(await execute_tool(client_id, tc2["name"], tc2["args"]))
+                                    tool_msgs2.append(ToolMessage(content=last2, tool_call_id=tc2["id"]))
+                                return last2
+
+                            result = await asyncio.wait_for(_run_backup(), timeout=timeout)
+                            _sess = sessions.get(client_id, {})
+                            if not _sess.get("tool_suppress", False):
+                                preview_len = _sess.get("tool_preview_length", 500)
+                                preview = (
+                                    result if (preview_len == 0 or len(result) <= preview_len)
+                                    else result[:preview_len] + "\n…(truncated)"
+                                )
+                                await push_tok(client_id, f"[llm_call ◀ backup] {backup_key}/{tool}:\n{preview}\n")
+                            return result
+                        except Exception as backup_exc:
+                            log.error(f"llm_call backup also failed: {backup_key} exc={backup_exc}")
+                            await push_tok(client_id, f"[llm_call ✗] backup {backup_key} also failed: {backup_exc}\n")
+
+                msg = f"ERROR: llm_call failed for model '{model}', tool '{tool}': {err_label}"
+                await push_tok(client_id, f"[llm_call ✗] {model}/{tool}: {err_label}\n")
                 return msg
             finally:
                 set_db_override(_prev_db_override)
@@ -2183,6 +2287,14 @@ async def dispatch_llm(model_key: str, messages: list[dict], client_id: str) -> 
     if model_key not in LLM_REGISTRY:
         await push_err(client_id, f"Unknown model: '{model_key}'")
         return ""
+
+    # ---- 503 fallback redirect: skip primary if probe is still running ----
+    from agents_xai import is_model_in_fallback, get_fallback_model
+    if is_model_in_fallback(model_key):
+        backup_key = get_fallback_model(model_key)
+        if backup_key and backup_key in LLM_REGISTRY:
+            log.info(f"dispatch_llm: {model_key} in fallback, routing to {backup_key}")
+            return await dispatch_llm(backup_key, messages, client_id)
 
     # Session-start tool_list auto-inject: on the first turn of a session, inject a
     # synthetic assistant message containing the tool_list result so the model starts

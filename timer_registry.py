@@ -40,6 +40,7 @@ def timer_start(name: str) -> float:
     """Mark timer as running. Returns monotonic t0 for duration tracking."""
     if name in _registry:
         _registry[name]["status"] = "running"
+        _registry[name]["next_run_at"] = None
         _registry[name]["last_error"] = None
     return time.monotonic()
 

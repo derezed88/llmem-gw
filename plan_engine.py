@@ -77,11 +77,11 @@ Task steps execute one at a time. If step N needs output from step N-1 (e.g., a 
 
 ### llm_call
 - REQUIRED args: model, prompt
-- model MUST be a real model key from the system (e.g., "samaritan-execution", "summarizer-gemini"). NEVER use "default" — it does not exist.
+- model MUST be a real model key from the system (e.g., "samaritan-execution", "summarizer-anthropic"). NEVER use "default" or "summarizer-gemini" — they must not be used.
 - mode: "text" (default, generates text) or "tool" (delegates a tool call; requires "tool" arg)
 - Do NOT use mode="chat" — it does not exist.
 - **samaritan-execution REQUIRES mode="tool" with an explicit tool= argument.** It rejects mode="text". For cognitive writes (set_goal, set_plan, set_belief, procedure_save, save_memory_typed), always use: {"tool": "llm_call", "args": {"model": "samaritan-execution", "mode": "tool", "tool": "<tool_name>", "prompt": "..."}}
-- For synthesis/summarization tasks, use model="summarizer-gemini" with mode="text".
+- For synthesis/summarization tasks, use model="summarizer-anthropic" with mode="text".
 
 ### search_tavily / search_xai / search_brightdata
 - Args: query (string). search_tavily also accepts search_depth="basic"|"advanced".
@@ -778,51 +778,94 @@ async def _complete_task(task_step_id: int, result_str: str, executor: str = "di
     )
 
 
+def _max_task_retries() -> int:
+    """Return the max retry limit for task steps before marking them failed.
+
+    Reads goal_health_failure_replan from plugins-enabled.json (default 3).
+    This reuses the same threshold as the goal health system so behaviour is consistent.
+    """
+    import json, os
+    try:
+        path = os.path.join(os.path.dirname(__file__), "plugins-enabled.json")
+        with open(path) as f:
+            raw = json.load(f).get("plugin_config", {}).get("proactive_cognition", {})
+        return int(raw.get("goal_health_failure_replan", 3))
+    except Exception:
+        return 3
+
+
 async def _fail_task(task_step_id: int, error: str):
     """
     Mark a task step as failed and propagate failure up the stack.
 
     Cascade:
-      task → status='pending', result=error
-      parent concept → status='blocked' (if any child failed)
-      goal → status='blocked' (if any concept is blocked)
+      task → fail_count++; if fail_count >= max_retries: status='failed'
+              else: status='pending' (retry on next processor cycle)
+      parent concept → status='failed' (blocked) when child hits hard failure
     """
     from database import execute_sql, fetch_dicts
     escaped = error[:2000].replace("'", "''")
+    max_retries = _max_task_retries()
+
+    # Increment fail_count and check threshold
+    rows = await fetch_dicts(
+        f"SELECT fail_count, parent_id FROM {_PLANS()} WHERE id = {task_step_id} LIMIT 1"
+    )
+    current_fails = rows[0]["fail_count"] if rows else 0
+    new_fails = current_fails + 1
+    hard_fail = new_fails >= max_retries
+
+    new_status = "failed" if hard_fail else "pending"
     await execute_sql(
-        f"UPDATE {_PLANS()} SET status = 'pending', "
+        f"UPDATE {_PLANS()} SET status = '{new_status}', fail_count = {new_fails}, "
         f"result = '{escaped}' WHERE id = {task_step_id}"
     )
 
-    # Propagate to parent concept step
-    rows = await fetch_dicts(
-        f"SELECT parent_id FROM {_PLANS()} WHERE id = {task_step_id} LIMIT 1"
-    )
-    if rows and rows[0].get("parent_id"):
-        parent_id = rows[0]["parent_id"]
-        await _check_parent_failure(parent_id, error)
+    if hard_fail:
+        log.warning(
+            f"_fail_task: task {task_step_id} reached max retries ({max_retries}), "
+            f"marking failed: {error[:100]}"
+        )
+        # Propagate hard failure to parent concept
+        if rows and rows[0].get("parent_id"):
+            await _check_parent_failure(rows[0]["parent_id"], error, hard_fail=True)
+    else:
+        log.warning(
+            f"_fail_task: task {task_step_id} failed (attempt {new_fails}/{max_retries}), "
+            f"re-queued: {error[:100]}"
+        )
+        if rows and rows[0].get("parent_id"):
+            await _check_parent_failure(rows[0]["parent_id"], error, hard_fail=False)
 
-    log.warning(f"_fail_task: task {task_step_id} failed: {error[:100]}")
 
-
-async def _check_parent_failure(parent_id: int, error: str):
+async def _check_parent_failure(parent_id: int, error: str, hard_fail: bool = False):
     """
     When a task step fails, note the error on the parent concept step.
 
-    Does NOT block the goal — the goal processor manages failure recovery
-    (pauses for user, accepts !plan auto done, resumes). Blocking the goal
-    here creates an inconsistent state that manual recovery can't fix.
+    On soft failure (retryable): appends error to result for audit trail only.
+    On hard failure (max retries reached): also sets concept status to 'failed'
+    so the goal health system can detect and handle it.
+
+    Does NOT block the goal directly — the goal processor manages goal-level
+    recovery to avoid inconsistent state that manual recovery can't fix.
     """
     from database import execute_sql, fetch_dicts
 
-    # Note the error on the concept step (append to result for audit trail)
     escaped = error[:2000].replace("'", "''")
-    await execute_sql(
-        f"UPDATE {_PLANS()} SET "
-        f"result = CONCAT(COALESCE(result, ''), ' | FAILED: {escaped}') "
-        f"WHERE id = {parent_id} AND status IN ('pending', 'in_progress')"
-    )
-    log.info(f"_check_parent_failure: concept {parent_id} task failure noted: {error[:100]}")
+    if hard_fail:
+        await execute_sql(
+            f"UPDATE {_PLANS()} SET status = 'failed', "
+            f"result = CONCAT(COALESCE(result, ''), ' | HARD FAIL: {escaped}') "
+            f"WHERE id = {parent_id} AND status IN ('pending', 'in_progress')"
+        )
+        log.warning(f"_check_parent_failure: concept {parent_id} blocked (hard fail): {error[:100]}")
+    else:
+        await execute_sql(
+            f"UPDATE {_PLANS()} SET "
+            f"result = CONCAT(COALESCE(result, ''), ' | FAILED: {escaped}') "
+            f"WHERE id = {parent_id} AND status IN ('pending', 'in_progress')"
+        )
+        log.info(f"_check_parent_failure: concept {parent_id} task failure noted: {error[:100]}")
 
 
 # ---------------------------------------------------------------------------

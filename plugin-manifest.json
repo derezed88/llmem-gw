@@ -251,6 +251,23 @@
         "file_extract"
       ]
     },
+    "plugin_photo_analysis": {
+      "type": "data_tool",
+      "file": "plugin_photo_analysis.py",
+      "description": "Photo and image analysis via Gemini 2.5 Flash vision (general, reasoning, OCR)",
+      "dependencies": [
+        "google-genai",
+        "httpx"
+      ],
+      "env_vars": [
+        "GEMINI_API_KEY"
+      ],
+      "config_files": [],
+      "priority": 411,
+      "tools": [
+        "analyze_photo"
+      ]
+    },
     "plugin_claude_vscode_sessions": {
       "type": "client_interface",
       "file": "plugin_claude_vscode_sessions.py",

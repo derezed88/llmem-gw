@@ -104,6 +104,69 @@ def _COGNITION() -> str:
 def _TEMPORAL() -> str:
     return get_tables_for_model().get("temporal", "samaritan_temporal")
 
+def _EMOTIONS() -> str:
+    return get_tables_for_model().get("emotions", "samaritan_emotions")
+
+def _LOCATION() -> str:
+    return get_tables_for_model().get("location", "samaritan_location")
+
+# ---------------------------------------------------------------------------
+# GPS location extraction
+# ---------------------------------------------------------------------------
+
+_GPS_RE = re.compile(
+    r"\s*\[GPS:\s*"
+    r"(?P<lat>-?\d+(?:\.\d+)?)\s*,\s*"
+    r"(?P<lon>-?\d+(?:\.\d+)?)"
+    r"(?:\s*±\s*(?P<acc>\d+(?:\.\d+)?)m?)?"
+    r"\s*\]\s*",
+)
+
+
+def strip_gps(text: str) -> tuple[str, dict | None]:
+    """Strip ``[GPS: lat,lon ±Xm]`` from *text*.
+
+    Returns (cleaned_text, gps_dict_or_None).
+    gps_dict keys: ``lat`` (float), ``lon`` (float), ``accuracy_m`` (float|None).
+    """
+    m = _GPS_RE.search(text)
+    if not m:
+        return text, None
+    cleaned = text[:m.start()] + text[m.end():]
+    cleaned = cleaned.strip() or text[:m.start()].strip()
+    gps = {
+        "lat": float(m.group("lat")),
+        "lon": float(m.group("lon")),
+        "accuracy_m": float(m.group("acc")) if m.group("acc") else None,
+    }
+    return cleaned, gps
+
+
+async def save_location(
+    lat: float,
+    lon: float,
+    accuracy_m: float | None = None,
+    session_id: str = "",
+    created_at: str | None = None,
+) -> int:
+    """Insert a GPS location row. *created_at* should be a MySQL datetime string."""
+    ts = created_at or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    session_id = (session_id or "").replace("\\", "\\\\").replace("'", "''")[:255]
+    acc_sql = f"{accuracy_m}" if accuracy_m is not None else "NULL"
+    sql = (
+        f"INSERT INTO {_LOCATION()} "
+        f"(latitude, longitude, accuracy_m, session_id, created_at) "
+        f"VALUES ({lat}, {lon}, {acc_sql}, '{session_id}', '{ts}')"
+    )
+    try:
+        row_id = await execute_insert(sql)
+        log.info(f"save_location: id={row_id} lat={lat} lon={lon} acc={accuracy_m} ts={ts}")
+        return row_id
+    except Exception as e:
+        log.error(f"save_location failed: {e}")
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # Typed table metrics — write/read counters, reset on restart
 # ---------------------------------------------------------------------------
@@ -263,8 +326,12 @@ async def save_memory(
     source: str = "session",
     session_id: str = "",
     type: str = "context",
+    created_at: str | None = None,
 ) -> int:
-    """Insert a new short-term memory row. Returns new row id, or 0 if duplicate/error."""
+    """Insert a new short-term memory row. Returns new row id, or 0 if duplicate/error.
+
+    *created_at*: optional MySQL datetime string to override DEFAULT CURRENT_TIMESTAMP.
+    """
     if not _mem_plugin_cfg().get("enabled", True):
         return 0
     topic = topic.replace("\\", "\\\\").replace("'", "''")[:255]
@@ -322,11 +389,18 @@ async def save_memory(
             except Exception as e:
                 log.warning(f"save_memory fuzzy-dedup check failed: {e}")
 
-    sql = (
-        f"INSERT INTO {_ST()} "
-        f"(topic, content, importance, source, session_id, type) "
-        f"VALUES ('{topic}', '{content}', {importance}, '{source}', '{session_id}', '{mem_type}')"
-    )
+    if created_at:
+        sql = (
+            f"INSERT INTO {_ST()} "
+            f"(topic, content, importance, source, session_id, type, created_at) "
+            f"VALUES ('{topic}', '{content}', {importance}, '{source}', '{session_id}', '{mem_type}', '{created_at}')"
+        )
+    else:
+        sql = (
+            f"INSERT INTO {_ST()} "
+            f"(topic, content, importance, source, session_id, type) "
+            f"VALUES ('{topic}', '{content}', {importance}, '{source}', '{session_id}', '{mem_type}')"
+        )
     try:
         row_id = await execute_insert(sql)
     except Exception as e:
@@ -465,6 +539,7 @@ async def save_conversation_turn(
     session_id: str = "",
     importance: int = 4,
     memory_types_enabled: bool = False,
+    created_at: str | None = None,
 ) -> tuple[int, int, str | None]:
     """Save a user prompt and assistant response as two verbatim memory rows.
 
@@ -498,6 +573,7 @@ async def save_conversation_turn(
         source="user",
         session_id=session_id,
         type=mem_type,
+        created_at=created_at,
     )
     asst_id = await save_memory(
         topic=topic,
@@ -506,6 +582,7 @@ async def save_conversation_turn(
         source="assistant",
         session_id=session_id,
         type=mem_type,
+        created_at=created_at,
     )
     return user_id, asst_id, topic
 

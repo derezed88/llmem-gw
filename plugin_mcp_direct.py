@@ -1402,7 +1402,7 @@ async def google_drive(
     """CRUD operations on Google Drive within the authorized folder.
 
     Args:
-        operation: 'list', 'read', 'create', 'append', 'delete'
+        operation: 'list', 'read', 'create', 'append', 'delete', 'move'
         file_id: Required for read/delete (get from list first)
         file_name: Required for create
         content: Required for create/append
@@ -1517,6 +1517,55 @@ async def google_tasks(
         return "Google Tasks plugin not available"
     except Exception as e:
         return f"Tasks error: {e}"
+
+
+@mcp.tool()
+async def stats_analyze(
+    operation: str,
+    sql: str = "",
+    csv_path: str = "",
+    json_data: str = "",
+    drive_file_id: str = "",
+    y_col: str = "",
+    x_cols: str = "",
+    columns: str = "",
+    method: str = "pearson",
+    period: int = 0,
+    date_col: str = "",
+    top_n: int = 20,
+) -> str:
+    """Statistical analysis on data from SQL, CSV, JSON, or Google Drive.
+
+    Args:
+        operation: 'columns' (inspect schema), 'describe' (descriptive stats),
+                   'correlation' (correlation matrix), 'ols' (linear regression),
+                   'logistic' (logistic regression), 'decompose' (time series),
+                   'frequency' (value counts).
+        sql: SQL query to pull data from MySQL (mymcp database).
+        csv_path: Local file path to a CSV file.
+        json_data: Inline JSON array of objects or dict of arrays.
+        drive_file_id: Google Drive file ID (CSV or JSON file).
+        y_col: Dependent variable column name. Required for ols, logistic, decompose, frequency.
+        x_cols: Comma-separated predictor column names. Required for ols, logistic.
+        columns: Comma-separated column names to include (for describe, correlation).
+        method: Correlation method: 'pearson', 'spearman', or 'kendall' (default 'pearson').
+        period: Seasonality period for decompose (auto-detected if 0).
+        date_col: Date column for sorting in decompose.
+        top_n: Number of top values for frequency (default 20).
+    """
+    _set_context()
+    try:
+        from stats_engine import run_stats
+        return await run_stats(
+            operation=operation, sql=sql, csv_path=csv_path,
+            json_data=json_data, drive_file_id=drive_file_id,
+            y_col=y_col, x_cols=x_cols, columns=columns,
+            method=method, period=period, date_col=date_col, top_n=top_n,
+        )
+    except ImportError as e:
+        return f"Stats engine not available: {e}"
+    except Exception as e:
+        return f"Stats error: {e}"
 
 
 @mcp.tool()
@@ -1655,6 +1704,225 @@ async def file_extract(
         )
     except Exception as e:
         return f"file_extract error: {e}"
+
+
+@mcp.tool()
+async def analyze_photo(
+    prompt: str,
+    file_id: str = "",
+    local_path: str = "",
+    url: str = "",
+    image_b64: str = "",
+    mime_type: str = "",
+    task_type: str = "general",
+) -> str:
+    """Analyze a photo or image using Gemini 2.5 Flash vision.
+
+    Provide exactly ONE image source: file_id, local_path, url, or image_b64.
+    Routes by task_type: general (describe), reasoning (deep analysis), ocr (extract text).
+
+    Args:
+        prompt: What to analyze or ask about the image. Overrides task_type default prompt.
+        file_id: Google Drive file ID (downloads via Drive API)
+        local_path: Absolute path to an image file on the local filesystem
+        url: HTTP/HTTPS URL pointing directly to an image
+        image_b64: Base64-encoded image data (optionally with data URI prefix)
+        mime_type: MIME type hint for base64 input (e.g. 'image/jpeg'). Auto-detected otherwise.
+        task_type: 'general' (default), 'reasoning', or 'ocr'
+    """
+    _set_context()
+    try:
+        from tools import get_tool_executor
+        executor = get_tool_executor("analyze_photo")
+        if not executor:
+            return "analyze_photo not available (plugin_photo_analysis not loaded)"
+        return await executor(
+            prompt=prompt,
+            file_id=file_id or None,
+            local_path=local_path or None,
+            url=url or None,
+            image_b64=image_b64 or None,
+            mime_type=mime_type or None,
+            task_type=task_type,
+        )
+    except Exception as e:
+        return f"analyze_photo error: {e}"
+
+
+@mcp.tool()
+async def eidetic_save(
+    topic: str,
+    content: str,
+    drive_file_id: str = "",
+    task_type: str = "general",
+    importance: int = 5,
+    source: str = "assistant",
+    analysis_model: str = "gemini-2.5-flash",
+    location_lat: float = 0.0,
+    location_lon: float = 0.0,
+    memory_link: str = "",
+    session_id: str = "",
+) -> str:
+    """Save a visual/photo memory to eidetic storage with Qdrant embedding.
+
+    Called automatically by the frontend after each photo analysis. Creates a
+    permanent visual memory record linked to the source image in Google Drive.
+
+    Args:
+        topic: Short topic label (e.g. 'kitchen-sink', 'street-sign-broadway')
+        content: The photo analysis text from Gemini vision
+        drive_file_id: Google Drive file ID of the source image
+        task_type: 'general', 'reasoning', or 'ocr'
+        importance: 1-10
+        source: 'user', 'assistant', 'directive', 'session'
+        analysis_model: Model that produced the analysis (default: gemini-2.5-flash)
+        location_lat: GPS latitude at capture time (0 = unknown)
+        location_lon: GPS longitude at capture time (0 = unknown)
+        memory_link: JSON array of related memory row IDs
+        session_id: Session that captured this
+    """
+    _set_context()
+    from memory import _EIDETIC, _EIDETIC_COLLECTION
+    from database import execute_sql
+
+    esc = lambda s: s.replace("'", "''") if s else ""
+    lat_sql = f"{location_lat}" if location_lat else "NULL"
+    lon_sql = f"{location_lon}" if location_lon else "NULL"
+    link_sql = f"'{esc(memory_link)}'" if memory_link else "NULL"
+    sid = session_id or f"{_CLIENT_ID_PREFIX}-mcp"
+
+    sql = (
+        f"INSERT INTO {_EIDETIC()} "
+        f"(topic, content, importance, source, session_id, drive_file_id, "
+        f"task_type, analysis_model, memory_link, location_lat, location_lon) "
+        f"VALUES ('{esc(topic)}', '{esc(content)}', {max(1, min(10, importance))}, "
+        f"'{esc(source)}', '{esc(sid)}', '{esc(drive_file_id)}', "
+        f"'{esc(task_type)}', '{esc(analysis_model)}', {link_sql}, "
+        f"{lat_sql}, {lon_sql})"
+    )
+    result = await execute_sql(sql)
+    # Extract row ID
+    row_id = 0
+    id_result = await execute_sql(f"SELECT LAST_INSERT_ID() AS id")
+    if id_result and "id" in id_result:
+        import re
+        m = re.search(r"(\d+)", id_result.split("\n")[-1] if "\n" in id_result else id_result)
+        if m:
+            row_id = int(m.group(1))
+
+    # Embed into Qdrant for semantic recall
+    if row_id:
+        try:
+            from plugin_memory_vector_qdrant import get_vector_api
+            vec = get_vector_api()
+            if vec:
+                embed_text = f"{topic}: {content}"
+                await vec.upsert_memory(
+                    row_id=row_id,
+                    topic=topic,
+                    content=content,
+                    importance=importance,
+                    tier="eidetic",
+                    collection=_EIDETIC_COLLECTION(),
+                )
+        except Exception as e:
+            log.warning(f"eidetic_save: Qdrant embed failed: {e}")
+
+    return f"Eidetic memory saved (id={row_id}): [{topic}] {content[:80]}"
+
+
+@mcp.tool()
+async def eidetic_recall(
+    query: str = "",
+    task_type: str = "",
+    time_start: str = "",
+    time_end: str = "",
+    drive_file_id: str = "",
+    limit: int = 20,
+    semantic: bool = True,
+    min_score: float = 0.40,
+) -> str:
+    """Search eidetic (visual/photo) memories by keyword, date, or semantic similarity.
+
+    Use this to recall what was seen in photos — 'Do you remember when we had ice cream?'
+
+    Args:
+        query: Natural language query or keyword (e.g. 'ice cream', 'street sign')
+        task_type: Filter by analysis type ('general', 'reasoning', 'ocr', empty=all)
+        time_start: ISO date/datetime start filter (e.g. '2026-10-01')
+        time_end: ISO date/datetime end filter (e.g. '2026-10-31')
+        drive_file_id: Search for a specific Drive file
+        limit: Max rows to return
+        semantic: Use Qdrant vector search (default true). False = SQL keyword search.
+        min_score: Minimum similarity for semantic search
+    """
+    _set_context()
+    from memory import _EIDETIC, _EIDETIC_COLLECTION
+    from database import execute_sql
+
+    results = []
+
+    # Semantic search path
+    if semantic and query:
+        try:
+            from plugin_memory_vector_qdrant import get_vector_api
+            vec = get_vector_api()
+            if vec:
+                hits = await vec.search_memories(
+                    query, tier="eidetic", top_k=limit,
+                    min_score=min_score, collection=_EIDETIC_COLLECTION(),
+                )
+                if hits:
+                    # Enrich with SQL data (drive_file_id, location, dates)
+                    ids = [str(h["id"]) for h in hits]
+                    sql = (
+                        f"SELECT id, topic, content, drive_file_id, task_type, "
+                        f"location_lat, location_lon, created_at "
+                        f"FROM {_EIDETIC()} WHERE id IN ({','.join(ids)})"
+                    )
+                    enriched = await execute_sql(sql)
+                    # Merge scores with SQL data
+                    score_map = {h["id"]: h["score"] for h in hits}
+                    for line in enriched.strip().split("\n"):
+                        if line.startswith("id") or line.startswith("-"):
+                            continue
+                        parts = [p.strip() for p in line.split("|")]
+                        if len(parts) >= 1:
+                            try:
+                                rid = int(parts[0])
+                                score = score_map.get(rid, 0)
+                                results.append(f"[score={score:.3f}] {line}")
+                            except ValueError:
+                                results.append(line)
+                    if results:
+                        return "\n".join(results)
+        except Exception as e:
+            log.warning(f"eidetic_recall semantic search failed: {e}")
+
+    # SQL keyword/filter search (fallback or when semantic=False)
+    esc = lambda s: s.replace("'", "''") if s else ""
+    where = []
+    if query:
+        q = esc(query)
+        where.append(f"(topic LIKE '%{q}%' OR content LIKE '%{q}%')")
+    if task_type:
+        where.append(f"task_type = '{esc(task_type)}'")
+    if drive_file_id:
+        where.append(f"drive_file_id = '{esc(drive_file_id)}'")
+    if time_start:
+        where.append(f"created_at >= '{esc(time_start)}'")
+    if time_end:
+        where.append(f"created_at <= '{esc(time_end)}'")
+
+    where_sql = " AND ".join(where) if where else "1=1"
+    sql = (
+        f"SELECT id, topic, LEFT(content, 200) AS content, drive_file_id, "
+        f"task_type, location_lat, location_lon, created_at "
+        f"FROM {_EIDETIC()} WHERE {where_sql} "
+        f"ORDER BY created_at DESC LIMIT {limit}"
+    )
+    result = await execute_sql(sql)
+    return result if result.strip() else "(no eidetic memories found)"
 
 
 @mcp.tool()
@@ -2045,6 +2313,9 @@ async def endpoint_voice_relay_submit(request: Request) -> JSONResponse:
     # Pass through emotion/prosody metadata from xAI STT if present
     if payload.get("emotion"):
         msg["emotion"] = payload["emotion"]
+    # Pass through GPS location metadata if present
+    if payload.get("location"):
+        msg["location"] = payload["location"]
     relay["inbox"].append(msg)
     relay["last_message_at"] = _time.time()
     log.info(f"voice_relay[{channel}]: inbound msg #{msg['id']} from {msg['source']}: {text[:80]}")
@@ -2342,22 +2613,125 @@ _DISPATCH_TMUX_SESSIONS = {
 
 _dispatch_locks: Dict[str, _asyncio.Lock] = {}
 
+# Thread sessions spawned dynamically: channel → tmux_session name
+_dynamic_channels: Dict[str, str] = {}
+
+# Max simultaneous dynamic thread sessions
+_MAX_THREAD_SESSIONS = 5
+
+# Idle TTL for dynamic sessions (seconds) — reap after this long with no activity
+_THREAD_SESSION_TTL = 1800  # 30 minutes
+
+_THREAD_START_SCRIPT = os.path.expanduser(
+    "~/projects/samaritan-work/claude-thread-start.sh"
+)
+
+
 def _get_dispatch(channel: str = "default") -> dict:
     if channel not in _dispatch_channels:
+        # For dynamic thread channels, tmux session name was registered via
+        # _register_thread_channel(); fall back to static map then default.
+        tmux_sess = (
+            _dynamic_channels.get(channel)
+            or _DISPATCH_TMUX_SESSIONS.get(channel)
+            or "samaritan-work"
+        )
         _dispatch_channels[channel] = {
             "pending_prompt": None,
             "response_event": None,
             "response_text": None,
             "last_submit_at": 0.0,
-            "tmux_session": _DISPATCH_TMUX_SESSIONS.get(channel, "samaritan-work"),
+            "client_id": None,
+            "turn_count": 0,
+            "tmux_session": tmux_sess,
         }
         _dispatch_locks[channel] = _asyncio.Lock()
     return _dispatch_channels[channel]
 
 
+def _register_thread_channel(channel: str, tmux_session: str) -> None:
+    """Register a dynamic thread channel → tmux session mapping."""
+    _dynamic_channels[channel] = tmux_session
+    # Update dispatch dict if already created (e.g. from a pre-spawn check)
+    if channel in _dispatch_channels:
+        _dispatch_channels[channel]["tmux_session"] = tmux_session
+
+
+async def _spawn_thread_session(channel: str) -> tuple:
+    """Spawn a new Claude Code tmux session for a dynamic thread channel.
+
+    Returns (ok: bool, tmux_session: str, message: str).
+    Enforces _MAX_THREAD_SESSIONS cap.
+    """
+    # Already registered and alive?
+    if channel in _dynamic_channels:
+        tmux_sess = _dynamic_channels[channel]
+        proc = await _asyncio.create_subprocess_exec(
+            "tmux", "has-session", "-t", tmux_sess,
+            stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
+        )
+        if await proc.wait() == 0:
+            return True, tmux_sess, "already running"
+
+    # Cap check
+    active = sum(
+        1 for ch in _dynamic_channels
+        if _dispatch_channels.get(ch, {}).get("last_submit_at", 0) > 0
+    )
+    if active >= _MAX_THREAD_SESSIONS:
+        return False, "", (
+            f"Thread session cap reached ({_MAX_THREAD_SESSIONS} active). "
+            "Finish or close another thread first."
+        )
+
+    # Derive short tmux session name from channel
+    # channel = "slack-thread-553459" → tmux = "samaritan-slack-553459"
+    suffix = channel.split("-")[-1] if "-" in channel else channel[:8]
+    tmux_session = f"samaritan-slack-{suffix}"
+
+    log.info(f"Spawning thread session: channel={channel} tmux={tmux_session}")
+    proc = await _asyncio.create_subprocess_exec(
+        "bash", _THREAD_START_SCRIPT, tmux_session,
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=45)
+    output = stdout.decode().strip()
+
+    if output.startswith("started:"):
+        _register_thread_channel(channel, tmux_session)
+        log.info(f"Thread session started: {tmux_session}")
+        return True, tmux_session, "started"
+    else:
+        log.error(f"Thread session spawn failed: {output} / {stderr.decode().strip()}")
+        return False, "", f"Failed to start Claude session: {output}"
+
+
+async def _reap_idle_thread_sessions() -> None:
+    """Kill dynamic thread sessions idle longer than _THREAD_SESSION_TTL."""
+    now = _time.time()
+    for channel in list(_dynamic_channels.keys()):
+        dispatch = _dispatch_channels.get(channel)
+        if not dispatch:
+            continue
+        last = dispatch.get("last_submit_at", 0)
+        if last > 0 and (now - last) > _THREAD_SESSION_TTL:
+            tmux_sess = _dynamic_channels[channel]
+            log.info(f"Reaping idle thread session: {tmux_sess} (idle {int(now-last)}s)")
+            proc = await _asyncio.create_subprocess_exec(
+                "tmux", "kill-session", "-t", tmux_sess,
+                stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
+            )
+            await proc.wait()
+            _dynamic_channels.pop(channel, None)
+            _dispatch_channels.pop(channel, None)
+            _dispatch_locks.pop(channel, None)
+
+
 def _format_dispatch_prompt(text: str, source: str = "voice",
-                            emotion: dict = None) -> str:
-    """Format user text with source/emotion metadata prefix for Claude."""
+                            emotion: dict = None,
+                            location: dict = None) -> str:
+    """Format user text with source/emotion/location metadata prefix for Claude."""
     prefix = f"[{source}"
     if emotion:
         em_label = emotion.get("emotion", "neutral")
@@ -2368,6 +2742,13 @@ def _format_dispatch_prompt(text: str, source: str = "voice",
         prosody = emotion.get("prosody", "")
         if prosody:
             prefix += f"|prosody:{prosody}"
+    if location:
+        lat = location.get("latitude", "")
+        lon = location.get("longitude", "")
+        acc = location.get("accuracy_m")
+        prefix += f"|location:{lat},{lon}"
+        if acc is not None:
+            prefix += f"±{acc}m"
     prefix += "]"
     return f"{prefix} {text}"
 
@@ -2385,55 +2766,141 @@ async def endpoint_claude_submit(request: Request) -> JSONResponse:
     text = payload.get("text", "").strip()
     source = payload.get("source", "voice")
     emotion = payload.get("emotion")
+    location = payload.get("location")
     channel = payload.get("channel", "default")
+    client_id = payload.get("client_id")
 
     if not text:
         return JSONResponse({"error": "Missing text"}, status_code=400)
 
+    # Reap idle thread sessions opportunistically on each submit
+    _asyncio.create_task(_reap_idle_thread_sessions())
+
     dispatch = _get_dispatch(channel)
     tmux_session = dispatch["tmux_session"]
 
-    # Check tmux session is alive
+    # Check tmux session is alive; spawn dynamically for thread channels
     proc = await _asyncio.create_subprocess_exec(
         "tmux", "has-session", "-t", tmux_session,
         stdout=_asyncio.subprocess.PIPE,
         stderr=_asyncio.subprocess.PIPE,
     )
     if await proc.wait() != 0:
-        return JSONResponse(
-            {"error": f"tmux session '{tmux_session}' not found"},
-            status_code=503,
-        )
+        # For dynamic thread channels, spawn on demand
+        if channel.startswith("slack-thread-"):
+            ok, tmux_session, msg = await _spawn_thread_session(channel)
+            if not ok:
+                return JSONResponse({"error": msg}, status_code=503)
+            dispatch = _get_dispatch(channel)  # re-fetch with updated tmux_session
+        else:
+            return JSONResponse(
+                {"error": f"tmux session '{tmux_session}' not found"},
+                status_code=503,
+            )
 
     # Format prompt with metadata prefix
-    prompt = _format_dispatch_prompt(text, source, emotion)
+    prompt = _format_dispatch_prompt(text, source, emotion, location)
 
     # Prepare response capture
     dispatch["response_text"] = None
     dispatch["response_event"] = _asyncio.Event()
     dispatch["pending_prompt"] = text
     dispatch["last_submit_at"] = _time.time()
+    dispatch["client_id"] = client_id
+    dispatch["turn_count"] = 0
+    dispatch["location"] = location  # stored for conv_log to save with ST memory timestamp
 
-    # Send to tmux (literal mode to avoid escaping issues)
-    proc = await _asyncio.create_subprocess_exec(
-        "tmux", "send-keys", "-l", "-t", tmux_session, prompt,
-        stdout=_asyncio.subprocess.PIPE,
-        stderr=_asyncio.subprocess.PIPE,
-    )
-    rc = await proc.wait()
-    if rc != 0:
-        return JSONResponse({"error": "tmux send-keys failed"}, status_code=503)
+    # Collapse newlines — tmux send-keys -l treats \n as Enter, which fragments
+    # multi-line content like photo analysis into separate submissions.
+    prompt = prompt.replace("\n", " ").replace("\r", " ")
 
-    # Send Enter separately (send-keys -l doesn't interpret special keys)
-    proc2 = await _asyncio.create_subprocess_exec(
-        "tmux", "send-keys", "-t", tmux_session, "Enter",
-        stdout=_asyncio.subprocess.PIPE,
-        stderr=_asyncio.subprocess.PIPE,
-    )
-    await proc2.wait()
+    # Safety cap: Claude Code's input buffer chokes on very long single-line pastes.
+    # Truncate [Photo analysis: ...] blocks to keep total prompt under 2000 chars.
+    import re as _re
+    _MAX_ANALYSIS = 500  # max chars for inline photo analysis text
+    _pa_match = _re.search(r'\[Photo analysis: (.+?)\]', prompt)
+    if _pa_match and len(_pa_match.group(1)) > _MAX_ANALYSIS:
+        truncated = _pa_match.group(1)[:_MAX_ANALYSIS].rsplit('. ', 1)[0] + '.'
+        prompt = prompt[:_pa_match.start(1)] + truncated + prompt[_pa_match.end(1):]
+        log.info(f"dispatch: truncated photo analysis from {len(_pa_match.group(1))} to {len(truncated)} chars")
 
+    # For long prompts (e.g. photo analysis), send-keys -l can overflow the
+    # terminal input buffer.  Use tmux load-buffer + paste-buffer instead,
+    # which handles arbitrary length reliably.
+    import tempfile as _tempfile, os as _os
+    tmp_path = None
+    try:
+        with _tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
+                                          delete=False) as tmp:
+            tmp.write(prompt)
+            tmp_path = tmp.name
+
+        # Load file into tmux paste buffer
+        proc = await _asyncio.create_subprocess_exec(
+            "tmux", "load-buffer", tmp_path,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        rc = await proc.wait()
+        if rc != 0:
+            return JSONResponse({"error": "tmux load-buffer failed"}, status_code=503)
+
+        # Paste into the target session's pane
+        proc2 = await _asyncio.create_subprocess_exec(
+            "tmux", "paste-buffer", "-t", tmux_session,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        rc2 = await proc2.wait()
+        if rc2 != 0:
+            return JSONResponse({"error": "tmux paste-buffer failed"}, status_code=503)
+    finally:
+        if tmp_path:
+            try:
+                _os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    # Brief pause to let Claude Code's input renderer process the pasted text
+    # before sending Enter. Without this, Enter can arrive before the paste is
+    # fully processed, leaving text stuck in the input buffer.
+    await _asyncio.sleep(0.3)
+
+    # Send Enter to submit the pasted text, with retry if it gets stuck
+    for _enter_attempt in range(3):
+        proc3 = await _asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", tmux_session, "Enter",
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        await proc3.wait()
+
+        if _enter_attempt < 2:
+            # Check if Claude accepted the input by looking at the pane content.
+            # If the pasted text is still visible in the last lines, Enter didn't take.
+            await _asyncio.sleep(0.5)
+            cap = await _asyncio.create_subprocess_exec(
+                "tmux", "capture-pane", "-t", tmux_session, "-p", "-l", "5",
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.PIPE,
+            )
+            cap_out, _ = await cap.communicate()
+            pane_tail = cap_out.decode("utf-8", errors="replace")
+            # If pane shows the user's text still sitting in input (not a ">" prompt
+            # or processing indicator), the Enter was lost — retry
+            if prompt[:40] in pane_tail:
+                log.warning(f"dispatch: Enter attempt {_enter_attempt + 1} didn't take, retrying...")
+                await _asyncio.sleep(0.3)
+                continue
+            break  # Enter was accepted
+        break
+
+    prompt_len = len(prompt)
+    loc_str = f"{location['latitude']},{location['longitude']}" if location else "none"
     log.info(f"dispatch: sent to {tmux_session} ch={channel} src={source} "
              f"emotion={emotion.get('emotion') if emotion else 'none'} "
+             f"location={loc_str} "
+             f"len={prompt_len} "
              f"text={text[:60]}")
 
     return JSONResponse({"status": "submitted", "channel": channel})
@@ -2525,6 +2992,257 @@ async def endpoint_claude_status(request: Request) -> JSONResponse:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Slash command passthrough (for remote config control)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Allowed slash commands that can be sent remotely.
+_ALLOWED_SLASH_COMMANDS = {
+    "effort", "model", "config",
+}
+
+_CLAUDE_SETTINGS_PATH = os.path.expanduser("~/.claude/settings.json")
+_CLAUDE_SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
+
+_VALID_EFFORT_LEVELS = {"low", "medium", "high", "max", "auto"}
+_VALID_MODELS = {"sonnet", "haiku", "opus"}
+
+
+def _read_claude_settings() -> dict:
+    """Read Claude Code settings.json."""
+    try:
+        with open(_CLAUDE_SETTINGS_PATH, "r") as f:
+            return json.loads(f.read())
+    except Exception:
+        return {}
+
+
+def _write_claude_settings(settings: dict):
+    """Write Claude Code settings.json."""
+    with open(_CLAUDE_SETTINGS_PATH, "w") as f:
+        f.write(json.dumps(settings, indent=2) + "\n")
+
+
+def _find_active_sessions() -> list:
+    """Find active Claude Code sessions from session files."""
+    sessions = []
+    try:
+        for fname in os.listdir(_CLAUDE_SESSIONS_DIR):
+            if not fname.endswith(".json"):
+                continue
+            fpath = os.path.join(_CLAUDE_SESSIONS_DIR, fname)
+            with open(fpath, "r") as f:
+                data = json.loads(f.read())
+            pid = data.get("pid")
+            # Check if process is still running
+            if pid and os.path.exists(f"/proc/{pid}"):
+                sessions.append(data)
+    except Exception:
+        pass
+    return sessions
+
+
+async def _tmux_send_slash(tmux_session: str, command: str) -> bool:
+    """Send a slash command to a tmux session. Returns True on success."""
+    proc = await _asyncio.create_subprocess_exec(
+        "tmux", "has-session", "-t", tmux_session,
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    if await proc.wait() != 0:
+        return False
+
+    proc = await _asyncio.create_subprocess_exec(
+        "tmux", "send-keys", "-l", "-t", tmux_session, command,
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    if await proc.wait() != 0:
+        return False
+
+    proc2 = await _asyncio.create_subprocess_exec(
+        "tmux", "send-keys", "-t", tmux_session, "Enter",
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    await proc2.wait()
+    return True
+
+
+async def endpoint_claude_slash(request: Request) -> JSONResponse:
+    """View or change Claude Code session settings remotely.
+
+    Body: { command: "/effort [level]", channel: "default" }
+
+    Supported commands:
+      /effort           — show current effort level (reads settings.json)
+      /effort <level>   — set effort level (updates settings.json + sends to session)
+      /model            — show current model (from session info)
+      /model <name>     — switch model (sends to session)
+      /config think     — sends to session (fire-and-forget)
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    command = payload.get("command", "").strip()
+    channel = payload.get("channel", "default")
+
+    if not command.startswith("/"):
+        return JSONResponse({"error": "Command must start with /"}, status_code=400)
+
+    # Parse command
+    parts = command.lstrip("/").split(None, 1)
+    cmd_word = parts[0].lower()
+    cmd_arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if cmd_word not in _ALLOWED_SLASH_COMMANDS:
+        return JSONResponse(
+            {"error": f"Command /{cmd_word} not in allowlist: {sorted(_ALLOWED_SLASH_COMMANDS)}"},
+            status_code=403,
+        )
+
+    dispatch = _get_dispatch(channel)
+    tmux_session = dispatch["tmux_session"]
+
+    # ── /effort ──
+    if cmd_word == "effort":
+        settings = _read_claude_settings()
+        current = settings.get("effortLevel", "auto")
+
+        if not cmd_arg:
+            # Query: return current effort level
+            return JSONResponse({
+                "status": "ok",
+                "command": command,
+                "output": f"Effort level: {current}",
+            })
+
+        # Set: validate and update
+        level = cmd_arg.lower()
+        if level not in _VALID_EFFORT_LEVELS:
+            return JSONResponse({
+                "status": "error",
+                "command": command,
+                "output": f"Invalid effort level '{level}'. Valid: {sorted(_VALID_EFFORT_LEVELS)}",
+            }, status_code=400)
+
+        # Update settings.json
+        settings["effortLevel"] = level
+        _write_claude_settings(settings)
+
+        # Also send to active session so it picks up immediately
+        sent = await _tmux_send_slash(tmux_session, command)
+
+        return JSONResponse({
+            "status": "ok",
+            "command": command,
+            "output": f"Effort level: {current} → {level}"
+                      + (" (sent to session)" if sent else " (saved, session unreachable)"),
+        })
+
+    # ── /model ──
+    if cmd_word == "model":
+        if not cmd_arg:
+            # Query: report what we know from session files
+            sessions = _find_active_sessions()
+            session_info = []
+            for s in sessions:
+                name = s.get("name", s.get("entrypoint", "unknown"))
+                pid = s.get("pid")
+                session_info.append(f"  {name} (pid {pid})")
+            if session_info:
+                output = "Active Claude Code sessions:\n" + "\n".join(session_info)
+                output += "\n(Model is per-session runtime state — use /model <name> to change)"
+            else:
+                output = "No active Claude Code sessions found."
+            return JSONResponse({
+                "status": "ok",
+                "command": command,
+                "output": output,
+            })
+
+        # Set: send to session
+        sent = await _tmux_send_slash(tmux_session, command)
+        return JSONResponse({
+            "status": "ok",
+            "command": command,
+            "output": f"Sent /model {cmd_arg} to {tmux_session}"
+                      + (" ✓" if sent else " (session unreachable)"),
+        })
+
+    # ── /config think ──
+    if cmd_word == "config":
+        # /config think is interactive (opens a dialog) — handle via settings.json
+        config_sub = cmd_arg.split(None, 1)
+        sub_cmd = config_sub[0].lower() if config_sub else ""
+        sub_arg = config_sub[1].strip() if len(config_sub) > 1 else ""
+
+        if sub_cmd != "think":
+            return JSONResponse({
+                "status": "error",
+                "command": command,
+                "output": "Only /config think is supported remotely.",
+            }, status_code=400)
+
+        settings = _read_claude_settings()
+        think_enabled = settings.get("alwaysThinkingEnabled", False)
+        env = settings.get("env", {})
+        max_tokens = env.get("MAX_THINKING_TOKENS", "adaptive (default)")
+
+        if not sub_arg:
+            # Query
+            return JSONResponse({
+                "status": "ok",
+                "command": command,
+                "output": f"Think: {'on' if think_enabled else 'off'}\n"
+                          f"Max thinking tokens: {max_tokens}",
+            })
+
+        # Set: on/off/token count
+        if sub_arg.lower() == "on":
+            settings["alwaysThinkingEnabled"] = True
+            _write_claude_settings(settings)
+            return JSONResponse({
+                "status": "ok",
+                "command": command,
+                "output": f"Think: off → on",
+            })
+
+        if sub_arg.lower() == "off":
+            settings["alwaysThinkingEnabled"] = False
+            _write_claude_settings(settings)
+            return JSONResponse({
+                "status": "ok",
+                "command": command,
+                "output": f"Think: on → off",
+            })
+
+        # Numeric: set MAX_THINKING_TOKENS
+        try:
+            tokens = int(sub_arg)
+            if tokens < 0:
+                raise ValueError
+        except ValueError:
+            return JSONResponse({
+                "status": "error",
+                "command": command,
+                "output": f"Invalid value '{sub_arg}'. Use: on, off, or a token count (e.g. 10000)",
+            }, status_code=400)
+
+        if "env" not in settings:
+            settings["env"] = {}
+        settings["env"]["MAX_THINKING_TOKENS"] = str(tokens)
+        _write_claude_settings(settings)
+        return JSONResponse({
+            "status": "ok",
+            "command": command,
+            "output": f"Max thinking tokens: {max_tokens} → {tokens}"
+                      + (" (0 = disabled)" if tokens == 0 else ""),
+        })
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Conversation logging endpoint (called by Claude Code hook)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -2575,6 +3293,10 @@ async def endpoint_conv_log(request: Request) -> JSONResponse:
 
     _set_context()
 
+    # Shared timestamp for ST memory and location rows (same pattern as routes.py)
+    from datetime import datetime as _dt, timezone as _tz
+    _shared_ts = _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M:%S")
+
     try:
         from memory import save_conversation_turn, _normalize_topic, load_topic_list
 
@@ -2590,6 +3312,7 @@ async def endpoint_conv_log(request: Request) -> JSONResponse:
             assistant_text=assistant_text,
             session_id=session_id,
             importance=importance,
+            created_at=_shared_ts,
         )
         log.info(
             f"conv_log: topic={topic} user_id={user_id} asst_id={asst_id} "
@@ -2599,6 +3322,7 @@ async def endpoint_conv_log(request: Request) -> JSONResponse:
         # Write live emotion tag if provided (from Claude Code inline inference)
         emotion_written = False
         user_emotion = payload.get("user_emotion")
+        xai_emotion = payload.get("xai_emotion")
         if user_emotion and user_id:
             try:
                 from emotions import _write_emotion, CORE_EMOTIONS
@@ -2611,22 +3335,58 @@ async def endpoint_conv_log(request: Request) -> JSONResponse:
                     "confidence": 0.9,  # high confidence — inferred live with full context
                     "context": "live inference by Claude Code with conversation context",
                 }
+                # Attach xAI STT prosody data if available
+                if xai_emotion:
+                    emotion_item["xai_emotion_label"] = xai_emotion.get("xai_emotion_label", "")
+                    emotion_item["xai_confidence"] = xai_emotion.get("xai_confidence")
+                    emotion_item["xai_prosody"] = xai_emotion.get("xai_prosody", "")
                 emotion_written = await _write_emotion(emotion_item, confidence_threshold=0.0)
                 if emotion_written:
                     log.info(f"conv_log: live emotion '{user_emotion.get('emotion_label')}' written for user_id={user_id}")
             except Exception as e:
                 log.warning(f"conv_log: emotion write failed: {e}")
 
+        # Save GPS location if present on the matched dispatch channel
+        # (stored at submit time by endpoint_claude_submit)
+        if _dp_match:
+            for _ch_name, _disp in _dispatch_channels.items():
+                _loc = _disp.get("location")
+                if _loc and _disp.get("last_submit_at", 0) > 0:
+                    _loc_age = _time.time() - _disp["last_submit_at"]
+                    if _loc_age < 600:
+                        try:
+                            from memory import save_location
+                            await save_location(
+                                lat=_loc["latitude"],
+                                lon=_loc["longitude"],
+                                accuracy_m=_loc.get("accuracy_m"),
+                                session_id=session_id,
+                                created_at=_shared_ts,
+                            )
+                            _disp["location"] = None  # consume once
+                            log.info(f"conv_log: location saved lat={_loc['latitude']} lon={_loc['longitude']}")
+                        except Exception as _loc_err:
+                            log.warning(f"conv_log: location save failed: {_loc_err}")
+
         # Signal dispatch channel if a pending prompt is waiting for a response.
         # Only match conv_logs that contain the dispatch prefix (proves it came from
         # the tmux dispatch, not from VS Code or another session).
         if _dp_match:
             for ch_name, dispatch in _dispatch_channels.items():
-                if (dispatch.get("pending_prompt")
-                        and dispatch.get("response_event")
-                        and dispatch["last_submit_at"] > 0
-                        and _time.time() - dispatch["last_submit_at"] < 120
-                        and dispatch["pending_prompt"][:50] in user_text):
+                _age = _time.time() - dispatch.get("last_submit_at", 0)
+                _turn = dispatch.get("turn_count", 0)
+                # Turn 1: match by original prompt text (proves this conv_log belongs to
+                # this dispatch). Turns 2+: match by client_id presence + recency only —
+                # the original prompt no longer appears in subsequent user_text values.
+                _prompt_match = (
+                    _turn >= 1  # already matched once, trust client_id
+                    or (dispatch.get("pending_prompt")
+                        and dispatch["pending_prompt"][:50] in user_text)
+                )
+                if (dispatch.get("last_submit_at", 0) > 0
+                        and _age < 600
+                        and _prompt_match
+                        and (dispatch.get("client_id") or dispatch.get("response_event"))):
                     # Strip topic tag from assistant_text before delivering
                     clean_asst = _re.sub(r'^<<[^>]*>>', '', assistant_text).strip()
                     # Skip truly empty responses (tool-call noise with no text)
@@ -2634,14 +3394,41 @@ async def endpoint_conv_log(request: Request) -> JSONResponse:
                         log.info(f"dispatch: skipping empty response for '{ch_name}'")
                         continue
                     log.info(f"dispatch: raw asst_text={assistant_text[:100]!r} clean={clean_asst[:100]!r}")
-                    dispatch["response_text"] = clean_asst
-                    dispatch["pending_prompt"] = None
-                    dispatch["last_submit_at"] = 0  # prevent re-match
-                    evt = dispatch["response_event"]
-                    if evt:
-                        evt.set()
-                    log.info(f"dispatch: response captured for channel '{ch_name}' "
-                             f"({len(clean_asst)} chars)")
+
+                    cb_client = dispatch.get("client_id")
+                    if cb_client:
+                        # Direct delivery to originating client queue (Slack/voice).
+                        # Keep client_id alive for multi-turn tasks — cleared only
+                        # when a new submit arrives (turn_count reset there).
+                        # Intermediate turns (2+) are truncated to a summary line
+                        # to avoid flooding Slack with full responses mid-task.
+                        from state import push_tok as _push_tok, push_done as _push_done
+                        turn_num = dispatch.get("turn_count", 0) + 1
+                        dispatch["turn_count"] = turn_num
+                        _SUMMARY_LIMIT = 280
+                        if turn_num > 1 and len(clean_asst) > _SUMMARY_LIMIT:
+                            # Truncate to first complete sentence or hard limit
+                            truncated = clean_asst[:_SUMMARY_LIMIT]
+                            last_period = truncated.rfind(". ")
+                            if last_period > 80:
+                                truncated = truncated[:last_period + 1]
+                            deliver_text = f"_(turn {turn_num})_ {truncated}…"
+                        else:
+                            deliver_text = clean_asst
+                        await _push_tok(cb_client, deliver_text)
+                        await _push_done(cb_client)
+                        log.info(f"dispatch: direct-delivered turn {turn_num} "
+                                 f"({len(deliver_text)} chars) to {cb_client} via ch '{ch_name}'")
+                    else:
+                        # Legacy poll path — store for _try_consume
+                        dispatch["response_text"] = clean_asst
+                        dispatch["pending_prompt"] = None
+                        dispatch["last_submit_at"] = 0
+                        evt = dispatch["response_event"]
+                        if evt:
+                            evt.set()
+                        log.info(f"dispatch: response captured for channel '{ch_name}' "
+                                 f"({len(clean_asst)} chars)")
                     break
 
         return JSONResponse({
@@ -2653,6 +3440,77 @@ async def endpoint_conv_log(request: Request) -> JSONResponse:
         })
     except Exception as e:
         log.error(f"conv_log error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Photo analysis & Drive upload HTTP endpoints (for frontend camera feature)
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def endpoint_analyze_photo(request):
+    """HTTP wrapper for the analyze_photo MCP tool."""
+    try:
+        body = await request.json()
+        image_b64 = body.get("image_b64", "")
+        prompt = body.get("prompt", "Describe what you see in this photo in detail.")
+        task_type = body.get("task_type", "general")
+        if not image_b64:
+            return JSONResponse({"error": "no image data"}, status_code=400)
+        result = await analyze_photo(
+            prompt=prompt,
+            image_b64=image_b64,
+            task_type=task_type,
+        )
+        return JSONResponse({"result": result})
+    except Exception as e:
+        log.error(f"endpoint_analyze_photo error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def endpoint_drive_upload_photo(request):
+    """Upload a base64 JPEG to Google Drive photos folder."""
+    try:
+        body = await request.json()
+        image_b64 = body.get("image_b64", "")
+        file_name = body.get("file_name", "")
+        folder_id = body.get("folder_id", "")
+        if not image_b64:
+            return JSONResponse({"error": "no image data"}, status_code=400)
+        if not file_name:
+            import time as _time
+            file_name = f"samaritan_capture_{int(_time.time())}.jpg"
+        from drive import run_drive_op
+        result = await run_drive_op("create_image", None, file_name, image_b64, folder_id or None)
+        # Extract file ID from result string "Uploaded 'name' — id: XXXXX"
+        file_id = ""
+        if "id:" in result:
+            file_id = result.split("id:")[-1].strip()
+        return JSONResponse({"result": result, "file_id": file_id, "file_name": file_name})
+    except Exception as e:
+        log.error(f"endpoint_drive_upload_photo error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def endpoint_eidetic_save(request):
+    """Save an eidetic (visual) memory via REST — called by frontend after photo analysis."""
+    try:
+        body = await request.json()
+        result = await eidetic_save(
+            topic=body.get("topic", "photo-analysis"),
+            content=body.get("content", ""),
+            drive_file_id=body.get("drive_file_id", ""),
+            task_type=body.get("task_type", "general"),
+            importance=body.get("importance", 5),
+            source=body.get("source", "assistant"),
+            analysis_model=body.get("analysis_model", "gemini-2.5-flash"),
+            location_lat=body.get("location_lat", 0.0),
+            location_lon=body.get("location_lon", 0.0),
+            memory_link=body.get("memory_link", ""),
+            session_id=body.get("session_id", ""),
+        )
+        return JSONResponse({"result": result})
+    except Exception as e:
+        log.error(f"endpoint_eidetic_save error: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -2694,7 +3552,11 @@ class Plugin(BasePlugin):
         routes.append(Route("/claude/submit", endpoint_claude_submit, methods=["POST"]))
         routes.append(Route("/claude/poll", endpoint_claude_poll, methods=["GET"]))
         routes.append(Route("/claude/status", endpoint_claude_status, methods=["GET"]))
+        routes.append(Route("/claude/slash", endpoint_claude_slash, methods=["POST"]))
         routes.append(Route("/mcp/health", endpoint_mcp_health, methods=["GET"]))
+        routes.append(Route("/analyze_photo", endpoint_analyze_photo, methods=["POST"]))
+        routes.append(Route("/drive_upload_photo", endpoint_drive_upload_photo, methods=["POST"]))
+        routes.append(Route("/eidetic_save", endpoint_eidetic_save, methods=["POST"]))
         return routes
 
     def get_config(self) -> dict:

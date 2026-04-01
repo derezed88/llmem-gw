@@ -53,14 +53,14 @@
       "heat_curve": [20, 50],
       "sp_section": null
     },
-    "tasks": {
-      "tools": ["google_tasks"],
+    "keep": {
+      "tools": ["google_keep"],
       "always_active": false,
       "heat_curve": [20, 50],
       "sp_section": null
     },
-    "keep": {
-      "tools": ["google_keep"],
+    "tasks": {
+      "tools": ["google_tasks"],
       "always_active": false,
       "heat_curve": [20, 50],
       "sp_section": null
@@ -138,6 +138,11 @@
     "probability": {
       "tools": ["prob_calc"],
       "always_active": true
+    },
+    "stats": {
+      "tools": ["stats_analyze"],
+      "always_active": false,
+      "heat_curve": [20, 50]
     }
   },
   "metadata": {

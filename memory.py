@@ -104,6 +104,12 @@ def _COGNITION() -> str:
 def _TEMPORAL() -> str:
     return get_tables_for_model().get("temporal", "samaritan_temporal")
 
+def _EIDETIC() -> str:
+    return get_tables_for_model().get("eidetic", "samaritan_memory_eidetic")
+
+def _EIDETIC_COLLECTION() -> str:
+    return get_tables_for_model().get("eidetic_collection", "samaritan_eidetic")
+
 def _EMOTIONS() -> str:
     return get_tables_for_model().get("emotions", "samaritan_emotions")
 

@@ -230,6 +230,8 @@ def _generate_table_map(prefix: str) -> dict:
         "temporal": f"{prefix}temporal",
         "tool_stats": f"{prefix}tool_stats",
         "cognition": f"{prefix}cognition",
+        "eidetic": f"{prefix}memory_eidetic",
+        "eidetic_collection": f"{prefix}eidetic",
     }
 
 def _get_create_tables_sql(prefix: str) -> str:

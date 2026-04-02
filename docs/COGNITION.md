@@ -1,6 +1,6 @@
 # Cognitive Architecture — llmem-gw
 
-Last updated: 2026-03-23
+Last updated: 2026-04-01
 
 This document describes the cognitive architecture built on top of the tiered memory system. It was designed around the question: *what pieces does a reactive LLM agent need to become autonomous?* The answer shaped everything here.
 
@@ -11,6 +11,8 @@ This document describes the cognitive architecture built on top of the tiered me
 The architecture extends the two-tier memory system (ST/LT + Qdrant) into a broader cognitive stack. Rather than building separate infrastructure for each cognitive function, almost everything reuses existing write paths (`save_memory()`), existing query patterns (Qdrant semantic search), and existing background loop patterns (aging timers).
 
 The design principle: **memory is the substrate**. Goals, beliefs, drives, self-knowledge, and procedural skills are all typed memory rows — they differ in how they are written, how they age, and how they are injected into context.
+
+As of 2026-04-01, three of the five original Python async cognitive loops (reflection, contradiction, goal health) have been replaced by an event-driven Claude Code session (`samaritan-cognition`). See the [Claude Code Cognition Session](#claude-code-cognition-session) section below.
 
 ---
 
@@ -63,10 +65,10 @@ Plans use a two-tier decomposition model:
 
 Each step has:
 - `step_type`: `concept` or `task`
-- `target`: `model` (auto-execute), `human` (pause and notify), `investigate` (unresolved)
+- `target`: `model` (auto-execute), `human` (pause and notify), `investigate` (unresolved), `claude-code` (queued for a Claude Code session), `claude-cognition` (queued for samaritan-cognition session)
 - `approval`: `proposed`, `approved`, `rejected`
 - `tool_call`: JSON blob with `{tool, args}` for task steps
-- `executor`: which model ran the step
+- `executor`: which model/session ran the step
 - `result`: execution output
 
 **Decomposition model**: `model_roles["plan_decomposer"]` (currently Sonnet 4.6, upgraded from Haiku 4.5 to eliminate model-name hallucinations in `tool_call` specs).
@@ -154,7 +156,7 @@ NULL → proposed → approved → executing → completed
 **Phase 4: Execution with Progress**
 - Goal processor picks up approved goals, sets `auto_process_status=executing`
 - **Auto-decomposition**: if approved concept steps have no task children, they are decomposed on the fly (with notification: "decomposing N concept step(s)...")
-- Tasks execute serially via 3-tier chain (direct → LLM executor → fallback)
+- Tasks execute serially via 2-tier chain (direct → LLM executor)
 - **Per-step progress**: after each task completes, initiating session receives: "Goal N: step 3/5 done — Read competitor report"
 - **Human steps**: execution pauses, user notified: "Goal N waiting on you: Step [M]: ... When done: `!plan auto done N M`"
 
@@ -227,12 +229,13 @@ Plans can exist without goals (`goal_id=0`):
 
 Beliefs are stored in `samaritan_beliefs` with a `confidence` score (1–10) and status `active`/`retracted`.
 
-`contradiction.py` runs as a background async task (default every 10 minutes, configurable):
-1. Fetches all active beliefs, groups by topic
-2. Sends pairs to the judge/LLM for conflict scoring
-3. Writes `contradiction-flag` rows (topic=`contradiction-flag`, confidence=9) when conflicts are detected
-4. Optionally auto-retracts the lower-confidence belief
-5. Measures resolution ratio (retracted flags / total flags) → feeds into the cognitive feedback loop
+As of 2026-04-01, active contradiction scanning is handled by the `samaritan-cognition` Claude Code session (triggered on each `assert_belief` call) rather than the Python async task. The `contradiction.py` module remains available for direct invocation but is no longer registered as a background timer loop.
+
+Contradiction check flow:
+1. `assert_belief` is called → activity hook in `plugin_mcp_direct.py` queues a `claude-cognition` step
+2. `samaritan-cognition` wakes, loads context, compares the new belief against existing beliefs
+3. If conflict found: `assert_belief(topic="contradiction-<topic>", ...)` flags it
+4. If no conflict: step marked done with a note
 
 Beliefs are vector-indexed in Qdrant alongside other memory types, so they surface in semantic retrieval.
 
@@ -297,59 +300,11 @@ Drives modulate goal prioritization: `load_typed_context_block()` fetches curren
 
 ## Proactive Cognition Loops
 
-Five independent background async tasks, all using the same timer/init pattern as the existing aging loops:
+As of 2026-04-01, the cognition architecture is a hybrid:
 
-### Reflection — `reflection.py`
+- **Event-driven (Claude Code)**: reflection, contradiction detection, goal health checks are handled by the `samaritan-cognition` Claude Code session. These are no longer Python async timer loops — they fire immediately when triggered by activity events. See the [Claude Code Cognition Session](#claude-code-cognition-session) section below.
 
-**Interval**: 24 hours (configurable via `reflection_interval_m`)
-**Model role**: `reflection`
-
-**Staleness gate**: Before any LLM call, runs `SELECT MAX(created_at)` on ST. If the newest user/assistant entry is older than `reflection_interval_m × 1.3` (default ~78 minutes), the entire cycle is skipped — zero LLM tokens spent. This prevents redundant reflection when no new conversation has occurred since the last cycle.
-
-**Actions per cycle** (in order within `run_reflection()`):
-
-1. **Memory extraction** — Pulls last `reflection_turn_limit` (default 40) ST rows (source=`user`/`assistant`), sends to `reflection` model role (default `summarizer-gemini`). LLM returns JSON `{"memories": [...], "goals_done": [...]}`. Each memory item has `{topic, content, importance, type}`. Saves up to `reflection_max_memories` (default 6) rows to `samaritan_cognition` (origin=`reflection`) via `save_cognition()`. Self-model rows use topic prefixes `self-capability-*`, `self-failure-*`, `self-preference-*` with type=`self_model`. Both exact and fuzzy dedup gates prevent redundant saves.
-
-2. **Goal completion detection** (two passes):
-   - **Pass 1**: The reflection LLM call (step 1) also checks active goals against conversation evidence, returning completed goal IDs in `goals_done`.
-   - **Pass 2**: Dedicated `_scan_goal_completions()` using the reasoning model for higher accuracy.
-   - Union of both passes → `UPDATE goals SET status='done'` for confirmed completions.
-
-3. **Goal health evaluation** (`_run_goal_health()`):
-   - **Failure counting**: Matches `self-failure-*` / `tool_failure` cognition rows to active goals by keyword overlap (≥2 keyword matches).
-   - **Escalation ladder**:
-     - `failure_count >= goal_health_failure_replan` (default 3) → LLM proposes new plan steps (replan action).
-     - `failure_count >= goal_health_failure_abandon` (default 5) → auto-abandons the goal with a reason.
-   - **Goal proposals**: Reasoning model proposes up to 2 new goals from observed patterns (failure remediation, curiosity threads). Gated by autonomy drive:
-     - `autonomy >= goal_health_autonomy_threshold` (default 0.6) → auto-created as `status='active'`, `source='assistant'`.
-     - `autonomy < threshold` → saved as `status='proposed'` for user review via `!cogn goals`.
-   - **Abandon guard**: Proposals resembling previously abandoned goals are blocked.
-
-4. **Drive decay & goal nudge** — Calls `update_drives_from_goals()`:
-   - Goal completed → boost `task-completion`
-   - Goal blocked → boost `discomfort`, reduce `task-completion`
-   - Zero completions + >3 active goals → reduce `task-completion`
-
-5. **Cognitive feedback evaluation** — Calls `cogn_feedback.evaluate(LOOP_REFLECTION, summary)` to assess whether this cycle produced useful output. Updates conditioned strength; may throttle or extinguish the loop if consistently unproductive.
-
-6. **Self-summary refresh** (every 5th cycle) — Pulls all `self-*` cognition/memory rows, distills via LLM into 3–5 bullet points, saves as `self-summary` row (type=`self_model`, importance=10). Injected into context as `## Self-Model`.
-
-### Goal Health Pass — `reflection.py`
-
-Runs as part of each reflection cycle. Evaluates active goals for stall/failure patterns.
-
-**Model role**: `goal_health`
-
-- `goal_health_failure_replan` (default 3): consecutive failures before replanning
-- `goal_health_failure_abandon` (default 5): consecutive failures before abandoning
-- `goal_health_autonomy_threshold` (default 0.6): autonomy drive level required for auto-creation
-
-### Contradiction Scan — `contradiction.py`
-
-**Interval**: 10 minutes (configurable via `contradiction_interval_m`)
-**Model role**: `contradiction`
-
-See Belief System above. Feeds back into cognitive feedback loop via resolution ratio.
+- **Timer-driven (Python async)**: prospective reminders, temporal inference, the goal processor, and the cognitive feedback loop remain as Python background tasks. These do not involve LLM calls in their core loop (or their LLM use doesn't justify a full Claude Code session).
 
 ### Prospective Reminders — `prospective.py`
 
@@ -371,6 +326,133 @@ Autonomous goal scanning, planning, and execution. See Goal Processor section ab
 **Model role**: `temporal_inference`
 
 Analyzes recent ST topics and proposes temporal pattern queries. Stores results in `samaritan_temporal` with `source="inferred"`. Fills the gap that semantic retrieval (Qdrant) has no time dimension — "what do I usually do at 10 AM?" has zero semantic overlap with actual activities.
+
+---
+
+## Claude Code Cognition Session
+
+**`plugin_mcp_direct.py` | `cognition-start.sh` | `.claude/rules/cognition-session.md`**
+
+The `samaritan-cognition` session is a dedicated Claude Code process (Sonnet model) running in a tmux session. It sits idle at an interactive prompt and is woken by event hooks in `plugin_mcp_direct.py` when cognitive work is needed.
+
+This replaces the Python async loops for reflection, contradiction detection, and goal health checks. The motivation: Claude performs substantially better reasoning on these tasks than the small models (Qwen, Gemini Flash) previously used in the Python loops, and the event-driven architecture eliminates the periodic LLM cost of timer-based loops that fire even when there is nothing new to process.
+
+### Trigger Events
+
+All triggers live in `plugin_mcp_direct.py` and fire as `asyncio.ensure_future()` calls immediately after the triggering MCP tool call completes.
+
+| Trigger | Event | Step queued |
+|---|---|---|
+| `memory_save` called | Any save | `Check new memory for contradictions: [topic] content` |
+| `assert_belief` called with `status="active"` | Belief created/updated | `Check belief for contradictions: [topic] content` |
+| `goal_create` called | New goal created | `Review new goal for conflicts with active goals: [id] title` |
+| `/conv_log` endpoint (every 5 turns) | Conversation activity | `Reflect on recent conversation (turn N): extract insights, update beliefs, check for new goals` |
+
+The turn counter (`_cogn_turn_counter`) is a process-global incremented by every call to `endpoint_conv_log`. It persists across sessions but resets on llmem-gw restart.
+
+### Step Routing
+
+Steps are inserted into `samaritan_plans` with `target='claude-cognition'` under a singleton goal titled **"Ongoing Cognitive Processing"** (auto-created on first trigger, status=`active`). Steps have `approval='approved'` so they are immediately visible to `steps_for_cognition()`.
+
+The `steps_for_cognition()` MCP tool queries:
+```sql
+SELECT ... FROM samaritan_plans
+WHERE target = 'claude-cognition' AND status IN ('pending', 'in_progress')
+ORDER BY goal_id, step_order
+```
+
+### Poke Mechanism
+
+After every successful step insert, `_poke_cognition_session()` sends a wake signal:
+```bash
+tmux send-keys -t samaritan-cognition "Process pending cognition steps" Enter
+```
+
+Pokes are **debounced**: if one was sent within the last 60 seconds (`_COGN_POKE_COOLDOWN`), the new poke is suppressed. Steps still accumulate in the DB — the session picks up all of them on the next wake.
+
+### Cognition Session Behavior
+
+On receiving "Process pending cognition steps", the session (`cognition-session.md` rules):
+
+1. Calls `steps_for_cognition()` — if empty, responds "No pending cognition steps." and stops
+2. For each step: marks `in_progress`, executes, marks `done` with result
+3. Processing all steps before finishing (no partial processing)
+
+**Step type handlers**:
+
+- **Contradiction check** (`Check new memory for contradictions` / `Check belief for contradictions`):
+  1. `load_context(query="<topic>")` to pull existing beliefs and memories
+  2. Compare new item against existing — look for direct conflicts, subtle tension, or outdated facts
+  3. If conflict: `assert_belief(topic="contradiction-<topic>", content="<description>", confidence=8)`
+  4. Mark step done with finding
+
+- **Reflection** (`Reflect on recent conversation`):
+  1. `memory_recall(topic="", tier="short", limit=10)` for recent context
+  2. Identify patterns, repeated themes, insights worth preserving
+  3. For significant findings: `assert_belief(topic="<topic>", content="<insight>", confidence=7)`
+  4. Mark step done with summary
+
+- **Goal health check** (`Review new goal for conflicts`):
+  1. `goal_list(status="active")` to get all active goals
+  2. Check for conflicts, duplicates, or blocking relationships
+  3. If conflict: `memory_save(topic="goal-conflict", content="<description>", importance=7)`
+  4. Mark step done with assessment
+
+### Session Lifecycle
+
+| Event | Behavior |
+|---|---|
+| `claude-start.sh` | Starts `samaritan-work`, then calls `cognition-start.sh` |
+| `restart-llmem.sh` | `samaritan-cognition` in `MANAGED_SESSIONS` — killed + cold-started after server comes up |
+| Claude process exits | Next `cognition-start.sh` run detects dead Claude, cold-starts |
+| `.post-restart-instructions.samaritan-cognition` | Delivered by `_deliver_instructions()` after cold-start |
+
+### Prerequisites
+
+- llmem-gw running with `plugin_mcp_direct` enabled (port 8769)
+- Claude Code CLI installed (`claude` in PATH)
+- tmux available
+- `samaritan_plans.target` ENUM includes `'claude-cognition'` (migration required — see Setup)
+- MCP Direct server registered with Claude Code (`mcp-direct-enable.sh`)
+- `cognition-session.md` rules file in `.claude/rules/`
+
+### Setup Steps
+
+1. **Apply the DB schema change** — add `claude-cognition` to the target ENUM:
+   ```sql
+   ALTER TABLE mymcp.samaritan_plans
+     MODIFY COLUMN target
+     ENUM('model','human','investigate','claude-code','claude-cognition')
+     NOT NULL DEFAULT 'model';
+   ```
+
+2. **Copy `cognition-start.sh`** to your workspace root and make it executable:
+   ```bash
+   chmod +x cognition-start.sh
+   ```
+
+3. **Copy `.claude/rules/cognition-session.md`** to your Claude Code workspace rules directory.
+
+4. **Update `claude-start.sh`** to call `cognition-start.sh` at the end:
+   ```bash
+   bash "$SCRIPT_DIR/cognition-start.sh"
+   ```
+
+5. **Add `samaritan-cognition` to `MANAGED_SESSIONS`** in `restart-llmem.sh`:
+   ```bash
+   "samaritan-cognition|${WORK_DIR}|--model claude-sonnet-4-6 -n 'samaritan-cognition'|"
+   ```
+
+6. **Start the session**:
+   ```bash
+   bash cognition-start.sh
+   ```
+
+7. **Smoke test**:
+   - Call `steps_for_cognition()` — should return no rows
+   - Call `memory_save` with any content
+   - Call `steps_for_cognition()` again — should show a pending contradiction-check step
+   - Check the tmux session: `tmux attach -t samaritan-cognition` — should show the session processing
 
 ---
 
@@ -463,15 +545,28 @@ External prompt
   memory scan  →  [memory gate]  →  save_memory()         │
       │                              │                    │
       │                    MySQL INSERT + Qdrant upsert   │
+      │                       │                           │
+      │      ┌────────────────┴─────────────────┐        │
+      │      │  activity hooks (plugin_mcp_direct)│        │
+      │      │  memory_save   → contradiction    │        │
+      │      │  assert_belief → contradiction    │        │
+      │      │  goal_create   → goal health      │        │
+      │      │  conv_log (/5) → reflection       │        │
+      │      └────────────────┬─────────────────┘        │
+      │                       │                           │
+      │              samaritan_plans (target=claude-cog.) │
+      │              + tmux poke (debounced 60s)          │
+      │                       │                           │
+      │              samaritan-cognition (Claude/Sonnet)  │
+      │              steps_for_cognition()                │
+      │              → reflect / contradict / goal-health │
+      │                via MCP tools                      │
       │                                                   │
-Background loops (async, independent):                    │
-  reflection.py    (24h)   → save_memory() + refresh_self │
-                             + goal_health pass            │
-  contradiction.py (10m)   → write flags, retract beliefs  │
-  prospective.py   (5m)    → fire due reminders            │
+Background loops (Python async, independent):             │
+  prospective.py   (5m)    → fire due reminders           │
   goal_processor   (30m)   → scan → propose → execute     │
-  temporal_inference (3h)  → infer temporal patterns       │
-  cogn_feedback.py         → update conditioned strengths  │
+  temporal_inf.    (3h)    → infer temporal patterns      │
+  cogn_feedback.py         → update conditioned strengths │
   aging loops      (60s/6h) → ST→LT summarization         │
 ```
 
@@ -513,10 +608,10 @@ All cognitive model assignments are centralized in the `model_roles` section of 
 | `judge` | `judge-gemini` | LLM-as-judge gates |
 | `plan_decomposer` | `plan-decomposer` | Goal → concept → task decomposition |
 | `plan_executor` | `samaritan-execution` | Plan step execution (backup via `backup_models` → `gpt-4o-execution`) |
-| `contradiction` | `qwen25-cogn` | Contradiction scanning |
+| `contradiction` | *(samaritan-cognition session)* | Contradiction scanning — moved to Claude Code |
 | `prospective` | `qwen25-cogn` | Prospective reminder evaluation |
-| `reflection` | `summarizer-gemini` | Reflection loop |
-| `goal_health` | `samaritan-reasoning` | Goal health pass |
+| `reflection` | *(samaritan-cognition session)* | Reflection loop — moved to Claude Code |
+| `goal_health` | *(samaritan-cognition session)* | Goal health pass — moved to Claude Code |
 | `temporal_inference` | `summarizer-gemini` | Temporal pattern inference |
 
 **Resolution order**: config override (plugins-enabled.json, if present) → `get_model_role()` (llm-models.json) → hardcoded fallback. Runtime overrides via `!cogn model <loop> <key>` are also supported.
@@ -531,13 +626,15 @@ The original plan proposed seven missing layers. Here is the actual outcome:
 |---|---|
 | Goal stack via type field + goal_manager.py | Built: typed goals table, tools, drive coupling, auto-injection into context, drive-weighted sort, reflection-based completion detection |
 | World model / beliefs via loose triple store | Built as typed beliefs + full contradiction scanner — more complete than planned |
-| Proactive loops via aging timer pattern | Built: reflection + contradiction + prospective, all with feedback learning |
+| Proactive loops via aging timer pattern | Built: reflection + contradiction + prospective, all with feedback learning. Reflection and contradiction later migrated to Claude Code session (event-driven) |
 | Surprise scoring at save time via Qdrant novelty check | **Not built as planned.** Replaced by retroactive access-ratio measurement — a stronger signal (actual usefulness vs. guessed novelty) |
 | Self-model via protected topic namespace | Built exactly as planned, plus `refresh_self_summary()` synthesis loop |
 | Drives via state.py session state | Built as persistent DB table with decay and goal-coupling, more durable than planned |
 | Procedural memory as second Qdrant collection | Built exactly as planned |
 
 The notable design divergence: **surprise scoring** was replaced by the cognitive feedback loop's access-ratio system. Instead of estimating novelty at write time (which requires a speculative Qdrant round-trip for every save), the system measures actual impact retroactively. A memory nobody ever retrieves is more actionable evidence than a save-time novelty estimate.
+
+The second significant divergence: **Python async cognitive loops replaced by Claude Code session**. The Python loops used small models (Qwen, Gemini Flash) on timers. The Claude Code session uses Sonnet, fires immediately on relevant events, and eliminates timer-based LLM costs when there is no new activity.
 
 ---
 
@@ -552,7 +649,7 @@ The notable design divergence: **surprise scoring** was replaced by the cognitiv
 
 ### 2026-03-12
 
-5. **Plan engine two-tier decomposition** ✓ — Concept → task steps with approval, ownership, and tool_call specs. Three-tier execution chain (direct → primary → fallback).
+5. **Plan engine two-tier decomposition** ✓ — Concept → task steps with approval, ownership, and tool_call specs. Two-tier execution chain (direct → LLM executor with backup_models failover).
 6. **Cognition table** ✓ — `samaritan_cognition` separates cognitive outputs from ST/LT. Migration `009`.
 7. **Temporal pattern recall** ✓ — `recall_temporal` tool + `temporal_inference.py` background inference + aging.
 
@@ -561,6 +658,10 @@ The notable design divergence: **surprise scoring** was replaced by the cognitiv
 8. **Goal processor** ✓ — Autonomous goal scanning, proposing, and serial execution. State machine: NULL → proposed → approved → executing → completed/paused_user/deferred/rejected. Notifier integration for proposals and human steps.
 9. **Model roles centralization** ✓ — All cognitive model assignments moved from `plugins-enabled.json` to `model_roles` in `llm-models.json`. Resolution order: config override → `get_model_role()` → hardcoded fallback.
 10. **Plan decomposer upgrade** ✓ — Upgraded from Haiku 4.5 to Sonnet 4.6 to eliminate model-name hallucinations in `tool_call` specs.
+
+### 2026-04-01
+
+11. **Claude Code cognition session** ✓ — `samaritan-cognition` tmux session replaces Python async loops for reflection, contradiction, and goal health. Event-driven: hooks in `plugin_mcp_direct.py` queue steps on `memory_save`, `assert_belief`, `goal_create`, and every 5 `conv_log` turns. Session woken via debounced tmux poke. Added `claude-cognition` target to `samaritan_plans` ENUM.
 
 ## Open Items
 

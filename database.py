@@ -232,6 +232,9 @@ def _generate_table_map(prefix: str) -> dict:
         "cognition": f"{prefix}cognition",
         "eidetic": f"{prefix}memory_eidetic",
         "eidetic_collection": f"{prefix}eidetic",
+        "location": f"{prefix}location",
+        "email_rules": f"{prefix}email_rules",
+        "email_triage": f"{prefix}email_triage",
     }
 
 def _get_create_tables_sql(prefix: str) -> str:
@@ -315,7 +318,7 @@ CREATE TABLE IF NOT EXISTS `{prefix}plans` (
     `status`      ENUM('pending','in_progress','done','skipped') NOT NULL DEFAULT 'pending',
     `step_type`   ENUM('concept','task') NOT NULL DEFAULT 'concept',
     `parent_id`   INT           DEFAULT NULL,
-    `target`      ENUM('model','human','investigate') NOT NULL DEFAULT 'model',
+    `target`      ENUM('model','human','investigate','claude-code') NOT NULL DEFAULT 'model',
     `executor`    VARCHAR(64)   DEFAULT NULL,
     `tool_call`   TEXT          DEFAULT NULL,
     `result`      TEXT          DEFAULT NULL,
@@ -542,6 +545,85 @@ CREATE TABLE IF NOT EXISTS `{prefix}cognition` (
     KEY `idx_importance`      (`importance`),
     KEY `idx_created`         (`created_at`),
     KEY `idx_last_accessed`   (`last_accessed`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Eidetic (visual/photo) memory
+CREATE TABLE IF NOT EXISTS `{prefix}memory_eidetic` (
+    `id`             INT          NOT NULL AUTO_INCREMENT,
+    `topic`          VARCHAR(255) NOT NULL,
+    `content`        TEXT         NOT NULL,
+    `importance`     TINYINT      NOT NULL DEFAULT 5 COMMENT '1=low 5=med 10=critical',
+    `source`         ENUM('session','user','directive','assistant') NOT NULL DEFAULT 'assistant',
+    `session_id`     VARCHAR(255) DEFAULT NULL,
+    `drive_file_id`  VARCHAR(128) DEFAULT NULL,
+    `task_type`      VARCHAR(32)  DEFAULT 'general',
+    `analysis_model` VARCHAR(64)  DEFAULT 'gemini-2.5-flash',
+    `memory_link`    TEXT         DEFAULT NULL COMMENT 'JSON array of related memory row IDs',
+    `location_lat`   DECIMAL(10, 7) DEFAULT NULL,
+    `location_lon`   DECIMAL(10, 7) DEFAULT NULL,
+    `created_at`     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`     TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    KEY `idx_topic`         (`topic`),
+    KEY `idx_importance`    (`importance`),
+    KEY `idx_drive_file_id` (`drive_file_id`),
+    KEY `idx_created`       (`created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- GPS location log (migration 016)
+CREATE TABLE IF NOT EXISTS `{prefix}location` (
+    `id`         INT AUTO_INCREMENT PRIMARY KEY,
+    `latitude`   DECIMAL(10, 7) NOT NULL,
+    `longitude`  DECIMAL(10, 7) NOT NULL,
+    `accuracy_m` FLOAT DEFAULT NULL,
+    `session_id` VARCHAR(255) DEFAULT NULL,
+    `created_at` DATETIME NOT NULL,
+    INDEX idx_created_at (`created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Email triage rules (migration 015)
+CREATE TABLE IF NOT EXISTS `{prefix}email_rules` (
+    `id`          INT AUTO_INCREMENT PRIMARY KEY,
+    `rule_name`   VARCHAR(100) NOT NULL,
+    `match_type`  ENUM('sender','domain','subject','body','header') NOT NULL,
+    `match_value` VARCHAR(255) NOT NULL,
+    `match_mode`  ENUM('exact','contains','regex') NOT NULL DEFAULT 'contains',
+    `action`      ENUM('delete','spam','archive','folder','notify','unsubscribe','skip') NOT NULL,
+    `action_args` VARCHAR(255) DEFAULT NULL,
+    `priority`    INT NOT NULL DEFAULT 50,
+    `enabled`     BOOLEAN NOT NULL DEFAULT TRUE,
+    `hit_count`   INT NOT NULL DEFAULT 0,
+    `last_hit_at` DATETIME DEFAULT NULL,
+    `source`      ENUM('user','auto','claude') NOT NULL DEFAULT 'user',
+    `notes`       VARCHAR(500) DEFAULT NULL,
+    `created_at`  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`  DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    KEY idx_enabled_priority (`enabled`, `priority`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- Email triage log (migration 015)
+CREATE TABLE IF NOT EXISTS `{prefix}email_triage` (
+    `id`              INT AUTO_INCREMENT PRIMARY KEY,
+    `email_uid`       VARCHAR(64) NOT NULL,
+    `folder`          VARCHAR(100) NOT NULL DEFAULT 'INBOX',
+    `sender`          VARCHAR(255) NOT NULL,
+    `sender_domain`   VARCHAR(100) NOT NULL,
+    `subject`         VARCHAR(500) NOT NULL,
+    `received_at`     DATETIME DEFAULT NULL,
+    `body_preview`    TEXT DEFAULT NULL,
+    `classification`  ENUM('delete','spam','archive','folder','notify','unsubscribe','skip','uncertain') NOT NULL,
+    `confidence`      FLOAT NOT NULL DEFAULT 0.0,
+    `action_taken`    ENUM('logged','executed','escalated','skipped') NOT NULL DEFAULT 'logged',
+    `matched_rule_id` INT DEFAULT NULL,
+    `llm_reasoning`   TEXT DEFAULT NULL,
+    `notified`        BOOLEAN NOT NULL DEFAULT FALSE,
+    `reviewed`        BOOLEAN NOT NULL DEFAULT FALSE,
+    `user_override`   VARCHAR(50) DEFAULT NULL,
+    `created_at`      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_uid (`email_uid`),
+    KEY idx_classification (`classification`),
+    KEY idx_reviewed (`reviewed`),
+    KEY idx_sender_domain (`sender_domain`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 """
 

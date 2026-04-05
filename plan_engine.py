@@ -295,7 +295,7 @@ Decompose the concept step into discrete task steps. Output JSON array only."""
     for i, task in enumerate(tasks, start=1):
         desc = str(task.get("description", "")).replace("'", "''")
         target = task.get("target", "model")
-        if target not in ("model", "human", "investigate", "claude-code"):
+        if target not in ("model", "human", "investigate", "claude-code", "claude-cognition"):
             target = "investigate"
 
         tool_call_raw = task.get("tool_call")
@@ -1127,7 +1127,7 @@ async def create_concept_step(
 
     desc = description.replace("'", "''")
     source = source if source in ("session", "user", "directive", "assistant") else "assistant"
-    target = target if target in ("model", "human", "investigate", "claude-code") else "model"
+    target = target if target in ("model", "human", "investigate", "claude-code", "claude-cognition") else "model"
     approval = approval if approval in ("proposed", "approved", "rejected", "auto") else "proposed"
     sid = session_id.replace("'", "''") if session_id else "NULL"
     sid_sql = f"'{sid}'" if session_id else "NULL"

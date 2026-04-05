@@ -25,6 +25,8 @@ Usage in Claude Code .mcp.json:
 import json
 import os
 import logging
+import subprocess as _subprocess
+import time as _cogn_time
 from typing import List, Any, Dict
 
 from mcp.server.fastmcp import FastMCP, Context
@@ -87,6 +89,78 @@ def _set_context(database: str = ""):
     ws_name = ws.get("name", "default")
     if not cid or not cid.startswith(_CLIENT_ID_PREFIX):
         current_client_id.set(f"{_CLIENT_ID_PREFIX}-{ws_name}")
+
+
+# ---------------------------------------------------------------------------
+# Activity-driven cognition — wake samaritan-cognition on key events
+# ---------------------------------------------------------------------------
+
+_last_cogn_poke: float = 0.0
+_COGN_POKE_COOLDOWN: int = 60       # minimum seconds between tmux pokes
+_COGN_GOAL_ID: int = 0              # cached ID for "Ongoing Cognitive Processing" goal
+_cogn_turn_counter: int = 0         # conv_log turns since last reflection step
+_COGN_REFLECT_EVERY: int = 5        # queue a reflection step every N real turns
+
+
+def _poke_cognition_session() -> None:
+    """Send a wake signal to the samaritan-cognition tmux session (debounced)."""
+    global _last_cogn_poke
+    now = _cogn_time.monotonic()
+    if now - _last_cogn_poke < _COGN_POKE_COOLDOWN:
+        return
+    _last_cogn_poke = now
+    try:
+        _subprocess.Popen(
+            ["tmux", "send-keys", "-t", "samaritan-cognition",
+             "Process pending cognition steps", "Enter"],
+            stdout=_subprocess.DEVNULL, stderr=_subprocess.DEVNULL,
+        )
+        log.info("cogn_poke: sent wake signal to samaritan-cognition")
+    except Exception as e:
+        log.warning(f"cogn_poke: failed to poke samaritan-cognition: {e}")
+
+
+async def _queue_cogn_step(description: str) -> None:
+    """Queue a task step for samaritan-cognition under the ongoing cognition goal."""
+    global _COGN_GOAL_ID
+    from database import fetch_dicts, execute_insert
+    try:
+        # Get or create the singleton cognition goal in mymcp
+        if not _COGN_GOAL_ID:
+            rows = await fetch_dicts(
+                "SELECT id FROM mymcp.samaritan_goals "
+                "WHERE title = 'Ongoing Cognitive Processing' AND status = 'active' LIMIT 1"
+            )
+            if rows:
+                _COGN_GOAL_ID = rows[0]["id"]
+            else:
+                _COGN_GOAL_ID = await execute_insert(
+                    "INSERT INTO mymcp.samaritan_goals "
+                    "(title, description, status, importance, source, session_id) VALUES "
+                    "('Ongoing Cognitive Processing', "
+                    "'Continuous cognitive processing: reflection, contradiction detection, goal health', "
+                    "'active', 8, 'assistant', 'plugin-mcp-direct')"
+                )
+                log.info(f"cogn: created cognition goal id={_COGN_GOAL_ID}")
+
+        # Determine step_order from current pending count
+        rows = await fetch_dicts(
+            f"SELECT COUNT(*) AS cnt FROM mymcp.samaritan_plans "
+            f"WHERE goal_id = {_COGN_GOAL_ID} AND status = 'pending'"
+        )
+        next_order = (rows[0]["cnt"] if rows else 0) + 1
+
+        d = description.replace("'", "''")
+        step_id = await execute_insert(
+            f"INSERT INTO mymcp.samaritan_plans "
+            f"(goal_id, step_order, description, status, step_type, target, approval, source, session_id) "
+            f"VALUES ({_COGN_GOAL_ID}, {next_order}, '{d}', 'pending', 'task', "
+            f"'claude-cognition', 'approved', 'assistant', 'plugin-mcp-direct')"
+        )
+        log.info(f"cogn: queued step id={step_id} [{next_order}]: {description[:60]}")
+        _poke_cognition_session()
+    except Exception as e:
+        log.warning(f"cogn: failed to queue step: {e}")
 
 
 @mcp.tool()
@@ -797,6 +871,11 @@ async def memory_save(
         source=source, session_id=f"{_CLIENT_ID_PREFIX}-mcp",
     )
     if row_id:
+        # Activity hook: queue contradiction check for new memory
+        import asyncio as _aio
+        _aio.ensure_future(_queue_cogn_step(
+            f"Check new memory for contradictions: [{topic}] {content[:120]}"
+        ))
         return f"Memory saved (id={row_id}): [{topic}] {content[:80]}"
     return "Memory not saved (duplicate or disabled)"
 
@@ -943,6 +1022,11 @@ async def goal_create(
     )
     row_id = await execute_insert(sql)
     _typed_metric_write(_GOALS())
+    # Activity hook: queue goal health check for newly created goal
+    import asyncio as _aio
+    _aio.ensure_future(_queue_cogn_step(
+        f"Review new goal for conflicts with active goals: [{row_id}] {title}"
+    ))
     return f"Goal created (id={row_id}): {title}"
 
 
@@ -1030,7 +1114,7 @@ async def step_create(
     from database import execute_insert
 
     step_type = step_type if step_type in ("concept", "task") else "concept"
-    target = target if target in ("model", "human", "investigate", "claude-code") else "model"
+    target = target if target in ("model", "human", "investigate", "claude-code", "claude-cognition") else "model"
     d = description.replace("'", "''")
 
     sql = (
@@ -1204,6 +1288,33 @@ async def steps_for_claude_code(
         return "(no steps — goals/plans tables not available in this database)"
 
 
+@mcp.tool()
+async def steps_for_cognition(
+) -> str:
+    """List plan steps with target='claude-cognition' that are pending/in_progress.
+
+    These are steps queued by activity-driven hooks (conv_log, memory_save,
+    assert_belief, goal_create) for the samaritan-cognition session to process.
+    """
+    _set_context()
+    from database import execute_sql
+
+    try:
+        sql = (
+            "SELECT p.id, p.goal_id, p.step_order, p.description, p.status, "
+            "p.step_type, p.approval, LEFT(p.result, 200) as result, "
+            "g.title as goal_title "
+            "FROM mymcp.samaritan_plans p "
+            "LEFT JOIN mymcp.samaritan_goals g ON g.id = p.goal_id "
+            "WHERE p.target = 'claude-cognition' AND p.status IN ('pending', 'in_progress') "
+            "ORDER BY p.goal_id, p.step_order"
+        )
+        result = await execute_sql(sql)
+        return result if result.strip() else "(no steps queued for claude-cognition)"
+    except Exception:
+        return "(no steps — goals/plans tables not available in this database)"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # TIER 1: Typed memory tools
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1227,10 +1338,17 @@ async def assert_belief(
     """
     _set_context()
     from tools import _assert_belief_exec
-    return await _assert_belief_exec(
+    result = await _assert_belief_exec(
         topic=topic, content=content, confidence=confidence,
         status=status, id=id,
     )
+    # Activity hook: queue contradiction check for new/updated belief
+    if status == "active":
+        import asyncio as _aio
+        _aio.ensure_future(_queue_cogn_step(
+            f"Check belief for contradictions: [{topic}] {content[:120]}"
+        ))
+    return result
 
 
 @mcp.tool()
@@ -1736,7 +1854,7 @@ async def analyze_photo(
         executor = get_tool_executor("analyze_photo")
         if not executor:
             return "analyze_photo not available (plugin_photo_analysis not loaded)"
-        return await executor(
+        result = await executor(
             prompt=prompt,
             file_id=file_id or None,
             local_path=local_path or None,
@@ -1745,6 +1863,18 @@ async def analyze_photo(
             mime_type=mime_type or None,
             task_type=task_type,
         )
+        # Auto-save eidetic entry when analyzing an existing Drive file
+        if file_id and result and not result.startswith("photo_analysis"):
+            _eidetic_asyncio.ensure_future(_fire_eidetic_save(
+                analysis_text=result,
+                drive_file_id=file_id,
+                task_type=task_type,
+                file_name="",
+                location_lat=0.0,
+                location_lon=0.0,
+                session_id=f"{_CLIENT_ID_PREFIX}-mcp",
+            ))
+        return result
     except Exception as e:
         return f"analyze_photo error: {e}"
 
@@ -1816,14 +1946,15 @@ async def eidetic_save(
             from plugin_memory_vector_qdrant import get_vector_api
             vec = get_vector_api()
             if vec:
-                embed_text = f"{topic}: {content}"
+                coll = _EIDETIC_COLLECTION()
+                vec._ensure_collection(coll)
                 await vec.upsert_memory(
                     row_id=row_id,
                     topic=topic,
                     content=content,
                     importance=importance,
                     tier="eidetic",
-                    collection=_EIDETIC_COLLECTION(),
+                    collection=coll,
                 )
         except Exception as e:
             log.warning(f"eidetic_save: Qdrant embed failed: {e}")
@@ -2058,6 +2189,11 @@ import time as _time
 # Each Claude Code workspace gets its own channel via workspace_register().
 _relay_channels: dict = {}
 _relay_msg_counter = 0
+
+# Utterance debounce: per-channel pending (task, accumulated_msg) while waiting
+# to see if a follow-up fragment arrives within the debounce window.
+_relay_debounce: dict = {}   # channel → {"task": asyncio.Task, "msg": dict}
+_RELAY_DEBOUNCE_SECS = 2.0   # window to wait for follow-up fragments
 
 # Concurrent polling cap — limits how many voice_relay_check() calls can
 # long-poll simultaneously.  Excess callers yield immediately with "(busy)".
@@ -2310,20 +2446,58 @@ async def endpoint_voice_relay_submit(request: Request) -> JSONResponse:
         "source": payload.get("source", "voice"),
         "timestamp": _time.time(),
     }
-    # Pass through emotion/prosody metadata from xAI STT if present
+    # Pass through emotion/prosody metadata from voice STT if present
     if payload.get("emotion"):
         msg["emotion"] = payload["emotion"]
+        # Store voice-inworld emotion in samaritan_emotions (fire-and-forget)
+        emo = payload["emotion"]
+        if emo.get("source") == "voice-inworld" and emo.get("emotion"):
+            try:
+                from emotions import store_voice_emotion
+                _asyncio.ensure_future(store_voice_emotion(
+                    emotion_label=emo["emotion"],
+                    confidence=float(emo.get("confidence", 0.5)),
+                    prosody=emo.get("prosody", ""),
+                    source="voice-inworld",
+                ))
+            except Exception as _e:
+                log.warning(f"voice_relay: emotion store failed: {_e}")
     # Pass through GPS location metadata if present
     if payload.get("location"):
         msg["location"] = payload["location"]
-    relay["inbox"].append(msg)
-    relay["last_message_at"] = _time.time()
     log.info(f"voice_relay[{channel}]: inbound msg #{msg['id']} from {msg['source']}: {text[:80]}")
 
-    # Wake any long-polling voice_relay_check() call
-    evt = relay.get("inbox_event")
-    if evt:
-        evt.set()
+    # ── Utterance debounce ────────────────────────────────────────────────────
+    # Hold the message for _RELAY_DEBOUNCE_SECS. If another fragment arrives
+    # before the timer fires, cancel, concatenate, and restart. Only then
+    # commit the merged utterance to the inbox and wake Claude Code.
+    pending = _relay_debounce.get(channel)
+    if pending:
+        # A fragment is already waiting — cancel its timer and merge
+        pending["task"].cancel()
+        prev = pending["msg"]
+        msg["text"] = prev["text"].rstrip() + " " + msg["text"]
+        msg["id"] = prev["id"]   # keep the original message id
+        # Merge metadata: prefer newer location/emotion if present
+        if not msg.get("location") and prev.get("location"):
+            msg["location"] = prev["location"]
+        if not msg.get("emotion") and prev.get("emotion"):
+            msg["emotion"] = prev["emotion"]
+        log.info(f"voice_relay[{channel}]: debounce merged fragment → {msg['text'][:80]!r}")
+
+    async def _commit(ch: str, m: dict) -> None:
+        await _asyncio.sleep(_RELAY_DEBOUNCE_SECS)
+        _relay_debounce.pop(ch, None)
+        relay_ch = _get_relay(ch)
+        relay_ch["inbox"].append(m)
+        relay_ch["last_message_at"] = _time.time()
+        log.info(f"voice_relay[{ch}]: debounce committed msg #{m['id']}: {m['text'][:80]!r}")
+        evt = relay_ch.get("inbox_event")
+        if evt:
+            evt.set()
+
+    task = _asyncio.ensure_future(_commit(channel, msg))
+    _relay_debounce[channel] = {"task": task, "msg": msg}
 
     return JSONResponse({"status": "queued", "message_id": msg["id"], "channel": channel})
 
@@ -2730,8 +2904,14 @@ async def _reap_idle_thread_sessions() -> None:
 
 def _format_dispatch_prompt(text: str, source: str = "voice",
                             emotion: dict = None,
-                            location: dict = None) -> str:
-    """Format user text with source/emotion/location metadata prefix for Claude."""
+                            location: dict = None,
+                            location_name: str = None,
+                            context_prefix: str = None) -> str:
+    """Format user text with source/emotion/location metadata prefix for Claude.
+
+    context_prefix: pre-built enrichment block prepended before the [source|...] line.
+    location_name:  resolved place name for GPS coords (injected as |near:<name>).
+    """
     prefix = f"[{source}"
     if emotion:
         em_label = emotion.get("emotion", "neutral")
@@ -2749,8 +2929,13 @@ def _format_dispatch_prompt(text: str, source: str = "voice",
         prefix += f"|location:{lat},{lon}"
         if acc is not None:
             prefix += f"±{acc}m"
+        if location_name:
+            prefix += f"|near:{location_name}"
     prefix += "]"
-    return f"{prefix} {text}"
+    prompt = f"{prefix} {text}"
+    if context_prefix:
+        prompt = f"{context_prefix} --- {prompt}"
+    return prompt
 
 
 async def endpoint_claude_submit(request: Request) -> JSONResponse:
@@ -2798,8 +2983,32 @@ async def endpoint_claude_submit(request: Request) -> JSONResponse:
                 status_code=503,
             )
 
-    # Format prompt with metadata prefix
-    prompt = _format_dispatch_prompt(text, source, emotion, location)
+    # Store voice-inworld emotion in samaritan_emotions (fire-and-forget)
+    if emotion and emotion.get("source") == "voice-inworld" and emotion.get("emotion"):
+        try:
+            from emotions import store_voice_emotion
+            _asyncio.ensure_future(store_voice_emotion(
+                emotion_label=emotion["emotion"],
+                confidence=float(emotion.get("confidence", 0.5)),
+                prosody=emotion.get("prosody", ""),
+                source="voice-inworld",
+            ))
+        except Exception as _e:
+            log.warning(f"claude_submit: emotion store failed: {_e}")
+
+    # Enrich: resolve GPS location + build context prefix (routine beliefs + pattern rules)
+    context_prefix: str | None = None
+    location_name: str | None = None
+    try:
+        from dispatch_enrich import build_context_prefix as _build_ctx
+        context_prefix, location_name = await _build_ctx(text, location)
+    except Exception as _enrich_err:
+        log.debug(f"dispatch_enrich skipped: {_enrich_err}")
+
+    # Format prompt with metadata prefix (+ enrichment if available)
+    prompt = _format_dispatch_prompt(text, source, emotion, location,
+                                     location_name=location_name,
+                                     context_prefix=context_prefix)
 
     # Prepare response capture
     dispatch["response_text"] = None
@@ -3319,10 +3528,19 @@ async def endpoint_conv_log(request: Request) -> JSONResponse:
             f"session={session_id}"
         )
 
+        # Activity hook: periodic reflection — every N real turns
+        global _cogn_turn_counter
+        _cogn_turn_counter += 1
+        if _cogn_turn_counter % _COGN_REFLECT_EVERY == 0:
+            import asyncio as _aio
+            _aio.ensure_future(_queue_cogn_step(
+                f"Reflect on recent conversation (turn {_cogn_turn_counter}): "
+                f"extract insights, update beliefs, check for new goals"
+            ))
+
         # Write live emotion tag if provided (from Claude Code inline inference)
         emotion_written = False
         user_emotion = payload.get("user_emotion")
-        xai_emotion = payload.get("xai_emotion")
         if user_emotion and user_id:
             try:
                 from emotions import _write_emotion, CORE_EMOTIONS
@@ -3333,18 +3551,28 @@ async def endpoint_conv_log(request: Request) -> JSONResponse:
                     "emotion_label": user_emotion.get("emotion_label", ""),
                     "intensity": user_emotion.get("intensity", 0.5),
                     "confidence": 0.9,  # high confidence — inferred live with full context
+                    "source": user_emotion.get("source", "inferred"),
                     "context": "live inference by Claude Code with conversation context",
                 }
-                # Attach xAI STT prosody data if available
-                if xai_emotion:
-                    emotion_item["xai_emotion_label"] = xai_emotion.get("xai_emotion_label", "")
-                    emotion_item["xai_confidence"] = xai_emotion.get("xai_confidence")
-                    emotion_item["xai_prosody"] = xai_emotion.get("xai_prosody", "")
                 emotion_written = await _write_emotion(emotion_item, confidence_threshold=0.0)
                 if emotion_written:
                     log.info(f"conv_log: live emotion '{user_emotion.get('emotion_label')}' written for user_id={user_id}")
             except Exception as e:
                 log.warning(f"conv_log: emotion write failed: {e}")
+
+        # Extract and store InWorld voice-detected emotion from dispatch prefix
+        # Format: [voice|emotion:LABEL(CONFIDENCE)|prosody:...|...]
+        if _dp_match:
+            _iw_em = _re.search(r'emotion:([\w-]+)\(([0-9.]+)\)', user_text_raw)
+            if _iw_em:
+                _iw_label = _iw_em.group(1)
+                _iw_conf = float(_iw_em.group(2))
+                _iw_pros = _re.search(r'prosody:([^|\]]+)', user_text_raw)
+                _iw_prosody = _iw_pros.group(1).strip() if _iw_pros else ""
+                import asyncio as _aio_iw
+                from emotions import store_voice_emotion as _store_iw
+                _aio_iw.ensure_future(_store_iw(_iw_label, _iw_conf, _iw_prosody))
+                log.info(f"conv_log: queued voice-inworld emotion {_iw_label}({_iw_conf})")
 
         # Save GPS location if present on the matched dispatch channel
         # (stored at submit time by endpoint_claude_submit)
@@ -3447,6 +3675,111 @@ async def endpoint_conv_log(request: Request) -> JSONResponse:
 # Photo analysis & Drive upload HTTP endpoints (for frontend camera feature)
 # ═══════════════════════════════════════════════════════════════════════════
 
+# --- Eidetic correlation stash ---
+# Maps image_hash → {analysis_text, task_type, location_lat, location_lon,
+#                     session_id, timestamp}
+# or image_hash → {drive_file_id, file_name, timestamp}
+# When both halves arrive, eidetic_save fires as a background task.
+import hashlib as _hashlib
+import time as _eidetic_time
+import asyncio as _eidetic_asyncio
+
+_eidetic_stash: dict = {}       # image_hash → dict
+_EIDETIC_STASH_TTL = 180        # seconds before stale entries are purged
+
+
+def _image_hash(image_b64: str) -> str:
+    """Compute a stable hash of the raw base64 image data."""
+    raw = image_b64.split(",", 1)[-1] if "," in image_b64 else image_b64
+    return _hashlib.sha256(raw[:8192].encode()).hexdigest()[:16]
+
+
+def _purge_stash():
+    """Remove stale stash entries older than TTL."""
+    now = _eidetic_time.time()
+    expired = [k for k, v in _eidetic_stash.items()
+               if now - v.get("timestamp", 0) > _EIDETIC_STASH_TTL]
+    for k in expired:
+        del _eidetic_stash[k]
+
+
+_EIDETIC_FILLER = _STOP_WORDS | frozenset(
+    "image photo picture captures shows displays depicts features appears visible "
+    "looking seen view angle perspective detailed clearly slightly somewhat "
+    "likely appears seems suggests indicates positioned located placed "
+    "upper lower left right center top bottom side area section portion "
+    "overall impression scene background foreground prominent dominant".split()
+)
+
+
+def _eidetic_topic_slug(analysis_text: str, max_words: int = 3) -> str:
+    """Generate a concise topic slug (up to 3 words) from photo analysis text.
+
+    Extracts the most descriptive nouns from the first sentence of the analysis,
+    skipping generic photo-description filler words.
+    """
+    # First sentence only — it's the best summary
+    first_sent = _re.split(r'[.\n]', analysis_text[:400])[0]
+    first_sent = _re.sub(r'\*\*[^*]*\*\*', '', first_sent)  # strip markdown bold
+    first_sent = _re.sub(r'[^a-zA-Z\s]', ' ', first_sent)
+    words = first_sent.lower().split()
+    significant = [w for w in words if w not in _EIDETIC_FILLER and len(w) > 2]
+    if not significant:
+        return "photo-analysis"
+    # Take first N unique significant words (order preserves sentence meaning)
+    seen = set()
+    slug_words = []
+    for w in significant:
+        if w not in seen:
+            seen.add(w)
+            slug_words.append(w)
+            if len(slug_words) >= max_words:
+                break
+    return "-".join(slug_words) if slug_words else "photo-analysis"
+
+
+async def _fire_eidetic_save(analysis_text: str, drive_file_id: str,
+                              task_type: str, file_name: str,
+                              location_lat: float, location_lon: float,
+                              session_id: str):
+    """Background eidetic save — called when both analysis and upload are done."""
+    try:
+        topic = file_name or _eidetic_topic_slug(analysis_text)
+        await eidetic_save(
+            topic=topic,
+            content=analysis_text,
+            drive_file_id=drive_file_id,
+            task_type=task_type,
+            importance=5,
+            source="assistant",
+            analysis_model="gemini-2.5-flash",
+            location_lat=location_lat,
+            location_lon=location_lon,
+            session_id=session_id,
+        )
+        log.info(f"eidetic: auto-saved for {topic} (drive_file_id={drive_file_id})")
+    except Exception as e:
+        log.warning(f"eidetic: auto-save failed: {e}")
+
+
+def _try_eidetic_merge(img_hash: str):
+    """Check if both analysis and upload data are in the stash; if so, fire eidetic save."""
+    entry = _eidetic_stash.get(img_hash)
+    if not entry:
+        return
+    if "analysis_text" in entry and "drive_file_id" in entry:
+        _eidetic_asyncio.ensure_future(_fire_eidetic_save(
+            analysis_text=entry["analysis_text"],
+            drive_file_id=entry["drive_file_id"],
+            task_type=entry.get("task_type", "general"),
+            file_name=entry.get("file_name", ""),
+            location_lat=entry.get("location_lat", 0.0),
+            location_lon=entry.get("location_lon", 0.0),
+            session_id=entry.get("session_id", ""),
+        ))
+        del _eidetic_stash[img_hash]
+
+
 async def endpoint_analyze_photo(request):
     """HTTP wrapper for the analyze_photo MCP tool."""
     try:
@@ -3461,6 +3794,18 @@ async def endpoint_analyze_photo(request):
             image_b64=image_b64,
             task_type=task_type,
         )
+        # Stash analysis result for eidetic correlation
+        if result and not result.startswith("analyze_photo error"):
+            _purge_stash()
+            img_hash = _image_hash(image_b64)
+            entry = _eidetic_stash.setdefault(img_hash, {})
+            entry["analysis_text"] = result
+            entry["task_type"] = task_type
+            entry["location_lat"] = body.get("location_lat", 0.0)
+            entry["location_lon"] = body.get("location_lon", 0.0)
+            entry["session_id"] = body.get("session_id", "")
+            entry["timestamp"] = _eidetic_time.time()
+            _try_eidetic_merge(img_hash)
         return JSONResponse({"result": result})
     except Exception as e:
         log.error(f"endpoint_analyze_photo error: {e}")
@@ -3485,6 +3830,15 @@ async def endpoint_drive_upload_photo(request):
         file_id = ""
         if "id:" in result:
             file_id = result.split("id:")[-1].strip()
+        # Stash upload result for eidetic correlation
+        if file_id:
+            _purge_stash()
+            img_hash = _image_hash(image_b64)
+            entry = _eidetic_stash.setdefault(img_hash, {})
+            entry["drive_file_id"] = file_id
+            entry["file_name"] = file_name
+            entry["timestamp"] = _eidetic_time.time()
+            _try_eidetic_merge(img_hash)
         return JSONResponse({"result": result, "file_id": file_id, "file_name": file_name})
     except Exception as e:
         log.error(f"endpoint_drive_upload_photo error: {e}")
@@ -3496,7 +3850,7 @@ async def endpoint_eidetic_save(request):
     try:
         body = await request.json()
         result = await eidetic_save(
-            topic=body.get("topic", "photo-analysis"),
+            topic=body.get("topic") or _eidetic_topic_slug(body.get("content", "")),
             content=body.get("content", ""),
             drive_file_id=body.get("drive_file_id", ""),
             task_type=body.get("task_type", "general"),

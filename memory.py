@@ -1430,7 +1430,7 @@ async def load_topic_list() -> list[str]:
 
 
 async def _update_last_accessed(row_ids: list) -> None:
-    """Fire-and-forget: update last_accessed for a list of shortterm row IDs."""
+    """Fire-and-forget: update last_accessed and increment access_count for a list of shortterm row IDs."""
     if not row_ids:
         return
     ids_str = ", ".join(str(rid) for rid in row_ids if str(rid).isdigit())
@@ -1438,14 +1438,14 @@ async def _update_last_accessed(row_ids: list) -> None:
         return
     try:
         await execute_sql(
-            f"UPDATE {_ST()} SET last_accessed = NOW() WHERE id IN ({ids_str})"
+            f"UPDATE {_ST()} SET last_accessed = NOW(), access_count = access_count + 1 WHERE id IN ({ids_str})"
         )
     except Exception as e:
         log.debug(f"_update_last_accessed failed: {e}")
 
 
 async def _update_lt_last_accessed(row_ids: list) -> None:
-    """Fire-and-forget: update last_accessed for a list of longterm row IDs."""
+    """Fire-and-forget: update last_accessed and increment access_count for a list of longterm row IDs."""
     if not row_ids:
         return
     ids_str = ", ".join(str(rid) for rid in row_ids if str(rid).isdigit())
@@ -1453,7 +1453,7 @@ async def _update_lt_last_accessed(row_ids: list) -> None:
         return
     try:
         await execute_sql(
-            f"UPDATE {_LT()} SET last_accessed = NOW() WHERE id IN ({ids_str})"
+            f"UPDATE {_LT()} SET last_accessed = NOW(), access_count = access_count + 1 WHERE id IN ({ids_str})"
         )
     except Exception as e:
         log.debug(f"_update_lt_last_accessed failed: {e}")
@@ -2297,7 +2297,7 @@ async def load_context_block(
         semantic_st_task = asyncio.create_task(vec.search_memories(query, tier="short", collection=_coll))
         semantic_lt_task = asyncio.create_task(vec.search_memories(query, tier="long", collection=_coll))
         always_task      = asyncio.create_task(
-            load_short_term(limit=10000, min_importance=always_importance)
+            load_short_term(limit=100, min_importance=always_importance)
         )
         # Always-inject by type: fetch active rows of high-priority types from ST
         if _always_types:
@@ -2406,15 +2406,18 @@ async def load_context_block(
             placeholders = ", ".join(f"'{t}'" for t in fuzzy_topics)
             fuzzy_rows = await _fetch_dicts(
                 f"SELECT id, topic, content, importance FROM {_ST()} "
-                f"WHERE topic IN ({placeholders})"
+                f"WHERE topic IN ({placeholders}) LIMIT 51"
             )
-            fuzzy_added = 0
-            for hit in fuzzy_rows:
-                if str(hit.get("id", "")) not in seen_ids_st:
-                    merged_st.append(hit)
-                    seen_ids_st.add(str(hit.get("id", "")))
-                    fuzzy_added += 1
-            log.debug(f"load_context_block: fuzzy_topics={list(fuzzy_topics)} matched={len(fuzzy_rows)} added={fuzzy_added}")
+            if len(fuzzy_rows) > 50:
+                log.debug(f"load_context_block: fuzzy_topics={list(fuzzy_topics)} skipped — 50+ rows too broad")
+            else:
+                fuzzy_added = 0
+                for hit in fuzzy_rows:
+                    if str(hit.get("id", "")) not in seen_ids_st:
+                        merged_st.append(hit)
+                        seen_ids_st.add(str(hit.get("id", "")))
+                        fuzzy_added += 1
+                log.debug(f"load_context_block: fuzzy_topics={list(fuzzy_topics)} matched={len(fuzzy_rows)} added={fuzzy_added}")
 
         log.debug(
             f"load_context_block: st_semantic={len(semantic_st)} "
@@ -2426,7 +2429,7 @@ async def load_context_block(
         _retrieval_stats["total"] += 1
         _retrieval_stats["fallback_no_vec"] += 1
         merged_st, topics = await asyncio.gather(
-            load_short_term(limit=10000, min_importance=min_importance),
+            load_short_term(limit=100, min_importance=min_importance),
             topics_task,
         )
         # Pull high-importance long-term rows directly

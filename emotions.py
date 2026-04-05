@@ -373,6 +373,12 @@ async def _call_llm(model_key: str, entries: list[dict],
     return []
 
 
+_VALID_SOURCES = {"inferred", "stated", "corrected", "voice-inworld"}
+
+def _valid_source(s: str) -> str:
+    return s if s in _VALID_SOURCES else "inferred"
+
+
 async def _write_emotion(item: dict, confidence_threshold: float) -> bool:
     """Write an emotion record to samaritan_emotions. Returns True if stored."""
     from database import execute_sql
@@ -399,19 +405,21 @@ async def _write_emotion(item: dict, confidence_threshold: float) -> bool:
     if core_clean in dims:
         dims[core_clean] = intensity
 
-    cols = ", ".join([
+    col_list = [
         "memory_table", "memory_id",
         "angry", "sad", "disgusted", "happy", "surprised", "bad", "fearful",
-        "emotion_label", "intensity", "confidence", "source", "context"
-    ])
-    vals = ", ".join([
+        "emotion_label", "intensity", "confidence", "source", "context",
+    ]
+    val_list = [
         f"'{mem_table}'", str(mem_id),
         str(dims["angry"]), str(dims["sad"]), str(dims["disgusted"]),
         str(dims["happy"]), str(dims["surprised"]), str(dims["bad"]),
         str(dims["fearful"]),
         f"'{label}'", str(intensity), str(confidence),
-        "'inferred'", f"'{context}'"
-    ])
+        f"'{_valid_source(item.get('source', 'inferred'))}'", f"'{context}'",
+    ]
+    cols = ", ".join(col_list)
+    vals = ", ".join(val_list)
 
     try:
         await execute_sql(f"INSERT INTO samaritan_emotions ({cols}) VALUES ({vals})")
@@ -422,6 +430,61 @@ async def _write_emotion(item: dict, confidence_threshold: float) -> bool:
         return True
     except Exception as e:
         log.warning(f"emotions: write failed: {e}")
+        return False
+
+
+# Inworld voice emotion → core emotion mapping
+_IW_CORE_MAP = {
+    "happy": "happy", "sad": "sad", "angry": "angry",
+    "fearful": "fearful", "surprised": "surprised", "disgusted": "disgusted",
+    "tender": "happy", "calm": "happy", "neutral": None,
+}
+
+
+async def store_voice_emotion(emotion_label: str, confidence: float,
+                              prosody: str = "", source: str = "voice-inworld") -> bool:
+    """Store a voice-detected emotion directly into samaritan_emotions.
+
+    Called from plugin_mcp_direct when Inworld voice profile arrives via voice relay.
+    memory_table='voice-stt', memory_id=0 (not linked to a specific memory row).
+    """
+    from database import execute_sql, set_db_override
+    set_db_override("mymcp")  # fire-and-forget tasks have no request context
+
+    core = _IW_CORE_MAP.get(emotion_label.lower())
+    if not core:
+        return False  # neutral or unknown — skip
+
+    intensity = max(0.0, min(1.0, confidence))
+    label = str(emotion_label)[:50]
+    context = str(prosody)[:500].replace("'", "''")
+
+    dims = {e: 0.0 for e in CORE_EMOTIONS}
+    if core in dims:
+        dims[core] = intensity
+
+    col_list = [
+        "memory_table", "memory_id",
+        "angry", "sad", "disgusted", "happy", "surprised", "bad", "fearful",
+        "emotion_label", "intensity", "confidence", "source", "context",
+    ]
+    val_list = [
+        "'voice-stt'", "0",
+        str(dims["angry"]), str(dims["sad"]), str(dims["disgusted"]),
+        str(dims["happy"]), str(dims["surprised"]), str(dims["bad"]),
+        str(dims["fearful"]),
+        f"'{label}'", str(intensity), str(confidence),
+        f"'{source}'", f"'{context}'",
+    ]
+    cols = ", ".join(col_list)
+    vals = ", ".join(val_list)
+
+    try:
+        await execute_sql(f"INSERT INTO samaritan_emotions ({cols}) VALUES ({vals})")
+        log.info(f"emotions: stored voice-inworld {label}({confidence:.2f}) prosody={prosody[:40]}")
+        return True
+    except Exception as e:
+        log.warning(f"emotions: voice write failed: {e}")
         return False
 
 

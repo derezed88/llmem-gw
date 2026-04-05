@@ -40,6 +40,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("AISvc")
 
+# Suppress high-frequency polling endpoints from uvicorn access log
+_SILENT_POLL_PATHS = {"/sms/outbound", "/api/v1/health", "/claude/poll"}
+
+class _PollFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(p in msg for p in _SILENT_POLL_PATHS)
+
+logging.getLogger("uvicorn.access").addFilter(_PollFilter())
+
 
 # ---------------------------------------------------------------------------
 # Display timezone — configurable via plugins-enabled.json "display_timezone"

@@ -143,8 +143,9 @@ async def cmd_help(client_id: str):
         "Proactive Cognition:\n"
         "  !timers                                   - dashboard of all background timers (status, last run, next run)\n"
         "  !timers <name>                            - detail view for one timer\n"
-        "  !cogn                                     - status dashboard for all cognition timers + stats\n"
+        "  !cogn                                     - status dashboard: timers + Claude Code cognition\n"
         "  !cogn on|off                              - master enable/disable (runtime, no restart)\n"
+        "  !cogn cognition [poke]                    - Claude Code session detail / manual wake\n"
         "  !cogn contradiction|prospective|reflection|temporal on|off|run\n"
         "                                            - per-loop toggle or immediate trigger\n"
         "  !cogn interval contradiction|prospective|reflection <value>\n"
@@ -827,11 +828,9 @@ async def cmd_membackfill(client_id: str, model_key: str = ""):
     !membackfill — embed and upsert any MySQL memory rows missing from Qdrant.
     Compares all MySQL row IDs against Qdrant point IDs; only processes the gap.
     """
-    if await _guard_utility_model(client_id, model_key, "membackfill"):
-        return
     set_model_context(model_key)
     from database import fetch_dicts
-    from memory import _ST, _LT, _COLLECTION
+    from memory import _ST, _LT, _COLLECTION, _EIDETIC, _EIDETIC_COLLECTION
 
     try:
         from plugin_memory_vector_qdrant import get_vector_api
@@ -847,6 +846,7 @@ async def cmd_membackfill(client_id: str, model_key: str = ""):
 
     await push_tok(client_id, "Scanning for missing Qdrant points...\n")
 
+    # --- Main memory collection (ST + LT) ---
     coll = _COLLECTION()
     try:
         qdrant_ids = vec.get_all_point_ids(collection=coll)
@@ -864,7 +864,6 @@ async def cmd_membackfill(client_id: str, model_key: str = ""):
     total_missing = len(missing_st) + len(missing_lt)
     orphan_count = len(qdrant_ids - mysql_ids)
 
-    # Report metrics
     report = (
         f"Collection:     {coll}\n"
         f"Qdrant points:  {len(qdrant_ids)}\n"
@@ -876,16 +875,43 @@ async def cmd_membackfill(client_id: str, model_key: str = ""):
     await push_tok(client_id, report)
 
     if total_missing == 0:
-        await push_tok(client_id, "No missing points — Qdrant has all MySQL rows.")
-        await conditional_push_done(client_id)
-        return
+        await push_tok(client_id, "No missing points — Qdrant has all MySQL rows.\n")
+    else:
+        await push_tok(client_id, f"Backfilling {total_missing} missing rows...")
+        saved_st = await vec.backfill(missing_st, tier="short", collection=coll) if missing_st else 0
+        saved_lt = await vec.backfill(missing_lt, tier="long",  collection=coll) if missing_lt else 0
+        await push_tok(client_id, f"Done. Upserted {saved_st} short-term + {saved_lt} long-term rows into Qdrant.\n")
 
-    await push_tok(client_id, f"Backfilling {total_missing} missing rows...")
+    # --- Eidetic collection ---
+    eidetic_coll = _EIDETIC_COLLECTION()
+    vec._ensure_collection(eidetic_coll)
+    try:
+        eid_qdrant_ids = vec.get_all_point_ids(collection=eidetic_coll)
+    except Exception:
+        eid_qdrant_ids = set()
 
-    saved_st = await vec.backfill(missing_st, tier="short", collection=coll) if missing_st else 0
-    saved_lt = await vec.backfill(missing_lt, tier="long",  collection=coll) if missing_lt else 0
+    eid_rows = await fetch_dicts(f"SELECT id, topic, content, importance FROM {_EIDETIC()}")
+    eid_mysql_ids = {int(r["id"]) for r in eid_rows}
+    missing_eid = [r for r in eid_rows if int(r["id"]) not in eid_qdrant_ids]
+    eid_orphans = len(eid_qdrant_ids - eid_mysql_ids)
 
-    await push_tok(client_id, f"Done. Upserted {saved_st} short-term + {saved_lt} long-term rows into Qdrant.")
+    eid_report = (
+        f"Collection:     {eidetic_coll}\n"
+        f"Qdrant points:  {len(eid_qdrant_ids)}\n"
+        f"MySQL rows:     {len(eid_mysql_ids)}\n"
+        f"In sync:        {len(eid_qdrant_ids & eid_mysql_ids)}\n"
+        f"Missing from Q: {len(missing_eid)}\n"
+        f"Orphans in Q:   {eid_orphans} (use !memreconcile to clean)\n"
+    )
+    await push_tok(client_id, eid_report)
+
+    if missing_eid:
+        await push_tok(client_id, f"Backfilling {len(missing_eid)} eidetic rows...")
+        saved_eid = await vec.backfill(missing_eid, tier="eidetic", collection=eidetic_coll) if missing_eid else 0
+        await push_tok(client_id, f"Done. Upserted {saved_eid} eidetic rows into Qdrant.")
+    else:
+        await push_tok(client_id, "No missing eidetic points.")
+
     await conditional_push_done(client_id)
 
 
@@ -895,11 +921,9 @@ async def cmd_memreconcile(client_id: str, model_key: str = ""):
     Inverse of !membackfill: Qdrant has points that MySQL doesn't → delete from Qdrant.
     Reports metrics: total Qdrant points, MySQL rows, orphans found, orphans deleted.
     """
-    if await _guard_utility_model(client_id, model_key, "memreconcile"):
-        return
     set_model_context(model_key)
     from database import fetch_dicts
-    from memory import _ST, _LT, _COLLECTION
+    from memory import _ST, _LT, _COLLECTION, _EIDETIC, _EIDETIC_COLLECTION
 
     try:
         from plugin_memory_vector_qdrant import get_vector_api
@@ -915,6 +939,10 @@ async def cmd_memreconcile(client_id: str, model_key: str = ""):
 
     await push_tok(client_id, "Scanning for orphaned Qdrant points...\n")
 
+    total_deleted = 0
+    total_orphans = 0
+
+    # --- Main memory collection (ST + LT) ---
     coll = _COLLECTION()
     try:
         qdrant_ids = vec.get_all_point_ids(collection=coll)
@@ -923,7 +951,6 @@ async def cmd_memreconcile(client_id: str, model_key: str = ""):
         await conditional_push_done(client_id)
         return
 
-    # Collect all valid MySQL IDs from both tiers
     st_ids = await fetch_dicts(f"SELECT id FROM {_ST()}")
     lt_ids = await fetch_dicts(f"SELECT id FROM {_LT()}")
     mysql_ids = {int(r["id"]) for r in st_ids} | {int(r["id"]) for r in lt_ids}
@@ -931,7 +958,6 @@ async def cmd_memreconcile(client_id: str, model_key: str = ""):
     orphan_ids = qdrant_ids - mysql_ids
     in_sync = qdrant_ids & mysql_ids
 
-    # Report metrics
     report = (
         f"Collection:     {coll}\n"
         f"Qdrant points:  {len(qdrant_ids)}\n"
@@ -941,27 +967,70 @@ async def cmd_memreconcile(client_id: str, model_key: str = ""):
     )
     await push_tok(client_id, report)
 
-    if not orphan_ids:
-        await push_tok(client_id, "No orphans — Qdrant is fully reconciled with MySQL.")
-        await conditional_push_done(client_id)
-        return
+    if orphan_ids:
+        deleted = 0
+        batch_size = 500
+        orphan_list = sorted(orphan_ids)
+        for i in range(0, len(orphan_list), batch_size):
+            batch = orphan_list[i : i + batch_size]
+            try:
+                vec._qc.delete(
+                    collection_name=coll,
+                    points_selector=batch,
+                )
+                deleted += len(batch)
+            except Exception as e:
+                await push_tok(client_id, f"Delete batch failed at offset {i}: {e}\n")
+        await push_tok(client_id, f"Deleted {deleted}/{len(orphan_ids)} orphaned points.\n")
+        total_deleted += deleted
+        total_orphans += len(orphan_ids)
+    else:
+        await push_tok(client_id, "No orphans in main collection.\n")
 
-    # Delete orphaned points in batches
-    deleted = 0
-    batch_size = 500
-    orphan_list = sorted(orphan_ids)
-    for i in range(0, len(orphan_list), batch_size):
-        batch = orphan_list[i : i + batch_size]
-        try:
-            vec._qc.delete(
-                collection_name=coll,
-                points_selector=batch,
-            )
-            deleted += len(batch)
-        except Exception as e:
-            await push_tok(client_id, f"Delete batch failed at offset {i}: {e}\n")
+    # --- Eidetic collection ---
+    eidetic_coll = _EIDETIC_COLLECTION()
+    try:
+        eid_qdrant_ids = vec.get_all_point_ids(collection=eidetic_coll)
+    except Exception:
+        eid_qdrant_ids = set()
 
-    await push_tok(client_id, f"Deleted {deleted}/{len(orphan_ids)} orphaned Qdrant points.")
+    eid_ids = await fetch_dicts(f"SELECT id FROM {_EIDETIC()}")
+    eid_mysql_ids = {int(r["id"]) for r in eid_ids}
+
+    eid_orphan_ids = eid_qdrant_ids - eid_mysql_ids
+    eid_in_sync = eid_qdrant_ids & eid_mysql_ids
+
+    eid_report = (
+        f"Collection:     {eidetic_coll}\n"
+        f"Qdrant points:  {len(eid_qdrant_ids)}\n"
+        f"MySQL rows:     {len(eid_mysql_ids)}\n"
+        f"In sync:        {len(eid_in_sync)}\n"
+        f"Orphans found:  {len(eid_orphan_ids)}\n"
+    )
+    await push_tok(client_id, eid_report)
+
+    if eid_orphan_ids:
+        deleted = 0
+        batch_size = 500
+        orphan_list = sorted(eid_orphan_ids)
+        for i in range(0, len(orphan_list), batch_size):
+            batch = orphan_list[i : i + batch_size]
+            try:
+                vec._qc.delete(
+                    collection_name=eidetic_coll,
+                    points_selector=batch,
+                )
+                deleted += len(batch)
+            except Exception as e:
+                await push_tok(client_id, f"Eidetic delete batch failed at offset {i}: {e}\n")
+        await push_tok(client_id, f"Deleted {deleted}/{len(eid_orphan_ids)} orphaned eidetic points.\n")
+        total_deleted += deleted
+        total_orphans += len(eid_orphan_ids)
+    else:
+        await push_tok(client_id, "No orphans in eidetic collection.\n")
+
+    summary = f"Reconciliation complete. {total_deleted}/{total_orphans} total orphans deleted across all collections."
+    await push_tok(client_id, summary)
     await conditional_push_done(client_id)
 
 
@@ -2709,6 +2778,78 @@ async def cmd_cogn(client_id: str, arg: str, model_key: str = ""):
         await conditional_push_done(client_id)
         return
 
+    # ── !cogn cognition [poke] ────────────────────────────────────────────
+    if parts and parts[0] == "cognition":
+        import subprocess as _sp
+        from database import fetch_dicts as _fd2
+        try:
+            from plugin_mcp_direct import (
+                _cogn_turn_counter, _COGN_REFLECT_EVERY,
+                _last_cogn_poke, _COGN_POKE_COOLDOWN,
+                _poke_cognition_session,
+            )
+            import time as _t
+        except ImportError as e:
+            await push_tok(client_id, f"plugin_mcp_direct not available: {e}\n")
+            await conditional_push_done(client_id)
+            return
+
+        sub = parts[1] if len(parts) > 1 else ""
+
+        if sub == "poke":
+            _alive_check = _sp.run(
+                ["tmux", "has-session", "-t", "samaritan-cognition"],
+                capture_output=True,
+            ).returncode == 0
+            if not _alive_check:
+                await push_tok(client_id,
+                    "samaritan-cognition is not running — poke has no effect.\n"
+                    "Start it with: bash ~/projects/samaritan-work/cognition-start.sh\n")
+            else:
+                _poke_cognition_session()
+                await push_tok(client_id, "Poke sent to samaritan-cognition (debounce may suppress if recent).\n")
+            await conditional_push_done(client_id)
+            return
+
+        # Status detail
+        alive = _sp.run(
+            ["tmux", "has-session", "-t", "samaritan-cognition"],
+            capture_output=True,
+        ).returncode == 0
+        pending = await _fd2(
+            "SELECT COUNT(*) AS cnt FROM mymcp.samaritan_plans "
+            "WHERE target='claude-cognition' AND status IN ('pending','in_progress')"
+        )
+        recent_steps = await _fd2(
+            "SELECT id, status, LEFT(description,80) as step_desc, LEFT(result,60) as res, updated_at "
+            "FROM mymcp.samaritan_plans WHERE target='claude-cognition' "
+            "ORDER BY id DESC LIMIT 5"
+        )
+        pending_count = pending[0]["cnt"] if pending else 0
+        now_mono = _t.monotonic()
+        cooldown_left = max(0.0, _COGN_POKE_COOLDOWN - (now_mono - _last_cogn_poke))
+        turns_until = _COGN_REFLECT_EVERY - (_cogn_turn_counter % _COGN_REFLECT_EVERY)
+        if turns_until == _COGN_REFLECT_EVERY:
+            turns_until = 0
+
+        out = [
+            f"## samaritan-cognition Detail\n",
+            f"  session      : {'ALIVE' if alive else 'DEAD  (start: bash ~/projects/samaritan-work/cognition-start.sh)'}",
+            f"  pending steps: {pending_count}",
+            f"  turn counter : {_cogn_turn_counter}  (reflect every {_COGN_REFLECT_EVERY}, next in {turns_until} turns)",
+            f"  poke cooldown: {'ready' if cooldown_left == 0 else f'{cooldown_left:.0f}s remaining'}",
+        ]
+        if recent_steps:
+            out.append("\n**Recent steps** (newest first):")
+            for r in recent_steps:
+                out.append(
+                    f"  [{r['id']}] {r['status']:<11} {r['step_desc']}"
+                    + (f"\n    result: {r['res']}" if r.get("res") else "")
+                )
+        await push_tok(client_id, "\n".join(out) + "\n")
+        await conditional_push_done(client_id)
+        return
+
     # ── !cogn on / off ─────────────────────────────────────────────────────
     if parts and parts[0] == "on":
         set_runtime_override("enabled", True)
@@ -2878,6 +3019,7 @@ async def cmd_cogn(client_id: str, arg: str, model_key: str = ""):
         f"  {'contradiction':<30}: {_bool(master and cscan)}{_ovr('contradiction_enabled')}  "
         f"every {_eff_interval('contradiction', cfg['contradiction_interval_m'])}{_ovr('contradiction_interval_m')}  "
         f"model={_eff_model('contradiction_model', 'contradiction', 'summarizer-gemini')}{_ovr('contradiction_model')}{suffix}"
+        f"  ← Python loop disabled; handled by samaritan-cognition"
     )
     # Prospective
     pscan = cfg.get("prospective_enabled", True)
@@ -2892,6 +3034,7 @@ async def cmd_cogn(client_id: str, arg: str, model_key: str = ""):
         f"  {'reflection':<30}: {_bool(master and rscan)}{_ovr('reflection_enabled')}  "
         f"every {_eff_interval('reflection', cfg.get('reflection_interval_m', 60))}{_ovr('reflection_interval_m')}  "
         f"model={_eff_model('reflection_model', 'reflection', 'summarizer-gemini')}{_ovr('reflection_model')}{suffix}"
+        f"  ← Python loop disabled; handled by samaritan-cognition"
     )
     lines.append("")
 
@@ -3017,6 +3160,43 @@ async def cmd_cogn(client_id: str, arg: str, model_key: str = ""):
     except Exception:
         pass
 
+    # Claude Code Cognition Session
+    try:
+        import subprocess as _sp2
+        from plugin_mcp_direct import (
+            _cogn_turn_counter, _COGN_REFLECT_EVERY,
+            _last_cogn_poke, _COGN_POKE_COOLDOWN,
+        )
+        import time as _t2
+        from database import fetch_dicts as _fd3
+
+        _alive = _sp2.run(
+            ["tmux", "has-session", "-t", "samaritan-cognition"],
+            capture_output=True,
+        ).returncode == 0
+        _pending = await _fd3(
+            "SELECT COUNT(*) AS cnt FROM mymcp.samaritan_plans "
+            "WHERE target='claude-cognition' AND status IN ('pending','in_progress')"
+        )
+        _pcount = _pending[0]["cnt"] if _pending else 0
+        _cooldown = max(0.0, _COGN_POKE_COOLDOWN - (_t2.monotonic() - _last_cogn_poke))
+        _turns_left = _COGN_REFLECT_EVERY - (_cogn_turn_counter % _COGN_REFLECT_EVERY)
+        if _turns_left == _COGN_REFLECT_EVERY:
+            _turns_left = 0
+        lines.append("**Claude Code Cognition (samaritan-cognition)**")
+        lines.append(f"  session      : {'ALIVE' if _alive else 'DEAD  (start: bash ~/projects/samaritan-work/cognition-start.sh)'}")
+        lines.append(f"  pending steps: {_pcount}  (!cogn cognition for detail)")
+        lines.append(
+            f"  turn counter : {_cogn_turn_counter}  "
+            f"(reflect every {_COGN_REFLECT_EVERY} turns, next in {_turns_left})"
+        )
+        lines.append(
+            f"  poke cooldown: {'ready' if _cooldown == 0 else f'{_cooldown:.0f}s remaining'}"
+        )
+    except Exception as _e:
+        lines.append(f"**Claude Code Cognition**: unavailable ({_e})")
+    lines.append("")
+
     if ovr:
         lines.append("")
         lines.append(f"**Active runtime overrides**: {list(ovr.keys())}  (!cogn reset to revert)")
@@ -3029,7 +3209,9 @@ async def cmd_cogn(client_id: str, arg: str, model_key: str = ""):
         "  !cogn interval contradiction|prospective|reflection <value>\n"
         "  !cogn model contradiction|prospective|reflection <key>\n"
         "  !cogn goals [approve <id>|reject <id>]\n"
-        "  !cogn flags [clear]  |  !cogn reset"
+        "  !cogn flags [clear]  |  !cogn reset\n"
+        "  !cogn cognition        — Claude Code session detail (steps, counter, poke state)\n"
+        "  !cogn cognition poke   — manually wake samaritan-cognition"
     )
 
     await push_tok(client_id, "\n".join(lines))

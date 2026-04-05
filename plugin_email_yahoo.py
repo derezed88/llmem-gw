@@ -200,6 +200,66 @@ async def _record_rule_hit(rule_id: int):
 
 
 # ---------------------------------------------------------------------------
+# Action execution (Phase 2)
+# ---------------------------------------------------------------------------
+
+async def _execute_action(
+    client,          # open YahooIMAPClient
+    uid: str,
+    action: str,
+    folder_name: str | None = None,
+    also_notify: bool = False,
+    email_data: dict | None = None,
+) -> tuple[str, str | None]:
+    """Execute a triage action against the mailbox.
+
+    Returns (action_taken, moved_to_folder).
+    action_taken is one of: moved, deleted, spam_marked, archived, notified, skipped, error:<msg>
+
+    Supported actions:
+      delete            — permanently delete
+      spam              — move to Spam / Bulk Mail
+      archive           — move to Archive
+      folder            — move to folder_name (required)
+      notify            — fire notification only, no move
+      notify+folder     — notify AND move to folder_name (required)
+      unsubscribe       — notify only (manual action needed)
+      skip              — no-op
+    """
+    moved_to = None
+    try:
+        if action in ("delete",):
+            client.delete_email(uid, folder="INBOX")
+            return "deleted", None
+
+        if action in ("spam",):
+            # Yahoo uses "Bulk Mail" for spam folder
+            dest = "Bulk Mail"
+            client.move_email(uid, source="INBOX", destination=dest)
+            return "spam_marked", dest
+
+        if action in ("archive",):
+            client.move_email(uid, source="INBOX", destination="Archive")
+            return "archived", "Archive"
+
+        if action in ("folder", "notify+folder"):
+            if not folder_name:
+                return "error:folder_name_required", None
+            client.move_email(uid, source="INBOX", destination=folder_name)
+            moved_to = folder_name
+            return "moved", moved_to
+
+        if action in ("notify", "unsubscribe", "skip"):
+            return "notified" if action == "notify" else "skipped", None
+
+    except Exception as e:
+        log.warning(f"_execute_action uid={uid} action={action}: {e}")
+        return f"error:{str(e)[:100]}", None
+
+    return "skipped", None
+
+
+# ---------------------------------------------------------------------------
 # LLM classification
 # ---------------------------------------------------------------------------
 
@@ -214,7 +274,7 @@ Categories:
 - skip: Uncertain — leave for manual review
 
 Classify based on sender reputation, subject line, and content. Err toward 'skip' when uncertain.
-
+{examples}
 EMAIL:
 From: {sender}
 Subject: {subject}
@@ -226,6 +286,44 @@ Respond with ONLY valid JSON (no markdown, no explanation):
 {{"classification": "<category>", "confidence": <0.0-1.0>, "reasoning": "<one sentence>"}}
 """
 
+_EXAMPLES_HEADER = """
+Known classification patterns (follow these for similar emails):
+{lines}
+
+"""
+
+
+async def _build_few_shot_examples() -> str:
+    """Build one-shot example block from active rules.
+
+    Each rule becomes one example line showing the pattern and expected action.
+    Skips rules with action='skip' (uninformative) and disabled rules.
+    """
+    try:
+        rules = await _load_rules()
+        if not rules:
+            return ""
+        lines = []
+        for r in rules:
+            action = r.get("action", "")
+            if action == "skip":
+                continue
+            match_type = r.get("match_type", "")
+            match_value = r.get("match_value", "")
+            folder = r.get("folder_name")
+            also_notify = r.get("also_notify")
+            action_label = action
+            if also_notify and folder:
+                action_label = f"notify (move to {folder})"
+            elif folder:
+                action_label = f"folder:{folder}"
+            lines.append(f"- {match_type} '{match_value}' → {action_label}")
+        if not lines:
+            return ""
+        return _EXAMPLES_HEADER.format(lines="\n".join(lines))
+    except Exception:
+        return ""
+
 
 async def _classify_email(email_data: dict) -> dict:
     """Classify an email using a cheap LLM. Returns {classification, confidence, reasoning}."""
@@ -236,9 +334,11 @@ async def _classify_email(email_data: dict) -> dict:
         from config import get_model_role
         model = cfg.get("classify_model") or get_model_role("email_classifier")
     except (KeyError, Exception):
-        model = "summarizer-gemini"  # cheap fallback
+        model = "summarizer-anthropic"  # cheap fallback
 
+    examples = await _build_few_shot_examples()
     prompt = _CLASSIFY_PROMPT.format(
+        examples=examples,
         sender=email_data.get("from", ""),
         subject=email_data.get("subject", ""),
         date=email_data.get("date", ""),
@@ -280,8 +380,12 @@ async def _already_triaged(email_uid: str) -> bool:
     return "1" in result.strip()
 
 
-async def run_scan() -> dict:
-    """Scan INBOX for unseen emails, classify, log, notify."""
+async def run_scan(search_criteria: str = "UNSEEN") -> dict:
+    """Scan INBOX for emails matching search_criteria, classify, log, notify.
+
+    search_criteria: IMAP search string (default: "UNSEEN").
+      Use "SINCE DD-Mon-YYYY" for date-range backfill, "ALL" for everything.
+    """
     from database import execute_sql, execute_insert, set_db_override
     from state import current_client_id
 
@@ -300,9 +404,8 @@ async def run_scan() -> dict:
 
     try:
         with YahooIMAPClient() as client:
-            # Fetch unseen emails
             emails = client.list_emails(
-                folder="INBOX", limit=scan_limit, search_criteria="UNSEEN"
+                folder="INBOX", limit=scan_limit, search_criteria=search_criteria
             )
             if not emails:
                 return {**results, "scanned": 0}
@@ -380,9 +483,18 @@ async def run_scan() -> dict:
                     log.warning(f"email triage log failed: {e}")
                     results["errors"] += 1
 
-                # Notify on important classifications
+                # Determine folder_name and also_notify from matched rule (if any)
+                rule_folder = matched_rule.get("folder_name") if matched_rule else None
+                rule_also_notify = bool(matched_rule.get("also_notify")) if matched_rule else False
+
+                # Notify: fire for notify classifications OR when rule has also_notify set
                 notify_classes = cfg.get("notify_classifications", ["notify"])
-                if classification in notify_classes:
+                should_notify = (
+                    classification in notify_classes
+                    or "notify+" in classification
+                    or rule_also_notify
+                )
+                if should_notify:
                     try:
                         import notifier
                         await notifier.fire_event(
@@ -398,6 +510,29 @@ async def run_scan() -> dict:
                         results["notifications"] += 1
                     except Exception as e:
                         log.warning(f"email notify failed: {e}")
+
+                # Execute action if auto_execute is enabled
+                if cfg.get("auto_execute", False):
+                    try:
+                        exec_action = classification
+                        exec_folder = rule_folder
+                        action_taken, moved_to = await _execute_action(
+                            client, uid, exec_action,
+                            folder_name=exec_folder,
+                            also_notify=rule_also_notify,
+                            email_data=email_data,
+                        )
+                        moved_sql = f"'{moved_to.replace(chr(39), chr(39)*2)}'" if moved_to else "NULL"
+                        await execute_sql(
+                            f"UPDATE {_TRIAGE()} SET action_taken = '{action_taken}', "
+                            f"moved_to_folder = {moved_sql} "
+                            f"WHERE email_uid = '{uid}' ORDER BY id DESC LIMIT 1"
+                        )
+                        if action_taken.startswith("error:"):
+                            results["errors"] += 1
+                    except Exception as e:
+                        log.warning(f"email execute failed uid={uid}: {e}")
+                        results["errors"] += 1
 
     except Exception as e:
         log.error(f"email scan error: {e}")
@@ -505,11 +640,21 @@ async def _cmd_email(args: str) -> str:
         lines.append(f"\n{len(rows)} shown. !email review = unreviewed only")
         return "\n".join(lines)
 
-    # !email scan — trigger immediate scan
+    # !email scan [since N] — trigger immediate scan
+    # "since N" fetches emails from the last N days (e.g. "!email scan since 3")
     if sub == "scan":
-        results = await run_scan()
+        criteria = "UNSEEN"
+        if rest.startswith("since "):
+            try:
+                import datetime
+                days = int(rest.split()[1])
+                since_dt = datetime.date.today() - datetime.timedelta(days=days)
+                criteria = f"SINCE {since_dt.strftime('%d-%b-%Y')}"
+            except (IndexError, ValueError):
+                return "Usage: !email scan since <days>  (e.g. !email scan since 3)"
+        results = await run_scan(search_criteria=criteria)
         return (
-            f"Scan complete: {results.get('scanned', 0)} emails, "
+            f"Scan complete ({criteria}): {results.get('scanned', 0)} emails, "
             f"{results.get('rules_matched', 0)} rules matched, "
             f"{results.get('llm_classified', 0)} LLM classified, "
             f"{results.get('notifications', 0)} notifications\n"
@@ -567,6 +712,133 @@ async def _cmd_email(args: str) -> str:
         except ValueError:
             return "Usage: !email override <triage_id> <action>"
 
+    # !email auto on|off — toggle auto_execute in plugins-enabled.json
+    if sub == "auto":
+        import json as _json
+        plugins_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plugins-enabled.json")
+        try:
+            with open(plugins_path) as f:
+                pcfg = _json.load(f)
+            email_cfg = pcfg.setdefault("plugin_config", {}).setdefault("email_yahoo", {})
+            if rest in ("on", "true", "1"):
+                email_cfg["auto_execute"] = True
+                with open(plugins_path, "w") as f:
+                    _json.dump(pcfg, f, indent=4)
+                return "Auto-execute ON — actions will be performed on next scan."
+            elif rest in ("off", "false", "0"):
+                email_cfg["auto_execute"] = False
+                with open(plugins_path, "w") as f:
+                    _json.dump(pcfg, f, indent=4)
+                return "Auto-execute OFF — triage logged only, no mailbox changes."
+            else:
+                current = email_cfg.get("auto_execute", False)
+                return f"Auto-execute is currently {'ON' if current else 'OFF'}. Use: !email auto on|off"
+        except Exception as e:
+            return f"Error toggling auto_execute: {e}"
+
+    # !email notify <on|off|status> [session_prefix]
+    # Subscribe/unsubscribe a session prefix to email_important notifications.
+    # Persisted in notifier.json — survives restarts and session reconnects.
+    # Default prefix = current session's client_id prefix (e.g. "slack-", "samaritan-voice")
+    # Examples:
+    #   !email notify on              — subscribe current session
+    #   !email notify on slack-       — subscribe all slack sessions
+    #   !email notify off             — unsubscribe current session prefix
+    #   !email notify status          — show current subscriptions
+    if sub == "notify":
+        try:
+            import notifier as _notifier
+            from state import current_client_id as _cid
+        except Exception as e:
+            return f"Notifier unavailable: {e}"
+
+        notify_parts = rest.strip().split(maxsplit=1) if rest.strip() else []
+        notify_sub = notify_parts[0].lower() if notify_parts else "status"
+        # Prefix arg — or derive from current session
+        if len(notify_parts) > 1:
+            prefix = notify_parts[1].strip()
+        else:
+            cid = _cid.get() or ""
+            # Derive prefix: keep up to and including first hyphen segment
+            # e.g. "slack-abc123" → "slack-", "samaritan-voice-xyz" → "samaritan-voice-"
+            parts = cid.split("-", 2)
+            prefix = "-".join(parts[:2]) + "-" if len(parts) >= 2 else cid
+
+        if notify_sub in ("on", "enable"):
+            msg = _notifier.add_target_prefix(
+                prefix, events=["email_important"], quiet_minutes=0
+            )
+            return f"{msg}\nEmail notifications will be delivered to sessions matching '{prefix}'."
+
+        if notify_sub in ("off", "disable"):
+            # Only remove email_important from this prefix's subscriptions, not full target
+            for t in _notifier._targets:
+                if t.get("client_id_prefix") == prefix:
+                    t["events"].discard("email_important")
+                    if not t["events"]:
+                        _notifier._targets.remove(t)
+                    _notifier._save()
+                    return f"Email notifications disabled for prefix '{prefix}'."
+            return f"No notification target found for prefix '{prefix}'."
+
+        # status
+        lines = ["## Email Notification Targets\n"]
+        found = False
+        for t in _notifier._targets:
+            if "email_important" in t.get("events", set()):
+                pfx = t.get("client_id_prefix") or f"session:{t['session_id']}"
+                lines.append(f"  {pfx}  (quiet={t['quiet_minutes']}m)")
+                found = True
+        if not found:
+            lines.append("  None. Use: !email notify on")
+        lines.append(f"\nCurrent session prefix: '{prefix}'")
+        return "\n".join(lines)
+
+    # !email execute [N] — retroactively execute actions on logged triage entries
+    # Optional N limits how many to process (default 50)
+    if sub == "execute":
+        try:
+            limit = int(rest) if rest.strip().isdigit() else 50
+        except ValueError:
+            limit = 50
+        rows = await fetch_dicts(
+            f"SELECT id, email_uid, classification, matched_rule_id "
+            f"FROM {_TRIAGE()} WHERE action_taken = 'logged' LIMIT {limit}"
+        ) or []
+        if not rows:
+            return "No pending triage entries (action_taken='logged') to execute."
+
+        # Load rules for folder_name lookup
+        rules_map = {r["id"]: r for r in (await _load_rules())}
+
+        executed = errors = 0
+        try:
+            from yahoo_imap import YahooIMAPClient
+            with YahooIMAPClient() as client:
+                for row in rows:
+                    uid = row["email_uid"]
+                    classification = row["classification"]
+                    rule = rules_map.get(row.get("matched_rule_id")) if row.get("matched_rule_id") else None
+                    folder_name = rule.get("folder_name") if rule else None
+                    also_notify = bool(rule.get("also_notify")) if rule else False
+                    action_taken, moved_to = await _execute_action(
+                        client, uid, classification,
+                        folder_name=folder_name,
+                        also_notify=also_notify,
+                    )
+                    moved_sql = f"'{moved_to.replace(chr(39), chr(39)*2)}'" if moved_to else "NULL"
+                    await execute_sql(
+                        f"UPDATE {_TRIAGE()} SET action_taken = '{action_taken}', "
+                        f"moved_to_folder = {moved_sql} WHERE id = {row['id']}"
+                    )
+                    if action_taken.startswith("error:"):
+                        errors += 1
+                    else:
+                        executed += 1
+        except Exception as e:
+            return f"Execute failed: {e}"
+        return f"Execute complete: {executed} actioned, {errors} errors (of {len(rows)} entries)"
+
     # !email stats
     if sub == "stats":
         s = get_stats()
@@ -610,10 +882,15 @@ async def _cmd_email(args: str) -> str:
             lines = ["## Email Rules\n"]
             for r in rows:
                 status = "ON" if r.get("enabled") else "off"
+                action_label = r.get("action", "?")
+                if r.get("also_notify") and r.get("folder_name"):
+                    action_label = f"notify+folder:{r['folder_name']}"
+                elif r.get("folder_name"):
+                    action_label = f"folder:{r['folder_name']}"
                 lines.append(
                     f"  [{status}] #{r['id']} p={r.get('priority', 50)} "
                     f"{r.get('match_type', '?')}:{r.get('match_mode', '?')}:"
-                    f"'{r.get('match_value', '')}' → **{r.get('action', '?')}** "
+                    f"'{r.get('match_value', '')}' → **{action_label}** "
                     f"(hits={r.get('hit_count', 0)})"
                 )
                 if r.get("notes"):
@@ -621,25 +898,58 @@ async def _cmd_email(args: str) -> str:
             return "\n".join(lines)
 
         # !email rules add domain:groupon.com delete [note text]
+        # Compound: !email rules add domain:chase.com notify+folder:Bills [notes]
         if rsub == "add":
             rest2 = " ".join(rparts[1:]) if len(rparts) > 1 else ""
             add_parts = rest2.split(maxsplit=2)
             if len(add_parts) < 2:
                 return (
                     "Usage: !email rules add <match>:<value> <action> [notes]\n"
+                    "Actions: delete, spam, archive, notify, skip, folder:<name>, notify+folder:<name>\n"
+                    "  Folder names with spaces: use quotes — folder:\"bills paid\" or notify+folder:\"bills paid\"\n"
                     "Examples:\n"
                     "  !email rules add domain:groupon.com delete\n"
+                    "  !email rules add domain:chase.com notify+folder:Bills\n"
+                    "  !email rules add domain:progressive.com notify+folder:\"bills paid\"\n"
                     "  !email rules add sender:recruiter@symbotic.com notify\n"
-                    "  !email rules add subject:unsubscribe skip\n"
+                    "  !email rules add domain:usps.com archive\n"
                     "  !email rules add body:\"win a prize\" spam"
                 )
             match_spec = add_parts[0]
-            action = add_parts[1].lower()
+            action_spec = add_parts[1].lower()
             notes = add_parts[2] if len(add_parts) > 2 else ""
+
+            # Parse compound action: notify+folder:Bills, folder:"My Bills", notify+folder:"bills paid"
+            # Folder names with spaces must be quoted: folder:"bills paid"
+            folder_name = None
+            also_notify = False
+            if action_spec.startswith("notify+folder:"):
+                raw_folder = action_spec.split(":", 1)[1].strip('"\'')
+                # Also consume quoted folder name that may have been split into notes
+                if not raw_folder and notes:
+                    quoted = notes.split(maxsplit=1)
+                    raw_folder = quoted[0].strip('"\'')
+                    notes = quoted[1] if len(quoted) > 1 else ""
+                folder_name = raw_folder
+                action = "folder"
+                also_notify = True
+            elif action_spec.startswith("folder:"):
+                raw_folder = action_spec.split(":", 1)[1].strip('"\'')
+                if not raw_folder and notes:
+                    quoted = notes.split(maxsplit=1)
+                    raw_folder = quoted[0].strip('"\'')
+                    notes = quoted[1] if len(quoted) > 1 else ""
+                folder_name = raw_folder
+                action = "folder"
+            else:
+                action = action_spec
 
             valid_actions = ("delete", "spam", "archive", "folder", "notify", "unsubscribe", "skip")
             if action not in valid_actions:
                 return f"Invalid action '{action}'. Valid: {', '.join(valid_actions)}"
+
+            if action == "folder" and not folder_name:
+                return "folder action requires a name: folder:<name> or notify+folder:<name>"
 
             if ":" not in match_spec:
                 return "Match must be type:value (e.g. domain:groupon.com)"
@@ -651,15 +961,18 @@ async def _cmd_email(args: str) -> str:
 
             s_val = match_value.strip("'\"").replace("'", "''")
             s_notes = notes.replace("'", "''") if notes else ""
-            name = f"{match_type}-{s_val[:30]}-{action}"
+            s_folder = folder_name.replace("'", "''") if folder_name else ""
+            action_label = f"notify+folder:{folder_name}" if also_notify else (f"folder:{folder_name}" if folder_name else action)
+            name = f"{match_type}-{s_val[:30]}-{action_label[:20]}"
 
+            folder_sql = f"'{s_folder}'" if s_folder else "NULL"
             row_id = await execute_insert(
                 f"INSERT INTO {_RULES()} "
-                f"(rule_name, match_type, match_value, match_mode, action, source, notes) "
+                f"(rule_name, match_type, match_value, match_mode, action, folder_name, also_notify, source, notes) "
                 f"VALUES ('{name}', '{match_type}', '{s_val}', 'contains', "
-                f"'{action}', 'user', '{s_notes}')"
+                f"'{action}', {folder_sql}, {1 if also_notify else 0}, 'user', '{s_notes}')"
             )
-            return f"Rule #{row_id} created: {match_type} contains '{match_value}' → {action}"
+            return f"Rule #{row_id} created: {match_type} contains '{match_value}' → {action_label}"
 
         # !email rules disable N
         if rsub == "disable":

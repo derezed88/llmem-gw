@@ -338,7 +338,8 @@ async def prospective_task() -> None:
     Wakes early if trigger_now() is called.
     """
     from timer_registry import register_timer, timer_sleep
-    register_timer("prospective", "cogn")
+    from state import fmt_interval as _fmt_iv
+    register_timer("prospective", _fmt_iv(_pcogn_cfg().get("prospective_interval_m", 5)))
 
     global _wake_event
     _wake_event = asyncio.Event()

@@ -8,11 +8,10 @@ Architecture:
 - POST /sms/inbound   — macOS proxy pushes incoming SMS here
 - GET  /sms/outbound  — macOS proxy polls for reply messages to send
 - POST /sms/ack       — macOS proxy acknowledges sent replies
-- GET  /sms/health    — health check
 
-Notifier integration:
-- Fires "sms_received" event so all subscribed sessions get live notifications
-- Quiet period is respected (won't interrupt active voice sessions within quiet window)
+Notification delivery (push, no polling):
+- Routes to most recently active session matching notify_models patterns via push_notif
+- Also fires "sms_received" notifier event for explicitly subscribed sessions (e.g. Slack)
 
 Commands (via !sms):
   !sms                      — show recent messages and status
@@ -31,7 +30,7 @@ import time
 from typing import List, Dict, Optional
 from starlette.routing import Route
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, StreamingResponse
 
 from plugin_loader import BasePlugin
 from config import log
@@ -62,20 +61,15 @@ _inbox_counter = 0
 _outbound: list[dict] = []  # [{id, phone, text, timestamp}, ...]
 _outbound_counter = 0
 
-# Global recent notifications (any matching session can poll these)
-_MAX_RECENT_NOTIFS = 20
-_recent_notifs: list[dict] = []  # [{text, phone, timestamp, id}, ...]
-_recent_notif_counter = 0
+# SSE subscribers for outbound push (one asyncio.Queue per connected macOS proxy)
+_outbound_subscribers: set[asyncio.Queue] = set()
 
-# Per-session last-seen notification ID (tracks what each session has already received)
-_session_last_seen: dict[str, int] = {}
+# Track when the macOS proxy last contacted us (SSE connect = heartbeat)
+_PROXY_TIMEOUT = 30  # seconds
+_last_proxy_contact: float = 0.0
 
 # Runtime enable/disable (overrides plugin_config)
 _runtime_enabled: Optional[bool] = None
-
-# Track when the macOS proxy last contacted us (outbound poll = heartbeat)
-_PROXY_TIMEOUT = 30  # seconds — consider proxy disconnected after this
-_last_proxy_contact: float = 0.0
 
 
 def _is_enabled() -> bool:
@@ -120,51 +114,48 @@ async def _resolve_phone_name(phone: str) -> str:
 
 async def _auto_notify_sessions(phone: str, text: str) -> int:
     """
-    Push SMS notification directly to all active sessions whose model
-    matches any pattern in notify_models.
+    Push SMS notification to the most recently active frontend with an open
+    SSE connection. Falls back through all sessions in last_active order until
+    one succeeds.
 
-    Patterns support trailing wildcard: "samaritan-voice*" matches
-    "samaritan-voice", "samaritan-voice-v2", etc.
+    "Active" means the session already has an entry in sse_queues — i.e. it has
+    an open SSE stream consuming from its queue. Sessions without an existing
+    queue entry are skipped (push_notif would silently enqueue into the void).
 
-    Returns number of sessions notified.
+    Returns 1 if a session was notified, 0 if no live session was found.
     """
-    patterns = _get_notify_models()
-    if not patterns:
-        return 0
-
-    from state import sessions, push_notif
-
-    # Compile patterns into regexes
-    regexes = []
-    for p in patterns:
-        if p.endswith("*"):
-            regexes.append(re.compile(re.escape(p[:-1]) + ".*"))
-        else:
-            regexes.append(re.compile(re.escape(p) + "$"))
+    from state import sessions, push_notif, sse_queues
 
     sender = await _resolve_phone_name(phone)
     msg = f"SMS from {sender}. {text}"
 
-    # Buffer in global recent list for webfe polling
-    global _recent_notif_counter
-    _recent_notif_counter += 1
-    notif_entry = {"text": msg, "phone": phone, "timestamp": time.time(), "id": _recent_notif_counter}
-    _recent_notifs.append(notif_entry)
-    if len(_recent_notifs) > _MAX_RECENT_NOTIFS:
-        _recent_notifs.pop(0)
+    # Sort all sessions by last_active descending (most recently active first)
+    sorted_sessions = sorted(
+        sessions.items(),
+        key=lambda kv: kv[1].get("last_active", 0.0),
+        reverse=True,
+    )
 
-    count = 0
-    for client_id, session in list(sessions.items()):
-        model = session.get("model", "")
-        if any(rx.match(model) for rx in regexes):
-            try:
-                await push_notif(client_id, msg)
-                log.info(f"SMS auto-notify → {client_id} (model={model})")
-                count += 1
-            except Exception as e:
-                log.warning(f"SMS auto-notify failed for {client_id}: {e}")
+    for client_id, session in sorted_sessions:
+        # Only push to sessions with an existing SSE queue (live connection).
+        # get_queue() creates a new queue for any client_id — checking first
+        # prevents silently dropping into a queue nobody is reading.
+        if client_id not in sse_queues:
+            continue
+        try:
+            await push_notif(client_id, msg)
+            log.info(
+                f"SMS auto-notify → {client_id} "
+                f"model={session.get('model', '?')} "
+                f"last_active={session.get('last_active', 0):.0f}"
+            )
+            return 1
+        except Exception as e:
+            log.warning(f"SMS auto-notify failed for {client_id}: {e}")
+            continue
 
-    return count
+    log.info("SMS auto-notify: no live SSE session found")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -179,8 +170,7 @@ async def endpoint_sms_inbound(request: Request) -> JSONResponse:
         phone : str   — sender phone number
         text  : str   — message body
     """
-    global _inbox_counter, _last_proxy_contact
-    _last_proxy_contact = time.time()
+    global _inbox_counter
 
     if not _is_enabled():
         return JSONResponse({"status": "disabled"}, status_code=503)
@@ -215,10 +205,11 @@ async def endpoint_sms_inbound(request: Request) -> JSONResponse:
     # Also fire notifier event for explicitly subscribed sessions
     try:
         import notifier
+        sender = await _resolve_phone_name(phone)
         preview = text[:120] + ("..." if len(text) > 120 else "")
         await notifier.fire_event(
             "sms_received",
-            f"SMS from {phone}",
+            f"SMS from {sender}",
             f"{preview}\n  Reply: !sms reply {phone} <your message>",
         )
     except Exception as e:
@@ -233,9 +224,6 @@ async def endpoint_sms_outbound(request: Request) -> JSONResponse:
 
     Returns list of pending reply messages, leaves them in queue until ACKed.
     """
-    global _last_proxy_contact
-    _last_proxy_contact = time.time()
-
     if not _is_enabled():
         return JSONResponse({"status": "disabled", "messages": []})
 
@@ -243,6 +231,51 @@ async def endpoint_sms_outbound(request: Request) -> JSONResponse:
         "status": "ok",
         "messages": list(_outbound),
     })
+
+
+async def endpoint_sms_outbound_stream(request: Request) -> StreamingResponse:
+    """
+    SSE stream for outbound replies. macOS proxy holds this connection open.
+    Server pushes reply messages as they are queued; proxy sends and ACKs.
+    Connection is always macOS → llmem-gw (NAT/firewall safe).
+    """
+    global _last_proxy_contact
+    _last_proxy_contact = time.time()
+
+    if not _is_enabled():
+        return JSONResponse({"status": "disabled"}, status_code=503)
+
+    q: asyncio.Queue = asyncio.Queue()
+    _outbound_subscribers.add(q)
+    log.info("SMS outbound SSE: proxy stream connected")
+
+    async def event_stream():
+        global _last_proxy_contact
+        try:
+            # Replay any currently unacked messages on reconnect
+            for msg in list(_outbound):
+                yield f"data: {json.dumps(msg)}\n\n"
+
+            while True:
+                try:
+                    msg = await asyncio.wait_for(q.get(), timeout=25.0)
+                    yield f"data: {json.dumps(msg)}\n\n"
+                    _last_proxy_contact = time.time()
+                except asyncio.TimeoutError:
+                    # Heartbeat — keeps connection alive through proxies/firewalls
+                    yield ": ping\n\n"
+                    _last_proxy_contact = time.time()
+        except (asyncio.CancelledError, GeneratorExit):
+            pass
+        finally:
+            _outbound_subscribers.discard(q)
+            log.info("SMS outbound SSE: proxy stream disconnected")
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 async def endpoint_sms_ack(request: Request) -> JSONResponse:
@@ -266,54 +299,9 @@ async def endpoint_sms_ack(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", "cleared": removed})
 
 
-async def endpoint_sms_notifications(request: Request) -> JSONResponse:
-    """
-    Poll for pending SMS notifications for a specific session.
-    Returns notifications newer than what this session has already seen.
-    Only returns notifications if the session's model matches notify_models.
-
-    Query params:
-        client_id : str  — session client_id
-    """
-    client_id = request.query_params.get("client_id", "")
-    if not client_id:
-        return JSONResponse({"error": "Missing client_id"}, status_code=400)
-
-    # Check if this session's model matches notify_models
-    from state import sessions
-    session = sessions.get(client_id)
-    if not session:
-        return JSONResponse({"notifications": []})
-
-    model = session.get("model", "")
-    patterns = _get_notify_models()
-    if not patterns:
-        return JSONResponse({"notifications": []})
-
-    matched = False
-    for p in patterns:
-        if p.endswith("*"):
-            if model.startswith(p[:-1]):
-                matched = True
-                break
-        elif model == p:
-            matched = True
-            break
-    if not matched:
-        return JSONResponse({"notifications": []})
-
-    # Return notifications newer than last seen
-    last_seen = _session_last_seen.get(client_id, 0)
-    pending = [n for n in _recent_notifs if n["id"] > last_seen]
-    if pending:
-        _session_last_seen[client_id] = pending[-1]["id"]
-
-    return JSONResponse({"notifications": pending})
-
-
 async def endpoint_sms_health(request: Request) -> JSONResponse:
-    """Health check."""
-    proxy_connected = (time.time() - _last_proxy_contact) < _PROXY_TIMEOUT if _last_proxy_contact else False
+    """Health check for the SMS proxy plugin."""
+    proxy_connected = len(_outbound_subscribers) > 0
     return JSONResponse({
         "status": "ok",
         "enabled": _is_enabled(),
@@ -357,13 +345,16 @@ async def cmd_sms(args: str) -> str:
         message = reply_parts[1]
 
         _outbound_counter += 1
-        _outbound.append({
+        msg_data = {
             "id": _outbound_counter,
             "phone": phone,
             "text": message,
             "timestamp": time.time(),
             "from_session": client_id,
-        })
+        }
+        _outbound.append(msg_data)
+        for _q in list(_outbound_subscribers):
+            _q.put_nowait(msg_data)
         log.info(f"SMS reply queued → {phone}: {message[:80]} (from {client_id})")
         return f"SMS reply queued → {phone} ({len(message)} chars)"
 
@@ -448,11 +439,11 @@ class SmsProxyPlugin(BasePlugin):
     def get_routes(self) -> List[Route]:
         """Return HTTP routes for SMS proxy."""
         return [
+            Route("/sms/health", endpoint_sms_health, methods=["GET"]),
             Route("/sms/inbound", endpoint_sms_inbound, methods=["POST"]),
+            Route("/sms/outbound/stream", endpoint_sms_outbound_stream, methods=["GET"]),
             Route("/sms/outbound", endpoint_sms_outbound, methods=["GET"]),
             Route("/sms/ack", endpoint_sms_ack, methods=["POST"]),
-            Route("/sms/notifications", endpoint_sms_notifications, methods=["GET"]),
-            Route("/sms/health", endpoint_sms_health, methods=["GET"]),
         ]
 
     def get_commands(self) -> Dict[str, any]:

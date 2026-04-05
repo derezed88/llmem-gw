@@ -272,6 +272,11 @@ async def run_agent(host: str = "0.0.0.0"):
                         await age_by_count()
                     except Exception as e:
                         log.warning(f"_age_count_task error on {db_name}: {e}")
+                    try:
+                        from memory_archive import check_and_archive
+                        await check_and_archive(db_name)
+                    except Exception as e:
+                        log.warning(f"_age_count_task archive error on {db_name}: {e}")
                 set_db_override("")
                 timer_end("mem_age_count", t0)
             except Exception as e:
@@ -315,6 +320,11 @@ async def run_agent(host: str = "0.0.0.0"):
                         await age_by_minutes(trigger_minutes=trigger_min)
                     except Exception as e:
                         log.warning(f"_age_minutes_task error on {db_name}: {e}")
+                    try:
+                        from memory_archive import check_and_archive
+                        await check_and_archive(db_name)
+                    except Exception as e:
+                        log.warning(f"_age_minutes_task archive error on {db_name}: {e}")
                 set_db_override("")
                 timer_end("mem_age_minutes", t0)
             except Exception as e:
@@ -368,33 +378,21 @@ async def run_agent(host: str = "0.0.0.0"):
             timer_sleep("mem_age_temporal", sleep_sec)
             await asyncio.sleep(sleep_sec)
 
-    # Run all servers, reaper, memory aging tasks, and proactive cognition tasks concurrently
+    # Run all servers, reaper, memory aging tasks, and proactive cognition tasks concurrently.
+    # Note: contradiction, reflection, and emotions are handled by the samaritan-cognition
+    # Claude Code session (activity-driven via plugin_mcp_direct.py hooks).
     await asyncio.gather(
         *servers_to_run,
         _session_reaper(),
         _age_count_task(),
         _age_minutes_task(),
         _age_temporal_task(),
-        _contradiction_task_wrapper(),
         _prospective_task_wrapper(),
-        _reflection_task_wrapper(),
         _temporal_inference_task_wrapper(),
         _memreview_auto_task_wrapper(),
         _goal_processor_task_wrapper(),
         _email_triage_task_wrapper(),
-        _emotions_task_wrapper(),
     )
-
-
-async def _contradiction_task_wrapper():
-    """Thin wrapper so import errors don't crash the gather."""
-    try:
-        from contradiction import contradiction_task
-        await contradiction_task()
-    except ImportError as e:
-        log.warning(f"contradiction module not available: {e}")
-    except Exception as e:
-        log.error(f"contradiction_task crashed: {e}")
 
 
 async def _prospective_task_wrapper():
@@ -406,17 +404,6 @@ async def _prospective_task_wrapper():
         log.warning(f"prospective module not available: {e}")
     except Exception as e:
         log.error(f"prospective_task crashed: {e}")
-
-
-async def _reflection_task_wrapper():
-    """Thin wrapper so import errors don't crash the gather."""
-    try:
-        from reflection import reflection_task
-        await reflection_task()
-    except ImportError as e:
-        log.warning(f"reflection module not available: {e}")
-    except Exception as e:
-        log.error(f"reflection_task crashed: {e}")
 
 
 async def _temporal_inference_task_wrapper():
@@ -461,17 +448,6 @@ async def _email_triage_task_wrapper():
         log.warning(f"email_triage module not available: {e}")
     except Exception as e:
         log.error(f"email_triage_task crashed: {e}")
-
-
-async def _emotions_task_wrapper():
-    """Thin wrapper so import errors don't crash the gather."""
-    try:
-        from emotions import emotions_task
-        await emotions_task()
-    except ImportError as e:
-        log.warning(f"emotions module not available: {e}")
-    except Exception as e:
-        log.error(f"emotions_task crashed: {e}")
 
 
 def main():

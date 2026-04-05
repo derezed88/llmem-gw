@@ -153,8 +153,23 @@ async def file_extract_executor(
 
     try:
         if file_id:
-            from drive import _drive_download_bytes
-            data, mime, name = await asyncio.to_thread(_drive_download_bytes, file_id)
+            from drive import (
+                _drive_download_bytes, _drive_export_pdf_bytes,
+                _GOOGLE_APPS_PDF_EXPORTABLE, _doc_has_images, _get_drive_service,
+            )
+            meta = await asyncio.to_thread(
+                lambda: _get_drive_service().files().get(fileId=file_id, fields="mimeType").execute()
+            )
+            if meta.get("mimeType") in _GOOGLE_APPS_PDF_EXPORTABLE:
+                has_images = await asyncio.to_thread(_doc_has_images, file_id)
+                if has_images:
+                    data, mime, name = await asyncio.to_thread(_drive_export_pdf_bytes, file_id)
+                    log.info("file_extract: Google Doc has images — exported as PDF for image-aware analysis")
+                else:
+                    data, mime, name = await asyncio.to_thread(_drive_download_bytes, file_id)
+                    log.info("file_extract: Google Doc has no images — using text export")
+            else:
+                data, mime, name = await asyncio.to_thread(_drive_download_bytes, file_id)
             source_label = f"Drive:{file_id}"
         elif url:
             data, mime, name = await _fetch_bytes_from_url(url)

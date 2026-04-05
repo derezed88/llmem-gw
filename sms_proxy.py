@@ -17,7 +17,7 @@ Usage:
 
 Config (sms_proxy_config.json):
   {
-    "llmem_gw_url": "http://YOUR_SERVER_IP:8767",
+    "llmem_gw_url": "http://192.168.10.111:8767",
     "poll_interval": 2,
     "outbound_poll_interval": 3,
     "allowed_numbers": [],
@@ -51,9 +51,8 @@ log = logging.getLogger("sms_proxy")
 # Config
 # ---------------------------------------------------------------------------
 DEFAULT_CONFIG = {
-    "llmem_gw_url": "http://YOUR_SERVER_IP:8767",
+    "llmem_gw_url": "http://192.168.10.111:8767",
     "poll_interval": 2,            # seconds between Messages DB polls
-    "outbound_poll_interval": 3,   # seconds between outbound reply polls
     "allowed_numbers": [],         # empty = allow all
     "blocked_numbers": [],
     "max_message_age": 60,         # ignore messages older than N seconds
@@ -257,19 +256,6 @@ class SmsPluginClient:
             log.error(f"Inbound POST error: {e}")
             return False
 
-    async def poll_outbound(self) -> list[dict]:
-        """Poll for outbound reply messages."""
-        session = await self._get_session()
-        try:
-            async with session.get(f"{self.base_url}/sms/outbound") as resp:
-                if resp.status != 200:
-                    return []
-                data = await resp.json()
-                return data.get("messages", [])
-        except Exception as e:
-            log.error(f"Outbound poll error: {e}")
-            return []
-
     async def ack_outbound(self, ids: list[int]) -> bool:
         """Acknowledge sent outbound messages."""
         session = await self._get_session()
@@ -345,35 +331,79 @@ class SmsProxy:
 
             await asyncio.sleep(self.cfg["poll_interval"])
 
-    async def _poll_outbound(self):
-        """Poll plugin for outbound replies and send via AppleScript."""
+    async def _stream_outbound(self):
+        """Stream outbound replies via SSE and send via AppleScript.
+
+        Holds a persistent connection to llmem-gw /sms/outbound/stream.
+        Server pushes messages as SSE events; we send immediately and ACK.
+        Reconnects with exponential backoff on disconnect.
+        Connection direction is always macOS → llmem-gw (NAT/firewall safe).
+        """
+        stream_url = f"{self.cfg['llmem_gw_url']}/sms/outbound/stream"
+        backoff = 5
+
         while True:
             try:
-                messages = await self.client.poll_outbound()
-                if messages:
-                    sent_ids = []
-                    for m in messages:
-                        phone = m.get("phone", "")
-                        text = m.get("text", "")
-                        msg_id = m.get("id")
-                        if not phone or not text:
-                            continue
-                        log.info(f"Outbound reply → {phone}: {text[:80]}...")
-                        if send_imessage(phone, text):
-                            sent_ids.append(msg_id)
-                    if sent_ids:
-                        await self.client.ack_outbound(sent_ids)
-            except Exception as e:
-                log.error(f"Outbound poll error: {e}", exc_info=True)
+                log.info("SMS outbound: connecting to SSE stream")
+                session = await self.client._get_session()
+                async with session.get(
+                    stream_url,
+                    headers={"Accept": "text/event-stream"},
+                    timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10),
+                ) as resp:
+                    if resp.status != 200:
+                        log.error(f"SMS outbound: SSE rejected HTTP {resp.status}, retry in {backoff}s")
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, 60)
+                        continue
 
-            await asyncio.sleep(self.cfg["outbound_poll_interval"])
+                    log.info("SMS outbound: SSE stream connected")
+                    backoff = 5  # reset on successful connect
+
+                    while True:
+                        line_bytes = await resp.content.readline()
+                        if not line_bytes:
+                            log.warning("SMS outbound: SSE stream closed by server")
+                            break
+
+                        line = line_bytes.decode("utf-8").rstrip("\r\n")
+
+                        if not line or line.startswith(":"):
+                            continue  # blank line (event boundary) or heartbeat comment
+
+                        if line.startswith("data: "):
+                            data_str = line[6:]
+                            try:
+                                msg = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                log.warning(f"SMS outbound: bad JSON in SSE event: {data_str}")
+                                continue
+
+                            phone = msg.get("phone", "")
+                            text = msg.get("text", "")
+                            msg_id = msg.get("id")
+                            if not phone or not text:
+                                continue
+
+                            log.info(f"Outbound reply → {phone}: {text[:80]}...")
+                            if send_imessage(phone, text):
+                                await self.client.ack_outbound([msg_id])
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.error(f"SMS outbound SSE error: {e}", exc_info=True)
+
+            log.info(f"SMS outbound: reconnecting in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
     async def run(self):
         """Main entry point — runs inbound and outbound loops concurrently."""
         log.info("SMS Proxy starting")
         log.info(f"  llmem-gw: {self.cfg['llmem_gw_url']}")
         log.info(f"  Inbound poll: {self.cfg['poll_interval']}s")
-        log.info(f"  Outbound poll: {self.cfg['outbound_poll_interval']}s")
+        log.info(f"  Outbound: SSE stream (event-driven)")
         log.info(f"  Messages DB: {MESSAGES_DB}")
 
         if not os.path.exists(MESSAGES_DB):
@@ -395,7 +425,7 @@ class SmsProxy:
         try:
             await asyncio.gather(
                 self._poll_inbound(),
-                self._poll_outbound(),
+                self._stream_outbound(),
             )
         except KeyboardInterrupt:
             log.info("Shutting down...")

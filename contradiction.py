@@ -200,7 +200,12 @@ _USER_PROMPT_TMPL = (
     "Check each pair below for logical contradiction. "
     "Return a JSON array — one object per contradiction found, empty array [] if none.\n"
     "Each object: {{\"belief_id_a\": N, \"belief_id_b\": N, \"conflict\": \"one sentence\", "
-    "\"resolution\": \"retract_a|retract_b|merge|flag\", \"confidence\": 0.0-1.0}}\n\n"
+    "\"resolution\": \"retract_a|retract_b|merge|flag\", \"confidence\": 0.0-1.0, "
+    "\"resolver\": \"admin|samaritan\"}}\n\n"
+    "resolver='samaritan' means the conflict is an internal design/logic inconsistency "
+    "that can be resolved by reasoning alone (no human input needed). "
+    "resolver='admin' means resolving it requires real-world information only the user has "
+    "(e.g. a routine changed, a personal decision was made).\n\n"
     "Only include pairs where confidence >= 0.7.\n\n"
     "PAIRS:\n{pairs_text}"
 )
@@ -247,10 +252,72 @@ async def _call_llm(model_key: str, pairs_text: str) -> list[dict]:
     return []
 
 
+async def _check_deferred(id_a: int, id_b: int) -> bool:
+    """
+    Return True if an active deferred-conflict belief exists for this pair
+    and its resolve_by timestamp hasn't passed yet.
+
+    Deferred beliefs use topic 'conflict-deferred-*' and a structured first line:
+        DEFERRED|resolver=admin|resolve_by=2026-04-05T09:00:00|belief_ids=131,144
+    Falls back to free-text scan for belief IDs if the structured header is absent.
+    """
+    from database import fetch_dicts
+    from memory import _BELIEFS
+    import re
+    from datetime import datetime, timezone
+
+    try:
+        rows = await fetch_dicts(
+            f"SELECT content FROM {_BELIEFS()} "
+            f"WHERE topic LIKE 'conflict-deferred-%' AND status='active'"
+        )
+    except Exception:
+        return False
+
+    now = datetime.now(timezone.utc)
+    for row in (rows or []):
+        content = row.get("content", "")
+
+        # --- resolve belief IDs from structured header or free text ---
+        m_ids = re.search(r'belief_ids=([\d,]+)', content)
+        if m_ids:
+            ids = {int(x) for x in m_ids.group(1).split(',') if x.strip()}
+        else:
+            # fallback: look for "belief N" mentions in free text
+            found = {int(x) for x in re.findall(r'belief\s+(\d+)', content, re.IGNORECASE)}
+            ids = found
+
+        if id_a not in ids and id_b not in ids:
+            continue  # not about this pair
+
+        # --- check resolve_by ---
+        m_rb = re.search(r'resolve_by=([\d\-T: ]+)', content)
+        if not m_rb:
+            # No resolve_by — treat as indefinitely deferred
+            return True
+        rb_str = m_rb.group(1).strip().rstrip('|')
+        for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
+            try:
+                resolve_by = datetime.strptime(rb_str, fmt).replace(tzinfo=timezone.utc)
+                break
+            except ValueError:
+                continue
+        else:
+            log.debug(f"contradiction: could not parse resolve_by={rb_str!r}, treating as deferred")
+            return True
+
+        if now < resolve_by:
+            log.debug(f"contradiction: deferred conflict for beliefs {id_a},{id_b} — resolve_by={rb_str}")
+            return True
+
+    return False
+
+
 async def _write_flag(item: dict, auto_retract: bool) -> None:
     """
     Write a contradiction-flag belief row and optionally retract one side.
     Flag row: topic='contradiction-flag', confidence=9, source='assistant'.
+    Skipped if a deferred-conflict belief exists for this pair and hasn't expired.
     """
     from database import execute_sql
     from memory import _BELIEFS
@@ -260,14 +327,20 @@ async def _write_flag(item: dict, auto_retract: bool) -> None:
     conflict = str(item.get("conflict", ""))[:500].replace("'", "''")
     resolution = str(item.get("resolution", "flag"))
     conf_score = float(item.get("confidence", 0.7))
+    resolver = str(item.get("resolver", "admin"))  # 'admin' or 'samaritan'
 
     flag_content = (
-        f"CONTRADICTION DETECTED (confidence={conf_score:.2f}): "
+        f"CONTRADICTION DETECTED (confidence={conf_score:.2f}, resolver={resolver}): "
         f"belief {id_a} vs belief {id_b} — {conflict} "
         f"(suggested resolution: {resolution})"
     ).replace("'", "''")
 
     tbl = _BELIEFS()
+
+    # Skip if a deferred-conflict belief exists for this pair
+    if await _check_deferred(id_a, id_b):
+        log.info(f"contradiction: skipping flag for beliefs {id_a} vs {id_b} — deferred by admin")
+        return
 
     # Avoid duplicate flags for the same pair
     try:

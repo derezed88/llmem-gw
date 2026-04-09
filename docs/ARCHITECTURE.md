@@ -195,6 +195,7 @@ Plugins are declared in `plugin-manifest.json` and enabled/disabled in `plugins-
 - `plugin_client_shellpy` — SSE streaming endpoint for shell.py (port 8765)
 - `plugin_proxy_llama` — OpenAI/Ollama-compatible proxy (configurable port, default 11434)
 - `plugin_client_slack` — Slack client: inbound via Socket Mode WebSocket, outbound via Web API (`chat.postMessage`)
+- `plugin_mcp_direct` — MCP (Model Context Protocol) server (port 8769) for Claude Code sessions — exposes ~34 tools covering memory, goals, beliefs, plans, database, Google services, search, and cross-system LLM calls
 
 **`data_tool`** — registers tools callable by the LLM:
 - `plugin_database_mysql` — `db_query` tool

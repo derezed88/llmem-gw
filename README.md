@@ -92,12 +92,20 @@ This is the foundation for building an agent that isn't just a stateless tool �
 
 #### Cognitive Architecture — Background Loops and Autonomous Behavior
 
-Beyond per-turn memory, five independent background loops run on configurable timers. Each is toggle-able in `plugins-enabled.json` — no code changes required.
+The cognition architecture is a hybrid of event-driven and timer-driven processing:
 
-- **Reflection loop** (default: 60 min) — Pulls recent conversation turns, extracts insights and self-model patterns via LLM, detects goal completions, and saves structured memories to an isolated cognition table. Includes a staleness gate: if there's been no new conversation, the cycle is skipped entirely (zero tokens). Every 5th cycle, synthesises all `self-*` patterns into a compact self-summary.
-- **Goal processor** (default: 30 min) — Scans for unplanned goals, decomposes them into concept and task steps via the plan engine, manages an approval workflow (propose → approve/defer/reject), and executes model-owned steps serially. Human-required steps pause and notify. Zero tokens on quiet cycles — the scanner is pure SQL.
-- **Contradiction detection** (default: 60 min) — Groups active beliefs by topic, sends pairs to an LLM for conflict detection, and flags contradictions. Optionally auto-retracts the lower-confidence belief (off by default — destruction requires confirmation).
-- **Prospective reminders** (default: 5 min) — Polls pending reminders with due dates (datetime or natural language like "next Monday"). Overdue items are injected into short-term memory as high-importance reminders and marked done.
+**Event-driven (Claude Code cognition session)** — Three cognitive functions are handled by a dedicated Claude Code session (`samaritan-cognition`) that fires immediately on relevant events, replacing their former Python async timer loops:
+
+- **Reflection** — Triggered every 5 conversation turns. Extracts insights, updates beliefs, detects goal completions.
+- **Contradiction detection** — Triggered on every `assert_belief` and `memory_save` call. Compares new content against existing beliefs for conflicts.
+- **Goal health checks** — Triggered on `goal_create`. Reviews new goals for conflicts with active goals.
+
+The motivation: Claude performs substantially better reasoning on these tasks than small models, and the event-driven architecture eliminates periodic LLM cost when there is nothing new to process.
+
+**Timer-driven (Python async)** — Three background loops remain as Python async tasks:
+
+- **Goal processor** (default: 30 min) — Scans for unplanned goals, decomposes them into concept and task steps via the plan engine, manages an approval workflow (propose → approve/defer/reject), and executes model-owned steps serially. Zero tokens on quiet cycles — the scanner is pure SQL.
+- **Prospective reminders** (default: 5 min) — Polls pending reminders with due dates. Overdue items are injected into short-term memory as high-importance reminders and marked done.
 - **Temporal inference** (default: 3 hr) — Analyses recent conversation topics and proposes time-aware queries ("what do I usually do at 10 AM?"). Fills the gap that semantic search can't cover — Qdrant has no time dimension.
 
 **Self-tuning via cognitive feedback** — Each loop measures its own usefulness (e.g., what fraction of reflection outputs were later retrieved, how many reminders were acted on). Low-value loops are automatically throttled or disabled; recovery happens when value improves. No manual tuning required.
@@ -106,7 +114,7 @@ Beyond per-turn memory, five independent background loops run on configurable ti
 
 **Drive / affect system** — Five persistent drives (`curiosity`, `task-completion`, `user-trust`, `discomfort`, `autonomy`) with values from 0–1. Drives decay toward baseline each reflection cycle and are nudged by goal performance: completions boost `task-completion`, blocks raise `discomfort`. Goals are sorted by `importance × drive_weight`, so the agent's priorities shift based on what's working.
 
-**Plan engine** — Two-tier decomposition (concept steps → executable task steps) with a three-tier execution chain: direct execution (zero LLM cost), primary LLM recovery, and fallback LLM. Failure at any tier cascades back to block the parent goal. Approval workflow supports propose/approve/defer/reject at each level.
+**Plan engine** — Two-tier decomposition (concept steps → executable task steps) with a two-tier execution chain: direct execution (zero LLM cost) and LLM recovery with backup_models failover. Failure cascades back to block the parent goal. Approval workflow supports propose/approve/defer/reject at each level.
 
 **LLM-as-judge** — Four gate points (prompt, response, tool call, memory save) where a separate judge model scores content before it proceeds. Per-model configuration in `llm-models.json`. Fail-open on parse errors.
 
@@ -377,6 +385,7 @@ Executors are auto-extracted from `StructuredTool.coroutine` — no separate exe
 | Ollama-compatible apps | HTTP (`llama_port`, default 11434) | Ollama NDJSON |
 | Slack | Socket Mode WebSocket (inbound) + Web API (outbound) | Slack Events API / `chat.postMessage` |
 | Programmatic / swarm | SSE (port 8767) | JSON/SSE via `api_client.py` or HTTP directly |
+| Claude Code (MCP Direct) | SSE (port 8769) | Model Context Protocol — ~34 tools for memory, goals, beliefs, search, Google services |
 
 The llama proxy auto-detects client format from User-Agent and path prefix, then routes all formats to the same `process_request()` pipeline.
 
@@ -548,6 +557,7 @@ Agent B ──────HTTP──►  │   ChatGoogleGenerativeAI │──�
 | `plugin_tmux` | `tmux_new`, `tmux_exec`, `tmux_ls`, `tmux_kill_session`, `tmux_kill_server`, `tmux_history`, `tmux_history_limit` | Persistent PTY shell sessions — LLM can run shell commands and read output; whitelist/blacklist configurable |
 | `plugin_memory_vector_qdrant` | _(infrastructure)_ | Qdrant vector index for semantic memory retrieval. Embeds memory rows via a local embedding model and provides scored nearest-neighbour lookup by topic. MySQL remains the source of truth; Qdrant is the retrieval index. Requires a running Qdrant instance and a compatible embedding endpoint (e.g. nomic-embed-text via llama.cpp). |
 | `plugin_claude_vscode_sessions` | _(client interface)_ | Exposes Claude Code session exports stored in Google Drive as a readable resource for the LLM |
+| `plugin_mcp_direct` | 8769 | MCP (Model Context Protocol) server — exposes the full data layer as ~34 tools for Claude Code sessions. Memory, goals, beliefs, plans, database, Google services, search, and cross-system LLM calls. See [docs/CLAUDEMCP.md](docs/CLAUDEMCP.md) |
 
 **History** — how conversation context is managed:
 
@@ -577,8 +587,9 @@ python llmemctl.py disable <plugin_name>
 | [docs/setup_services.md](docs/setup_services.md) | systemd, tmux, screen, and tunnel deployment |
 | [docs/plugin-client-api.md](docs/plugin-client-api.md) | API plugin — programmatic access and swarm setup |
 | [docs/SWARMDESIGN.md](docs/SWARMDESIGN.md) | Swarm foundation and discovery design options |
-| [docs/COGNITION.md](docs/COGNITION.md) | Cognitive architecture — typed memory, background loops, drives, goal/plan state machine, cognitive feedback |
-| [docs/TASKMGMT.md](docs/TASKMGMT.md) | Task management — goals, plans, two-tier decomposition, three-tier execution |
+| [docs/COGNITION.md](docs/COGNITION.md) | Cognitive architecture — typed memory, background loops, Claude Code cognition session, drives, goal/plan state machine, cognitive feedback |
+| [docs/CLAUDEMCP.md](docs/CLAUDEMCP.md) | Claude Code + MCP Direct integration — sessions, hooks, emotion tagging, restart continuity |
+| [docs/TASKMGMT.md](docs/TASKMGMT.md) | Task management — goals, plans, two-tier decomposition, two-tier execution |
 | [docs/JUDGEMODEL.md](docs/JUDGEMODEL.md) | Judge model architecture — per-turn scoring, memory review, history filtering |
 | [docs/CONTEXTENG.md](docs/CONTEXTENG.md) | Context engineering — every prompt layer, injection order, toggles |
 | [docs/MEMORY_PROJECT1.md](docs/MEMORY_PROJECT1.md) | Tiered memory system — ST/LT, Qdrant, aging, conv_log |

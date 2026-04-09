@@ -1,7 +1,7 @@
 # Task Management: Goals, Plans, and Execution
 
 Complete lifecycle documentation for the three-layer task management system:
-**Goal Setters** (human / reasoning model / cognition) → **Planner** (Claude Haiku 4.5) → **Executor** (three-tier: direct → primary LLM → fallback LLM).
+**Goal Setters** (human / reasoning model / cognition) → **Planner** (Sonnet 4.6) → **Executor** (two-tier: direct → primary LLM → fallback LLM).
 
 ---
 
@@ -281,7 +281,7 @@ The `!plan run` command and `run_plan_pipeline()` pass `auto_approve=True` to de
 
 ---
 
-## 5. Execution — Three-Tier Executor with Failover
+## 5. Execution — Two-Tier Executor with Failover
 
 Execution responsibility lives in the **plan engine system**, not in the reasoning model. This ensures deterministic routing, cost control, and automatic failover between executor models.
 
@@ -392,7 +392,7 @@ If synonym mapping fails and the direct call raises, the LLM executor tiers hand
 
 | Target | Behavior |
 |--------|----------|
-| `model` | Auto-executable via three-tier executor. |
+| `model` | Auto-executable via two-tier executor. |
 | `human` | Requires human action. Cannot auto-execute. Shown in plan view for manual completion. |
 | `investigate` | Needs further analysis. Decomposer couldn't resolve with current tools. |
 
@@ -404,7 +404,7 @@ Only `target='model'` steps are picked up by `execute_pending_tasks()`.
 execute_pending_tasks(goal_id=None, max_steps=10)
 ```
 
-Finds all pending + approved + model-targeted task steps, ordered by goal_id and step_order. Executes up to `max_steps` sequentially. Each step goes through the full three-tier execution path.
+Finds all pending + approved + model-targeted task steps, ordered by goal_id and step_order. Executes up to `max_steps` sequentially. Each step goes through the full two-tier execution path.
 
 ---
 
@@ -654,7 +654,7 @@ Haiku returns:
 
 → Task step 258 created, approval='auto' (auto-approve mode)
 
-**b) Execute**: Task 258 enters three-tier execution:
+**b) Execute**: Task 258 enters two-tier execution:
 - **Tier 1 (direct)**: `get_tool_executor('db_query')` resolves function, `_map_tool_args()` maps `query` → `sql`, direct call succeeds.
 - Executor column written as `'direct'`.
 
@@ -746,9 +746,9 @@ python test_plan_engine.py -v                 # verbose output
 Results: 5 passed, 0 failed
 ```
 
-### Three-Tier Executor Tests (verified 2026-03-12)
+### Two-Tier Executor Tests (verified 2026-03-12)
 
-Manual E2E tests on running server validating the three-tier failover system:
+Manual E2E tests on running server validating the two-tier failover system:
 
 | Test | Tool | Args | Tier Hit | Executor Column | Cascade |
 |------|------|------|----------|-----------------|---------|
@@ -780,7 +780,7 @@ INFO execute_task_step: id=297 tool=search_tavily executor=samaritan-execution (
 
 | File | Role |
 |------|------|
-| `plan_engine.py` | Core: three-tier execution, decomposition, approval, completion/failure propagation |
+| `plan_engine.py` | Core: two-tier execution, decomposition, approval, completion/failure propagation |
 | `tools.py` | `_set_goal_exec()`, `_set_plan_exec()`, `get_tool_executor()` |
 | `routes.py:cmd_plan()` | `!plan` command handler with all subcommands |
 | `memory.py:load_typed_context_block()` | Context injection of goals + plan hierarchy into prompts |

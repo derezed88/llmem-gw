@@ -392,6 +392,7 @@ async def run_agent(host: str = "0.0.0.0"):
         _memreview_auto_task_wrapper(),
         _goal_processor_task_wrapper(),
         _email_triage_task_wrapper(),
+        _interrupts_dispatch_task_wrapper(),
     )
 
 
@@ -426,6 +427,17 @@ async def _memreview_auto_task_wrapper():
         log.warning(f"memreview_auto module not available: {e}")
     except Exception as e:
         log.error(f"memreview_auto_task crashed: {e}")
+
+
+async def _interrupts_dispatch_task_wrapper():
+    """Thin wrapper so import errors don't crash the gather."""
+    try:
+        from interrupts_dispatch import dispatch_task
+        await dispatch_task()
+    except ImportError as e:
+        log.warning(f"interrupts_dispatch module not available: {e}")
+    except Exception as e:
+        log.error(f"interrupts_dispatch_task crashed: {e}")
 
 
 async def _goal_processor_task_wrapper():

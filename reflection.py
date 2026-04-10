@@ -227,6 +227,24 @@ async def _call_llm(model_key: str, turns_text: str, max_memories: int,
         msgs = [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=prompt)]
         response = await asyncio.wait_for(llm.ainvoke(msgs), timeout=timeout)
         raw = _content_to_str(response.content)
+        # Log per-call cost
+        try:
+            from cost_events import log_cost_event, _estimate_cost_for_model
+            _usage = getattr(response, "usage_metadata", None) or {}
+            _ti = _usage.get("input_tokens", 0) or 0
+            _to = _usage.get("output_tokens", 0) or 0
+            _cost = _estimate_cost_for_model(cfg, _ti, _to)
+            if _cost is not None:
+                asyncio.ensure_future(log_cost_event(
+                    provider=cfg.get("host", "unknown").split("//")[-1].split("/")[0],
+                    service=cfg.get("model_id", model_key),
+                    tool_name="cogn-reflection",
+                    model_key=model_key,
+                    client_id="cogn-reflection",
+                    cost_usd=_cost, tokens_in=_ti, tokens_out=_to, unit="tokens",
+                ))
+        except Exception:
+            pass
     except Exception as e:
         log.warning(f"reflection: LLM call failed: {e}")
         return [], []
@@ -308,6 +326,24 @@ async def _scan_goal_completions(turns_text: str,
         msgs = [SystemMessage(content=_GOAL_SCAN_SYSTEM), HumanMessage(content=prompt)]
         response = await asyncio.wait_for(llm.ainvoke(msgs), timeout=timeout)
         raw = _content_to_str(response.content)
+        # Log per-call cost
+        try:
+            from cost_events import log_cost_event, _estimate_cost_for_model
+            _usage = getattr(response, "usage_metadata", None) or {}
+            _ti = _usage.get("input_tokens", 0) or 0
+            _to = _usage.get("output_tokens", 0) or 0
+            _cost = _estimate_cost_for_model(cfg, _ti, _to)
+            if _cost is not None:
+                asyncio.ensure_future(log_cost_event(
+                    provider=cfg.get("host", "unknown").split("//")[-1].split("/")[0],
+                    service=cfg.get("model_id", model_key),
+                    tool_name="cogn-reflection-goalscan",
+                    model_key=model_key,
+                    client_id="cogn-reflection",
+                    cost_usd=_cost, tokens_in=_ti, tokens_out=_to, unit="tokens",
+                ))
+        except Exception:
+            pass
     except Exception as e:
         log.warning(f"reflection: goal-scan LLM call failed: {e}")
         return []
@@ -533,6 +569,25 @@ async def _run_goal_health(
         msgs = [SystemMessage(content=_GOAL_HEALTH_SYSTEM), HumanMessage(content=prompt)]
         response = await asyncio.wait_for(llm.ainvoke(msgs), timeout=timeout)
         raw = _content_to_str(response.content)
+        # Log per-call cost
+        try:
+            from cost_events import log_cost_event, _estimate_cost_for_model
+            _cfg = LLM_REGISTRY[model_key]
+            _usage = getattr(response, "usage_metadata", None) or {}
+            _ti = _usage.get("input_tokens", 0) or 0
+            _to = _usage.get("output_tokens", 0) or 0
+            _cost = _estimate_cost_for_model(_cfg, _ti, _to)
+            if _cost is not None:
+                asyncio.ensure_future(log_cost_event(
+                    provider=_cfg.get("host", "unknown").split("//")[-1].split("/")[0],
+                    service=_cfg.get("model_id", model_key),
+                    tool_name="cogn-goal-health",
+                    model_key=model_key,
+                    client_id="cogn-reflection",
+                    cost_usd=_cost, tokens_in=_ti, tokens_out=_to, unit="tokens",
+                ))
+        except Exception:
+            pass
     except Exception as e:
         log.warning(f"goal_health: LLM call failed: {e}")
         return summary
@@ -930,7 +985,7 @@ async def run_reflection() -> dict:
         set_db_override(db_name)
         try:
             from memory import update_drives_from_goals
-            drive_summary = await update_drives_from_goals()
+            drive_summary = await update_drives_from_goals(interval_m=cfg.get("reflection_interval_m", 240))
             summary["drives_updated"] = summary.get("drives_updated", 0) + drive_summary.get("drives_updated", 0)
             log.info(
                 f"reflection[{db_name}]: drives — updated={drive_summary.get('drives_updated', 0)} "

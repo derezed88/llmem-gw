@@ -23,6 +23,9 @@ _GPS_THRESHOLD_M = 300      # max distance (meters) to claim a named location
 _BELIEF_TRUNC = 200         # max chars per belief in context block
 _RULE_RESULT_LINES = 3      # max result lines per matched rule
 _ROUTINE_MAX = 3            # max routines to inject even when triggered
+_MOVEMENT_THRESHOLD_M = 200 # min distance (meters) between fixes to count as movement
+_MOVEMENT_WINDOW_MIN = 15   # look back N minutes for movement detection
+_MOVEMENT_MIN_FIXES = 2     # need at least N fixes in window to assess movement
 
 # Routines are only injected when the user text touches a schedule-relevant topic.
 # Keeps technical/coding conversations clean of irrelevant lifestyle context.
@@ -97,6 +100,83 @@ def log_gps_async(lat: float, lon: float, accuracy_m: float | None, session_id: 
         except Exception as e:
             log.debug(f"log_gps_async insert failed: {e}")
     asyncio.ensure_future(_insert())
+
+
+# ── Movement detection ───────────────────────────────────────────────────────
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Equirectangular distance in meters — accurate enough for < 50 km."""
+    import math
+    dx = (lat2 - lat1) * 111320
+    dy = (lon2 - lon1) * 111320 * math.cos(math.radians((lat1 + lat2) / 2))
+    return math.sqrt(dx * dx + dy * dy)
+
+
+async def detect_movement(lat: float, lon: float) -> dict:
+    """Classify location state from recent GPS history.
+
+    Returns dict with:
+        known_place: str | None  — name of nearest known place (within threshold)
+        moving: bool             — significant position change in recent window
+        speed_kmh: float | None  — estimated speed if moving
+        location_state: str      — "stationary-known" | "stationary-unknown" | "moving"
+    """
+    result = {
+        "known_place": None,
+        "moving": False,
+        "speed_kmh": None,
+        "location_state": "stationary-unknown",
+    }
+
+    try:
+        # Check if current position is near a known place
+        result["known_place"] = await resolve_gps_location(lat, lon)
+
+        # Get recent GPS fixes for movement detection
+        rows = await _dicts(
+            f"SELECT latitude, longitude, created_at "
+            f"FROM mymcp.samaritan_location "
+            f"WHERE created_at >= DATE_SUB(NOW(), INTERVAL {_MOVEMENT_WINDOW_MIN} MINUTE) "
+            f"ORDER BY created_at DESC LIMIT 20"
+        )
+
+        if len(rows) < _MOVEMENT_MIN_FIXES:
+            # Not enough data — classify by known/unknown only
+            result["location_state"] = (
+                "stationary-known" if result["known_place"] else "stationary-unknown"
+            )
+            return result
+
+        # Compute max displacement from current position across recent fixes
+        max_dist = 0.0
+        oldest_row = rows[-1]
+        for row in rows:
+            d = _haversine_m(lat, lon, float(row["latitude"]), float(row["longitude"]))
+            if d > max_dist:
+                max_dist = d
+
+        if max_dist >= _MOVEMENT_THRESHOLD_M:
+            result["moving"] = True
+            result["location_state"] = "moving"
+            # Estimate speed from oldest fix in window to current position
+            oldest_lat = float(oldest_row["latitude"])
+            oldest_lon = float(oldest_row["longitude"])
+            total_dist = _haversine_m(lat, lon, oldest_lat, oldest_lon)
+            oldest_time = oldest_row["created_at"]
+            if isinstance(oldest_time, str):
+                oldest_time = datetime.fromisoformat(oldest_time)
+            elapsed_h = (datetime.now() - oldest_time).total_seconds() / 3600
+            if elapsed_h > 0:
+                result["speed_kmh"] = round(total_dist / 1000 / elapsed_h, 1)
+        else:
+            result["location_state"] = (
+                "stationary-known" if result["known_place"] else "stationary-unknown"
+            )
+
+    except Exception as e:
+        log.debug(f"detect_movement: {e}")
+
+    return result
 
 
 # ── Always-on context ─────────────────────────────────────────────────────────
@@ -210,8 +290,10 @@ async def build_context_prefix(
 
     # Fire all tasks in parallel
     gps_task: asyncio.Task | None = None
+    movement_task: asyncio.Task | None = None
     if lat is not None and lon is not None:
         gps_task = asyncio.create_task(resolve_gps_location(lat, lon))
+        movement_task = asyncio.create_task(detect_movement(lat, lon))
         log_gps_async(lat, lon, acc, "dispatch")  # fire-and-forget, not awaited
 
     # Only load routines when text is schedule/person/location relevant
@@ -221,7 +303,7 @@ async def build_context_prefix(
     )
     rules_task = asyncio.create_task(_run_dispatch_rules(text))
 
-    all_tasks = [t for t in [gps_task, routines_task, rules_task] if t is not None]
+    all_tasks = [t for t in [gps_task, movement_task, routines_task, rules_task] if t is not None]
 
     remaining = max(0.05, (_DEADLINE_MS / 1000) - (_time.monotonic() - t0))
     done, pending = await asyncio.wait(all_tasks, timeout=remaining)
@@ -237,6 +319,16 @@ async def build_context_prefix(
     if gps_task and gps_task in done and not gps_task.cancelled():
         try:
             location_name = gps_task.result()
+        except Exception:
+            pass
+
+    movement: dict | None = None
+    if movement_task and movement_task in done and not movement_task.cancelled():
+        try:
+            movement = movement_task.result()
+            # movement's known_place is authoritative (same query), sync location_name
+            if movement and movement.get("known_place"):
+                location_name = movement["known_place"]
         except Exception:
             pass
 
@@ -263,7 +355,20 @@ async def build_context_prefix(
     now = datetime.now()
     time_str = f"{now.strftime('%A')} {now.strftime('%H:%M')}"
     near_str = f" | near: {location_name}" if location_name else ""
-    header = f"[context: {time_str}{near_str}]"
+    # Location state: stationary-known, stationary-unknown, or moving (+ speed)
+    state_str = ""
+    if movement:
+        loc_state = movement.get("location_state", "")
+        if loc_state == "moving":
+            speed = movement.get("speed_kmh")
+            # Convert to mph for US customary
+            mph = round(speed * 0.621371, 0) if speed else None
+            speed_part = f" ~{int(mph)}mph" if mph else ""
+            state_str = f" | moving{speed_part}"
+        elif loc_state == "stationary-unknown":
+            state_str = " | new location"
+        # stationary-known: no extra tag needed — "near: <place>" already signals it
+    header = f"[context: {time_str}{near_str}{state_str}]"
 
     parts = [header]
 

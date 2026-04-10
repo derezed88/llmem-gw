@@ -133,6 +133,8 @@ async def cmd_help(client_id: str):
         "  !memstats                                 - memory system health dashboard\n"
         "  !membackfill                              - embed missing rows into Qdrant vector index\n"
         "  !memreconcile                             - remove orphaned Qdrant points not in MySQL\n"
+        "  !sourcebackfill                           - embed missing samaritan_sources rows into Qdrant\n"
+        "  !sourcereconcile                          - remove orphaned samaritan_sources Qdrant points\n"
         "  !memreview [approve N,N|reject N,N|clear] - AI topic review with HITL approval\n"
         "  !memreview types                          - review typed memory tables (goals, beliefs, etc.) [memory_types_enabled]\n"
         "  !memreview classify                       - classify untyped memory rows into memory types\n"
@@ -1031,6 +1033,179 @@ async def cmd_memreconcile(client_id: str, model_key: str = ""):
 
     summary = f"Reconciliation complete. {total_deleted}/{total_orphans} total orphans deleted across all collections."
     await push_tok(client_id, summary)
+    await conditional_push_done(client_id)
+
+
+async def cmd_sourcebackfill(client_id: str, model_key: str = ""):
+    """
+    !sourcebackfill — embed and upsert samaritan_sources rows missing from Qdrant.
+    Finds rows with embedding_model IS NULL and calls _upsert_source_vec for each.
+    Idempotent: safe to re-run.
+    """
+    set_model_context(model_key)
+    from database import fetch_dicts
+    from sources import _upsert_source_vec, SOURCE_COLLECTION
+
+    try:
+        from plugin_memory_vector_qdrant import get_vector_api
+        vec = get_vector_api()
+        if not vec:
+            await push_tok(client_id, "Vector plugin not available.")
+            await conditional_push_done(client_id)
+            return
+    except Exception as e:
+        await push_tok(client_id, f"Vector plugin error: {e}")
+        await conditional_push_done(client_id)
+        return
+
+    await push_tok(client_id, "Scanning samaritan_sources for missing embeddings...\n")
+
+    vec._ensure_collection(SOURCE_COLLECTION)
+    try:
+        qdrant_ids = vec.get_all_point_ids(collection=SOURCE_COLLECTION)
+    except Exception as e:
+        await push_tok(client_id, f"Failed to fetch Qdrant point IDs: {e}")
+        await conditional_push_done(client_id)
+        return
+
+    rows_needing = await fetch_dicts(
+        "SELECT id, canonical_url, title, summary, domain_tags, authority, "
+        "source_type, collection "
+        "FROM mymcp.samaritan_sources "
+        "WHERE embedding_model IS NULL AND status IN ('active','pending_embed')"
+    )
+    all_rows = await fetch_dicts("SELECT id FROM mymcp.samaritan_sources")
+    mysql_ids = {int(r["id"]) for r in all_rows}
+    orphan_count = len(qdrant_ids - mysql_ids)
+
+    report = (
+        f"Collection:     {SOURCE_COLLECTION}\n"
+        f"Qdrant points:  {len(qdrant_ids)}\n"
+        f"MySQL rows:     {len(mysql_ids)}\n"
+        f"In sync:        {len(qdrant_ids & mysql_ids)}\n"
+        f"Missing from Q: {len(rows_needing)}\n"
+        f"Orphans in Q:   {orphan_count} (use !sourcereconcile to clean)\n"
+    )
+    await push_tok(client_id, report)
+
+    if not rows_needing:
+        await push_tok(client_id, "No missing embeddings — all active sources embedded.\n")
+        await conditional_push_done(client_id)
+        return
+
+    await push_tok(client_id, f"Backfilling {len(rows_needing)} sources...\n")
+    succeeded = 0
+    failed = 0
+    for r in rows_needing:
+        src_id = int(r["id"])
+        tags_val = r.get("domain_tags")
+        if tags_val is None:
+            tags_str = None
+        elif isinstance(tags_val, (bytes, bytearray)):
+            tags_str = tags_val.decode("utf-8", errors="ignore")
+        elif isinstance(tags_val, str):
+            tags_str = tags_val
+        else:
+            import json as _json
+            tags_str = _json.dumps(tags_val)
+        try:
+            await _upsert_source_vec(
+                src_id=src_id,
+                canonical_url=r.get("canonical_url") or "",
+                title=r.get("title") or "",
+                summary=r.get("summary") or "",
+                domain_tags_json=tags_str,
+                authority=r.get("authority") or "unknown",
+                source_type=r.get("source_type") or "internet",
+                collection=r.get("collection") or "",
+            )
+            # _upsert_source_vec updates embedding_model on success; verify
+            check = await fetch_dicts(
+                f"SELECT embedding_model FROM mymcp.samaritan_sources WHERE id = {src_id}"
+            )
+            if check and check[0].get("embedding_model"):
+                succeeded += 1
+            else:
+                failed += 1
+        except Exception as e:
+            failed += 1
+            await push_tok(client_id, f"Row id={src_id} failed: {e}\n")
+
+    await push_tok(
+        client_id,
+        f"Done. {succeeded} embedded, {failed} failed, {len(rows_needing)} total processed.\n",
+    )
+    await conditional_push_done(client_id)
+
+
+async def cmd_sourcereconcile(client_id: str, model_key: str = ""):
+    """
+    !sourcereconcile — remove orphaned samaritan_sources qdrant points
+    whose MySQL rows no longer exist. Inverse of !sourcebackfill.
+    """
+    set_model_context(model_key)
+    from database import fetch_dicts
+    from sources import SOURCE_COLLECTION
+
+    try:
+        from plugin_memory_vector_qdrant import get_vector_api
+        vec = get_vector_api()
+        if not vec:
+            await push_tok(client_id, "Vector plugin not available.")
+            await conditional_push_done(client_id)
+            return
+    except Exception as e:
+        await push_tok(client_id, f"Vector plugin error: {e}")
+        await conditional_push_done(client_id)
+        return
+
+    await push_tok(client_id, "Scanning samaritan_sources collection for orphaned points...\n")
+
+    vec._ensure_collection(SOURCE_COLLECTION)
+    try:
+        qdrant_ids = vec.get_all_point_ids(collection=SOURCE_COLLECTION)
+    except Exception as e:
+        await push_tok(client_id, f"Failed to fetch Qdrant point IDs: {e}")
+        await conditional_push_done(client_id)
+        return
+
+    rows = await fetch_dicts("SELECT id FROM mymcp.samaritan_sources")
+    mysql_ids = {int(r["id"]) for r in rows}
+    orphan_ids = qdrant_ids - mysql_ids
+    in_sync = qdrant_ids & mysql_ids
+
+    report = (
+        f"Collection:     {SOURCE_COLLECTION}\n"
+        f"Qdrant points:  {len(qdrant_ids)}\n"
+        f"MySQL rows:     {len(mysql_ids)}\n"
+        f"In sync:        {len(in_sync)}\n"
+        f"Orphans found:  {len(orphan_ids)}\n"
+    )
+    await push_tok(client_id, report)
+
+    if not orphan_ids:
+        await push_tok(client_id, "No orphans in samaritan_sources collection.")
+        await conditional_push_done(client_id)
+        return
+
+    deleted = 0
+    batch_size = 500
+    orphan_list = sorted(orphan_ids)
+    for i in range(0, len(orphan_list), batch_size):
+        batch = orphan_list[i : i + batch_size]
+        try:
+            vec._qc.delete(
+                collection_name=SOURCE_COLLECTION,
+                points_selector=batch,
+            )
+            deleted += len(batch)
+        except Exception as e:
+            await push_tok(client_id, f"Delete batch failed at offset {i}: {e}\n")
+
+    await push_tok(
+        client_id,
+        f"Reconciliation complete. Deleted {deleted}/{len(orphan_ids)} orphaned points from samaritan_sources.",
+    )
     await conditional_push_done(client_id)
 
 
@@ -5797,6 +5972,10 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
                     await cmd_membackfill(client_id, session.get("model", ""))
                 elif cmd == "memreconcile":
                     await cmd_memreconcile(client_id, session.get("model", ""))
+                elif cmd == "sourcebackfill":
+                    await cmd_sourcebackfill(client_id, session.get("model", ""))
+                elif cmd == "sourcereconcile":
+                    await cmd_sourcereconcile(client_id, session.get("model", ""))
                 elif cmd == "memreview":
                     await cmd_memreview(client_id, arg, session.get("model", ""))
                 elif cmd == "memclassify":
@@ -5921,6 +6100,12 @@ async def process_request(client_id: str, text: str, raw_payload: dict, peer_ip:
             return
         if cmd == "memreconcile":
             await cmd_memreconcile(client_id, session.get("model", ""))
+            return
+        if cmd == "sourcebackfill":
+            await cmd_sourcebackfill(client_id, session.get("model", ""))
+            return
+        if cmd == "sourcereconcile":
+            await cmd_sourcereconcile(client_id, session.get("model", ""))
             return
         if cmd == "memreview":
             await cmd_memreview(client_id, arg, session.get("model", ""))

@@ -60,7 +60,7 @@ Then create `.system_prompt_swarm-peers` with content like:
 
 ```
 Known swarm peers:
-  NUC11:    http://192.168.x.x:8767
+  NUC11:    http://192.168.10.101:8767
   EC2-Hub:  http://54.210.x.x:8767
   Agent-B:  http://localhost:8777
 ```
@@ -77,7 +77,7 @@ Register it in the parent section's `[SECTIONS]` list and reload:
 Ask the NUC11 agent to run !model
 ```
 
-The LLM sees the peer list in its context, resolves "NUC11" to the URL, and calls `agent_call("http://192.168.x.x:8767", "!model")`.
+The LLM sees the peer list in its context, resolves "NUC11" to the URL, and calls `agent_call("http://192.168.10.101:8767", "!model")`.
 
 **Properties:**
 - Zero new code
@@ -111,7 +111,7 @@ CREATE TABLE swarm_agents (
 ```bash
 mysql -u $MYSQL_USER -p$MYSQL_PASS llmem_gw \
   -e "INSERT INTO swarm_agents (name, url, model, description)
-      VALUES ('NUC11', 'http://192.168.x.x:8767', 'qwen25', 'Local 7B model')
+      VALUES ('NUC11', 'http://192.168.10.101:8767', 'qwen25', 'Local 7B model')
       ON DUPLICATE KEY UPDATE url=VALUES(url), last_seen=NOW();"
 ```
 
@@ -149,7 +149,7 @@ Add `POST /api/v1/register` and `GET /api/v1/agents` endpoints to `plugin_client
 ```json
 {
   "name": "NUC11",
-  "url": "http://192.168.x.x:8767",
+  "url": "http://192.168.10.101:8767",
   "model": "qwen25",
   "description": "Local 7B model node"
 }
@@ -200,7 +200,7 @@ A new `!agent` command that manages a local name→URL mapping file (`swarm-agen
 
 The registry is persisted to `swarm-agents.json` in the instance directory, so it survives restarts. Each instance maintains its own independent list.
 
-`!agent call NUC11 !model` expands to `agent_call("http://192.168.x.x:8767", "!model")` internally, removing the need to know or type the URL.
+`!agent call NUC11 !model` expands to `agent_call("http://192.168.10.101:8767", "!model")` internally, removing the need to know or type the URL.
 
 Optionally, the `!agent list` output could be injected into the system prompt at context-build time so the LLM can also resolve names in natural language without explicit `!agent call` syntax.
 
@@ -246,7 +246,7 @@ These options are not mutually exclusive. A realistic deployment might combine t
 Without implementing any discovery scheme, the swarm works right now by specifying URLs directly:
 
 ```
-Use agent_call to ask the agent at http://192.168.x.x:8767 to run !model
+Use agent_call to ask the agent at http://192.168.10.101:8767 to run !model
 ```
 
 The quickest ergonomic improvement with no code is Option 1 — add a `.system_prompt_swarm-peers` file with your known agents and reload. The LLM will resolve names from context for the rest of the session.

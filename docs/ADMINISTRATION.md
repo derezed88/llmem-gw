@@ -84,16 +84,10 @@ python llmemctl.py disable <plugin_name>   # disable a plugin
 | `plugin_client_slack` | client_interface | Slack bidirectional client (see tuning below) |
 | `plugin_database_mysql` | data_tool | `db_query` tool |
 | `plugin_storage_googledrive` | data_tool | `google_drive` tool |
-| `plugin_search_ddgs` | data_tool | `search_ddgs` tool (no key required) |
-| `plugin_search_tavily` | data_tool | `search_tavily` tool |
-| `plugin_search_xai` | data_tool | `search_xai` tool |
-| `plugin_search_google` | data_tool | `search_google` tool |
-| `plugin_search_perplexity` | data_tool | `perplexity_search`, `sonar_answer` tools |
-| `plugin_calendar_google` | data_tool | Google Calendar integration |
-| `plugin_geocode_google` | data_tool | Google Geocoding API |
-| `plugin_places_google` | data_tool | Google Places API |
-| `plugin_weather_google` | data_tool | Google Weather API |
-| `plugin_sms_proxy` | data_tool | SMS via proxy server |
+| `plugin_search_ddgs` | data_tool | `ddgs_search` tool (no key required) |
+| `plugin_search_tavily` | data_tool | `tavily_search` tool |
+| `plugin_search_xai` | data_tool | `xai_search` tool |
+| `plugin_search_google` | data_tool | `google_search` tool |
 | `plugin_urlextract_tavily` | data_tool | `url_extract` tool |
 | `plugin_tmux` | data_tool | PTY shell sessions (`tmux_new`, `tmux_exec`, etc.) |
 

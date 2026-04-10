@@ -55,6 +55,7 @@ ALL_EVENTS: list[str] = [
     "task_completed",
     "belief_saved",
     "contradiction_detected",
+    "interrupt",
     "prospective_reminder",
     "temporal_pattern_inferred",
     "tool_called",

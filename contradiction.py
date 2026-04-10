@@ -229,6 +229,24 @@ async def _call_llm(model_key: str, pairs_text: str) -> list[dict]:
         msgs = [SystemMessage(content=_SYSTEM_PROMPT), HumanMessage(content=prompt)]
         response = await _asyncio.wait_for(llm.ainvoke(msgs), timeout=timeout)
         raw = _content_to_str(response.content)
+        # Log per-call cost
+        try:
+            from cost_events import log_cost_event, _estimate_cost_for_model
+            _usage = getattr(response, "usage_metadata", None) or {}
+            _ti = _usage.get("input_tokens", 0) or 0
+            _to = _usage.get("output_tokens", 0) or 0
+            _cost = _estimate_cost_for_model(cfg, _ti, _to)
+            if _cost is not None:
+                _asyncio.ensure_future(log_cost_event(
+                    provider=cfg.get("host", "unknown").split("//")[-1].split("/")[0],
+                    service=cfg.get("model_id", model_key),
+                    tool_name="cogn-contradiction",
+                    model_key=model_key,
+                    client_id="cogn-contradiction",
+                    cost_usd=_cost, tokens_in=_ti, tokens_out=_to, unit="tokens",
+                ))
+        except Exception:
+            pass
     except Exception as e:
         log.warning(f"contradiction: LLM call failed: {e}")
         return []

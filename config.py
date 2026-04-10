@@ -14,6 +14,9 @@ LLM_MODELS_FILE = os.path.join(BASE_DIR, "llm-models.json")
 LLM_TOOLS_FILE = os.path.join(BASE_DIR, "llm-tools.json")
 PLUGINS_ENABLED_FILE = os.path.join(BASE_DIR, "plugins-enabled.json")
 
+# MCP Direct (plugin_mcp_direct SSE transport)
+MCP_DIRECT_URL = os.getenv("MCP_DIRECT_URL", "http://localhost:8769")
+
 # Google Drive
 DRIVE_FOLDER_ID = os.getenv("FOLDER_ID")
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]

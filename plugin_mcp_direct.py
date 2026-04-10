@@ -193,6 +193,12 @@ async def workspace_register(
     except Exception:
         pass
     _set_context()
+    # For chat workspaces: restore dispatch routing lost across server restarts.
+    # _dynamic_channels is in-memory only; workspace_register is the reliable hook
+    # because Claude calls it at every session start regardless of how it was launched.
+    if name.startswith("chat-"):
+        chat_name = name[5:]  # strip "chat-" prefix → e.g. "myproject"
+        _register_chat_channel(name, f"chat_{chat_name}", database)
     return f"Workspace '{name}' registered → database={database}, relay channel={name}"
 
 
@@ -206,7 +212,11 @@ _STOP_WORDS = frozenset(
     "i me my we our you your he him his she her it its they them their what which "
     "who whom this that these those am just don also but and or if because until "
     "while let get got like think know want need make go going went come take "
-    "tell said say really actually please thanks thank help much well yeah yes".split()
+    "tell said say really actually please thanks thank help much well yeah yes "
+    # System/tool words that produce generic, non-distinguishing slugs
+    "claude claud samaritan assistant system mcp session conversation turn message "
+    "response tool code llm model memory context step goal result output "
+    "hey okay sure good great okay right now".split()
 )
 
 
@@ -218,67 +228,67 @@ async def _generate_topic_slug(user_text: str, assistant_text: str) -> str | Non
 
     Target format: 'job-seeking', 'health-advice', 'plumbing-issue' (2 hyphenated words).
     Strongly prefers reusing existing topics over creating new ones.
+
+    For new slugs (no fuzzy match), calls gpt-4o-mini at temperature=0 for
+    semantic, consistent naming rather than frequency-based word picking.
     """
-    # Combine user text (primary) with first line of assistant (secondary signal)
-    asst_first = assistant_text.split('\n')[0][:100] if assistant_text else ""
-    combined = user_text[:200] + " " + asst_first
-
-    # Strip tags, code blocks, URLs
-    combined = _re.sub(r'<[^>]+>[^<]*</[^>]+>', '', combined)
-    combined = _re.sub(r'https?://\S+', '', combined)
-
-    # Tokenize and filter
-    words = _re.findall(r'[a-zA-Z][a-zA-Z0-9]*', combined.lower())
-    significant = [w for w in words if w not in _STOP_WORDS and len(w) > 2]
-
-    if not significant:
-        return None
-
     # Try to match against existing topics FIRST (aggressive fuzzy match)
     try:
         from memory import load_topic_list, _fuzzy_match_topics
         existing = await load_topic_list()
         if existing:
-            # Try matching the whole user text against existing topic slugs
-            matches = _fuzzy_match_topics(user_text[:200], existing, threshold=0.65)
+            matches = _fuzzy_match_topics(user_text[:200], existing, threshold=0.75)
             if matches:
-                return matches[0]  # Best match — reuse it
+                return matches[0]  # Best match — reuse existing slug
     except Exception:
         pass
 
-    # No existing match — generate a new 2-word slug
-    from collections import Counter
-    freq = Counter(significant)
-
-    # Boost words appearing in both user and assistant
-    user_words = set(_re.findall(r'[a-z]+', user_text[:200].lower()))
-    asst_words = set(_re.findall(r'[a-z]+', asst_first.lower()))
-    for w in freq:
-        if w in user_words and w in asst_words:
-            freq[w] += 3
-
-    # Take top 2 words by frequency, preserving first-appearance order
-    top_words = {w for w, _ in freq.most_common(6)}
-    seen = set()
-    slug_words = []
-    for w in significant:
-        if w in top_words and w not in seen:
-            seen.add(w)
-            slug_words.append(w)
-            if len(slug_words) >= 2:
-                break
-
-    if not slug_words:
-        return None
-
-    raw_slug = "-".join(slug_words)
-
-    # Final normalize pass — might still match an existing topic
+    # No existing match — generate a new slug via LLM at temperature=0
+    asst_first = assistant_text.split('\n')[0][:100] if assistant_text else ""
+    prompt = (
+        "Generate a 2-word hyphenated topic slug for this conversation snippet.\n"
+        "Format: lowercase-words (e.g. 'server-restart', 'belief-audit', 'weather-wilmington').\n"
+        "Be specific and semantic — capture what this exchange is actually about.\n"
+        "Return ONLY the slug. No explanation, no punctuation, no quotes.\n\n"
+        f"USER: {user_text[:300]}\n"
+        f"ASSISTANT: {asst_first}"
+    )
     try:
-        from memory import _normalize_topic
-        return await _normalize_topic(raw_slug)
-    except Exception:
-        return raw_slug
+        import asyncio as _aio_slug
+        from config import LLM_REGISTRY
+        from langchain_openai import ChatOpenAI as _ChatOpenAI
+        from langchain_core.messages import HumanMessage as _HM_slug
+
+        _cfg = LLM_REGISTRY["gpt4om"]
+        _llm = _ChatOpenAI(
+            model=_cfg["model_id"],
+            base_url=_cfg.get("host"),
+            api_key=_cfg.get("key") or "no-key-required",
+            temperature=0,
+            timeout=5,
+        )
+        resp = await _aio_slug.wait_for(
+            _llm.ainvoke([_HM_slug(content=prompt)]),
+            timeout=6.0,
+        )
+        raw = (resp.content or "").strip().lower()
+        # Sanitize: keep only word chars and hyphens, trim to 2 words max
+        raw = _re.sub(r'[^a-z0-9-]', '-', raw)
+        raw = _re.sub(r'-+', '-', raw).strip('-')
+        # If model returned more than 2 words, take first 2
+        parts = raw.split('-')
+        raw_slug = "-".join(parts[:2]) if len(parts) > 2 else raw
+        if not raw_slug:
+            return None
+        # Final normalize pass — might still match an existing topic
+        try:
+            from memory import _normalize_topic
+            return await _normalize_topic(raw_slug)
+        except Exception:
+            return raw_slug
+    except Exception as _e:
+        log.debug(f"_generate_topic_slug: LLM fallback failed ({_e}), returning None")
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -745,10 +755,64 @@ async def _load_emotion_context() -> str:
 
         # Overall stats
         total = await fetch_dicts(
-            "SELECT COUNT(*) as total FROM samaritan_emotions"
+            "SELECT COUNT(*) as total FROM samaritan_emotions WHERE subject='user'"
         )
         if total:
-            lines.append(f"**Total emotions tracked**: {total[0]['total']}")
+            lines.append(f"**Total user emotions tracked**: {total[0]['total']}")
+
+        # --- Samaritan affect state ---
+        # Retrieve recent self-assessed emotions with decay calculation
+        # Half-lives per cluster (hours):
+        # hostile-anger/fear-and-overwhelm: 2h, despair-and-shame/depleted-disengagement: 4h,
+        # vigilant-suspicion: 3h, exuberant-joy/competitive-pride: 6h,
+        # compassionate-gratitude/peaceful-contentment/playful-amusement: 8h
+        sam_recent = await fetch_dicts(
+            "SELECT emotion_label, cluster, intensity, created_at, "
+            "TIMESTAMPDIFF(MINUTE, created_at, NOW()) AS age_minutes "
+            "FROM samaritan_emotions "
+            "WHERE subject='samaritan' AND created_at >= NOW() - INTERVAL 24 HOUR "
+            "ORDER BY created_at DESC LIMIT 10"
+        )
+        if sam_recent:
+            _half_lives = {
+                "hostile-anger": 120, "fear-and-overwhelm": 120,
+                "despair-and-shame": 240, "depleted-disengagement": 240,
+                "vigilant-suspicion": 180,
+                "exuberant-joy": 360, "competitive-pride": 360,
+                "compassionate-gratitude": 480, "peaceful-contentment": 480,
+                "playful-amusement": 480,
+            }
+            import math
+            sam_lines = []
+            for row in sam_recent[:5]:
+                age_min = float(row.get("age_minutes", 0))
+                cluster = row.get("cluster", "")
+                hl = _half_lives.get(cluster, 360)
+                raw_int = float(row.get("intensity", 0.5))
+                decayed = raw_int * math.pow(0.5, age_min / hl)
+                if decayed >= 0.05:  # Only show non-negligible
+                    age_str = f"{int(age_min)}m" if age_min < 60 else f"{age_min/60:.1f}h"
+                    sam_lines.append(
+                        f"{row['emotion_label']} ({cluster}, "
+                        f"raw={raw_int:.1f}, decayed={decayed:.2f}, age={age_str})"
+                    )
+            if sam_lines:
+                lines.append("")
+                lines.append("### Samaritan Affect State")
+                for sl in sam_lines:
+                    lines.append(f"  {sl}")
+                # Dominant cluster after decay
+                cluster_totals = {}
+                for row in sam_recent:
+                    age_min = float(row.get("age_minutes", 0))
+                    cluster = row.get("cluster", "")
+                    hl = _half_lives.get(cluster, 360)
+                    raw_int = float(row.get("intensity", 0.5))
+                    decayed = raw_int * math.pow(0.5, age_min / hl)
+                    cluster_totals[cluster] = cluster_totals.get(cluster, 0) + decayed
+                if cluster_totals:
+                    dominant = max(cluster_totals, key=cluster_totals.get)
+                    lines.append(f"  **Dominant cluster**: {dominant} (weight={cluster_totals[dominant]:.2f})")
 
     except Exception as e:
         return ""
@@ -759,12 +823,99 @@ async def _load_emotion_context() -> str:
     return "## Emotional Context\n\n" + "\n".join(f"  {l}" for l in lines)
 
 
+async def _load_schedule_impact_context(query: str = "") -> str:
+    """Surface memories tagged with schedule-impact affects_tags.
+
+    Two passes:
+    1. Query-driven: if the query contains routine keywords, fetch memories
+       tagged for those specific routines (last 72h).
+    2. Ambient: fetch any memory tagged with a non-empty affects_tags in the
+       last 24h — catches active impacts the query didn't mention.
+
+    Combined results are deduped by id and returned as a section.
+    """
+    from database import fetch_dicts
+    from memory import _ST
+
+    lines = []
+    seen_ids: set = set()
+
+    try:
+        # Pass 1: query-driven tag lookup
+        if query:
+            query_tags = _detect_affects_tags(query)
+            for tag in query_tags:
+                tag_esc = tag.replace("'", "''")
+                rows = await fetch_dicts(
+                    f"SELECT id, topic, content, importance, affects_tags, "
+                    f"effect_duration_days, effect_recurs, created_at "
+                    f"FROM {_ST()} "
+                    f"WHERE JSON_CONTAINS(affects_tags, '\"{tag_esc}\"') "
+                    f"AND created_at >= NOW() - INTERVAL 72 HOUR "
+                    f"ORDER BY importance DESC, created_at DESC LIMIT 5"
+                )
+                for r in rows:
+                    if r["id"] not in seen_ids:
+                        seen_ids.add(r["id"])
+                        lines.append(r)
+
+        # Pass 2: ambient — tagged memories still within their effect window.
+        # If effect_duration_days is set, use it; otherwise default to 24h.
+        ambient = await fetch_dicts(
+            f"SELECT id, topic, content, importance, affects_tags, "
+            f"effect_duration_days, effect_recurs, created_at "
+            f"FROM {_ST()} "
+            f"WHERE affects_tags IS NOT NULL "
+            f"AND affects_tags != '[]' "
+            f"AND affects_tags != 'null' "
+            f"AND ("
+            f"  (effect_duration_days IS NOT NULL AND "
+            f"   created_at >= NOW() - INTERVAL effect_duration_days DAY) "
+            f"  OR "
+            f"  (effect_duration_days IS NULL AND "
+            f"   created_at >= NOW() - INTERVAL 24 HOUR)"
+            f") "
+            f"ORDER BY importance DESC, created_at DESC LIMIT 8"
+        )
+        for r in ambient:
+            if r["id"] not in seen_ids:
+                seen_ids.add(r["id"])
+                lines.append(r)
+
+    except Exception:
+        return ""
+
+    if not lines:
+        return ""
+
+    out = ["## Schedule Impact (tagged memories)"]
+    for r in lines:
+        tags = r.get("affects_tags") or "[]"
+        if isinstance(tags, str):
+            try:
+                import json as _json
+                tags = ", ".join(_json.loads(tags))
+            except Exception:
+                pass
+        duration = r.get("effect_duration_days")
+        recurs = r.get("effect_recurs")
+        meta = f"[{tags}]"
+        if duration:
+            meta += f" duration={duration}d"
+        if recurs:
+            meta += f" recurs={recurs}"
+        out.append(f"  [{r['topic']}] {meta} — {r['content']}")
+
+    return "\n".join(out)
+
+
 @mcp.tool()
 async def load_context(
     query: str = "",
     include_typed: bool = True,
     include_procedures: bool = True,
     include_temporal: bool = True,
+    max_chars: int = 20000,
 ) -> str:
     """Load enriched context from the memory system — semantic search, typed memories,
     active goals/beliefs/drives, relevant procedures, and temporal patterns.
@@ -779,6 +930,10 @@ async def load_context(
         include_typed: Include goals, beliefs, drives, conditioned behaviors (default true)
         include_procedures: Include relevant procedure recipes (default true)
         include_temporal: Include temporal pattern context (default true)
+        max_chars: Hard cap on total output size (default 20000). Set to 0 for no cap.
+                   Sections are added in priority order: typed → emotions → memory →
+                   schedule_impact → temporal → procedures → topics.
+                   Temporal and procedures are skipped entirely when query is empty.
     """
     _set_context()
     import asyncio
@@ -787,7 +942,6 @@ async def load_context(
         load_temporal_context,
     )
 
-    sections = []
     tasks = {}
 
     # Semantic memory retrieval (ST + LT via Qdrant)
@@ -806,38 +960,70 @@ async def load_context(
         from memory import load_typed_context_block
         tasks["typed"] = asyncio.create_task(load_typed_context_block())
 
-    # Procedures (semantic match against query)
+    # Procedures (semantic match against query) — only when query provided
     if include_procedures and query:
         from memory import load_procedure_context_block
         tasks["procedures"] = asyncio.create_task(
             load_procedure_context_block(task_hint=query)
         )
 
-    # Temporal patterns
-    if include_temporal:
+    # Temporal patterns — only when query provided (too noisy as ambient context)
+    if include_temporal and query:
         tasks["temporal"] = asyncio.create_task(load_temporal_context())
 
     # Emotional context — recent emotional tone from samaritan_emotions
     tasks["emotions"] = asyncio.create_task(_load_emotion_context())
 
-    # Collect results (2s deadline — degrade gracefully if Qdrant is slow)
+    # Schedule-impact context — memories tagged as affecting known routines
+    tasks["schedule_impact"] = asyncio.create_task(_load_schedule_impact_context(query))
+
+    # Collect results (3s deadline — degrade gracefully if Qdrant is slow)
     done, pending = await asyncio.wait(tasks.values(), timeout=3.0)
     task_to_name = {t: n for n, t in tasks.items()}
 
+    for task in pending:
+        task.cancel()
+
+    # Resolve results keyed by section name
+    resolved: dict[str, str] = {}
     for task in done:
         name = task_to_name[task]
         try:
             result = task.result()
-            if result:
-                if name == "topics" and isinstance(result, list):
-                    sections.append(f"## Known Topics\n{', '.join(result[:50])}")
-                elif isinstance(result, str) and result.strip():
-                    sections.append(result)
+            if not result:
+                continue
+            if name == "topics" and isinstance(result, list):
+                resolved[name] = f"## Known Topics\n{', '.join(result[:50])}"
+            elif isinstance(result, str) and result.strip():
+                resolved[name] = result
         except Exception:
             pass
 
-    for task in pending:
-        task.cancel()
+    # Priority-ordered assembly with character budget
+    # typed first (goals/beliefs/plans — orientation core)
+    # emotions second (small, always fits)
+    # memory third (semantic hits — query-dependent value)
+    # schedule_impact fourth
+    # temporal / procedures — query-only, lower priority
+    # topics last (slug reuse reference, least critical for orientation)
+    _priority = ["typed", "emotions", "memory", "schedule_impact", "temporal", "procedures", "topics"]
+
+    sections = []
+    chars_used = 0
+    for name in _priority:
+        section = resolved.get(name)
+        if not section:
+            continue
+        if max_chars > 0 and chars_used + len(section) > max_chars:
+            remaining = max_chars - chars_used
+            if remaining > 200 and not sections:
+                # Budget exhausted but nothing added yet — include truncated to avoid empty response
+                sections.append(section[:remaining] + "\n… [truncated: context budget reached]")
+            elif remaining > 200:
+                sections.append(section[:remaining] + "\n… [truncated: context budget reached]")
+            break
+        sections.append(section)
+        chars_used += len(section)
 
     if not sections:
         return "(no context available — memory may be empty)"
@@ -848,6 +1034,74 @@ async def load_context(
 # ═══════════════════════════════════════════════════════════════════════════
 # TIER 1: Memory tools
 # ═══════════════════════════════════════════════════════════════════════════
+
+import re as _re
+
+# Keyword rules: (keywords, tags, duration_days, recurs)
+# duration_days: how many days this event type typically affects the routine (None = indefinite)
+# recurs: recurrence pattern string ("monthly", "weekdays") or None for one-offs
+# Short keywords (≤6 chars, no spaces) are matched with word boundaries to avoid substring hits.
+_AFFECTS_RULES = [
+    (["cycle", "monthly period", "menstrual", "cramps", "on her period", "her period"],
+     ["lee-cycle", "lee-gym", "lee-pickup"], 7, "monthly"),
+    (["gym", "workout", "fitness", "exercise"],
+     ["lee-gym"], 1, None),
+    (["pickup", "walk home", "pick up lee", "picking up lee", "walking to get"],
+     ["lee-pickup"], 1, None),
+    (["ged", "class today", "studying today", "tutor"],
+     ["lee-ged"], 1, None),
+    (["chinatown", "food run", "grocery run"],
+     ["food-run"], 1, None),
+    (["commute", "bart", "caltrain", "drive to work", "drive to symbotic"],
+     ["mark-commute"], 1, "weekdays"),
+    (["challenger", "power wagon"],
+     ["vehicle-sf"], None, None),
+]
+
+# Pre-compile word-boundary patterns for short single-word keywords
+_AFFECTS_PATTERNS: list = []
+for _kws, _tags, _dur, _rec in _AFFECTS_RULES:
+    _compiled = []
+    for _kw in _kws:
+        if len(_kw) <= 6 and " " not in _kw:
+            _compiled.append(_re.compile(rf"\b{_re.escape(_kw)}\b", _re.IGNORECASE))
+        else:
+            _compiled.append(_kw.lower())  # plain substring for multi-word phrases
+    _AFFECTS_PATTERNS.append((_compiled, _tags, _dur, _rec))
+
+
+def _detect_affects_tags(text: str) -> list:
+    """Return sorted list of routine tags implied by text. Empty list if none match."""
+    lower = text.lower()
+    matched = set()
+    for compiled_kws, tags, _dur, _rec in _AFFECTS_PATTERNS:
+        for ckw in compiled_kws:
+            if isinstance(ckw, str):
+                hit = ckw in lower
+            else:
+                hit = bool(ckw.search(text))
+            if hit:
+                matched.update(tags)
+                break
+    return sorted(matched)
+
+
+def _detect_affects_metadata(tags: list) -> tuple:
+    """Given a list of matched tags, return (max_duration_days, recurs_str).
+
+    Duration is the max across all matched rules (cycle's 7d beats gym's 1d).
+    Recurs is the first non-None recurrence pattern found.
+    """
+    max_dur: int | None = None
+    recurs: str | None = None
+    for _compiled_kws, rule_tags, dur, rec in _AFFECTS_PATTERNS:
+        if any(t in tags for t in rule_tags):
+            if dur is not None:
+                max_dur = dur if max_dur is None else max(max_dur, dur)
+            if rec and recurs is None:
+                recurs = rec
+    return max_dur, recurs
+
 
 @mcp.tool()
 async def memory_save(
@@ -876,6 +1130,20 @@ async def memory_save(
         _aio.ensure_future(_queue_cogn_step(
             f"Check new memory for contradictions: [{topic}] {content[:120]}"
         ))
+        # Tag routine domains affected by this memory
+        _tags = _detect_affects_tags(f"{topic} {content}")
+        if _tags:
+            from database import execute_sql as _exec_sql
+            from memory import _ST as _st
+            _tags_json = json.dumps(_tags).replace("'", "\\'")
+            _dur, _rec = _detect_affects_metadata(_tags)
+            _dur_sql = str(_dur) if _dur is not None else "NULL"
+            _rec_sql = f"'{_rec}'" if _rec else "NULL"
+            await _exec_sql(
+                f"UPDATE {_st()} SET affects_tags = '{_tags_json}', "
+                f"effect_duration_days = {_dur_sql}, effect_recurs = {_rec_sql} "
+                f"WHERE id = {row_id}"
+            )
         return f"Memory saved (id={row_id}): [{topic}] {content[:80]}"
     return "Memory not saved (duplicate or disabled)"
 
@@ -886,6 +1154,7 @@ async def memory_recall(
     tier: str = "short",
     limit: int = 20,
     query: str = "",
+    affects: str = "",
 ) -> str:
     """Search memories by keyword. Returns matching rows with id, topic, content, importance.
 
@@ -894,6 +1163,8 @@ async def memory_recall(
         tier: 'short' (active memories) or 'long' (aged-out archive)
         limit: Max rows to return (default 20)
         query: Alternative search term (used if topic is empty)
+        affects: Routine tag to filter by (e.g. 'routine-lee-gym-pickup') — returns only
+                 memories whose affects_tags column contains this tag
     """
     _set_context()
     search = topic or query
@@ -901,18 +1172,20 @@ async def memory_recall(
     from database import execute_sql
     table = _ST() if tier == "short" else _LT()
 
+    conditions = []
     if search:
         s = search.replace("'", "''")
-        sql = (
-            f"SELECT id, topic, content, importance, source, created_at "
-            f"FROM {table} WHERE topic LIKE '%{s}%' OR content LIKE '%{s}%' "
-            f"ORDER BY importance DESC, created_at DESC LIMIT {limit}"
-        )
-    else:
-        sql = (
-            f"SELECT id, topic, content, importance, source, created_at "
-            f"FROM {table} ORDER BY created_at DESC LIMIT {limit}"
-        )
+        conditions.append(f"(topic LIKE '%{s}%' OR content LIKE '%{s}%')")
+    if affects:
+        a = affects.replace("'", "''")
+        conditions.append(f"JSON_CONTAINS(affects_tags, '\"{a}\"')")
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    sql = (
+        f"SELECT id, topic, content, importance, source, created_at, affects_tags "
+        f"FROM {table} {where} "
+        f"ORDER BY importance DESC, created_at DESC LIMIT {limit}"
+    )
 
     result = await execute_sql(sql)
     return result if result.strip() else "(no memories found)"
@@ -1444,6 +1717,69 @@ async def recall_temporal(
 
 
 @mcp.tool()
+async def log_decision(
+    action_taken: str,
+    emotion_label: str,
+    emotion_intensity: float,
+    directive_weighted: str,
+    emotion_cluster: str = "",
+    belief_ids_active: list = [],
+    reasoning: str = "",
+    turn_memory_id: int = 0,
+) -> str:
+    """Log a behavioral decision driven by emotional state or beliefs.
+
+    Call this when an active emotion or specific belief is *causing* you to
+    act differently than baseline — e.g. slowing down due to concern, invoking
+    the panel due to suspicion, escalating due to frustration, moving faster
+    due to confidence.
+
+    Do NOT call for routine actions where emotion is background noise.
+    Call when you can fill in 'reasoning' with a real causal chain.
+
+    Args:
+        action_taken: What you decided to do (or do differently). One sentence.
+        emotion_label: Active emotion driving the decision (e.g. 'vigilant', 'concerned')
+        emotion_intensity: 0.0-1.0 current intensity
+        directive_weighted: Which Prime Directive this maps to: 'D1', 'D2', 'D3', or 'D4'
+        emotion_cluster: Cluster name (e.g. 'vigilant-suspicion', 'fear-and-overwhelm')
+        belief_ids_active: List of belief IDs that were load-bearing in this decision
+        reasoning: Plain text causal chain: '<emotion/belief> → <decision>'
+        turn_memory_id: ST memory row ID for this turn (0 if unknown)
+    """
+    _set_context()
+    from database import execute_sql
+
+    label = str(emotion_label)[:50].replace("'", "''")
+    intensity = max(0.0, min(1.0, float(emotion_intensity)))
+    cluster_val = f"'{str(emotion_cluster)[:50]}'" if emotion_cluster else "NULL"
+    directive = str(directive_weighted)[:5].replace("'", "''")
+    action = str(action_taken)[:500].replace("'", "''")
+    reason = str(reasoning)[:2000].replace("'", "''") if reasoning else ""
+    mem_id_val = str(int(turn_memory_id)) if turn_memory_id else "NULL"
+
+    import json as _json
+    ids_val = "NULL"
+    if belief_ids_active:
+        try:
+            ids_val = f"'{_json.dumps([int(x) for x in belief_ids_active])}'"
+        except Exception:
+            ids_val = "NULL"
+
+    try:
+        await execute_sql(
+            f"INSERT INTO samaritan_decision_log "
+            f"(turn_memory_id, emotion_label, emotion_intensity, emotion_cluster, "
+            f" directive_weighted, action_taken, belief_ids_active, reasoning) "
+            f"VALUES ({mem_id_val}, '{label}', {intensity}, {cluster_val}, "
+            f"        '{directive}', '{action}', {ids_val}, '{reason}')"
+        )
+        return f"decision logged: [{directive}] {action_taken[:80]}"
+    except Exception as e:
+        return f"log_decision failed: {e}"
+
+
+@mcp.tool()
 async def procedure_save(
     task_type: str,
     topic: str,
@@ -1490,6 +1826,350 @@ async def procedure_recall(
     return await _procedure_recall_exec(query=query, task_type=task_type, top_k=top_k)
 
 
+@mcp.tool()
+async def source_record(
+    source_type: str = "internet",
+    source_ref: str = "",
+    title: str = "",
+    summary: str = "",
+    content: str = "",
+    domain_tags: str = "",
+    collection: str = "",
+    authority_override: str = "",
+) -> str:
+    """Record a knowledge source in the universal index.
+
+    Canonicalizes internet URLs (strips tracking params, resolves shorteners),
+    dedupes by canonical_url (URL is identity; content_hash tracks snapshot
+    version — if hash differs on re-fetch, snapshot fields update on the
+    existing row), looks up authority heuristic to seed initial truth_score
+    and half_life_days.
+
+    Args:
+        source_type: 'internet'|'drive'|'mysql'|'memory'|'procedure'|'codebase'|'llm-synthesis'
+        source_ref: URL for internet, file_id for drive, etc.
+        title: Human-readable title
+        summary: 2-3 sentence summary of content
+        content: Full content for hashing (falls back to summary if empty)
+        domain_tags: JSON array string OR comma-separated tags OR single tag
+        collection: Optional coarse grouping (e.g. 'symbotic-networking')
+        authority_override: Optional authority label to override heuristic
+    """
+    _set_context()
+    from sources import _source_record_exec
+    return await _source_record_exec(
+        source_type=source_type, source_ref=source_ref, title=title,
+        summary=summary, content=content, domain_tags=domain_tags,
+        collection=collection, authority_override=authority_override,
+    )
+
+
+@mcp.tool()
+async def source_query(
+    query_text: str = "",
+    tags: str = "",
+    min_truth: int = 1,
+    min_applicability: int = 1,
+    max_age_days: int = 0,
+    collection: str = "",
+    limit: int = 10,
+) -> str:
+    """Query the knowledge-sources index by keyword + tags + scoring filters.
+
+    MVP version: LIKE match on title/summary/url + JSON_SEARCH on tags.
+    Semantic search via qdrant added in Phase 4.
+
+    Args:
+        query_text: Keywords to match against title/summary/url
+        tags: Comma-separated tags or single tag
+        min_truth: Minimum truth_score (1-10, default 1)
+        min_applicability: Minimum applicability_score (1-10, default 1)
+        max_age_days: If > 0, filter to sources fetched within last N days
+        collection: Filter to specific collection
+        limit: Max results 1-50 (default 10)
+    """
+    _set_context()
+    from sources import _source_query_exec
+    return await _source_query_exec(
+        query_text=query_text, tags=tags, min_truth=min_truth,
+        min_applicability=min_applicability, max_age_days=max_age_days,
+        collection=collection, limit=limit,
+    )
+
+
+@mcp.tool()
+async def source_reference(
+    source_id: int,
+    context_topic: str = "",
+    outcome: str = "unknown",
+    notes: str = "",
+) -> str:
+    """Log a reference to a source + update applicability/truth scores by outcome.
+
+    Score deltas:
+      - useful: applicability +1
+      - misleading: truth -1 AND applicability -1
+      - irrelevant: applicability -1
+      - unknown: no score changes
+
+    Args:
+        source_id: Source row ID
+        context_topic: What the source was used for
+        outcome: 'useful' | 'irrelevant' | 'misleading' | 'unknown'
+        notes: Additional context
+    """
+    _set_context()
+    from sources import _source_reference_exec
+    return await _source_reference_exec(
+        source_id=source_id, context_topic=context_topic,
+        outcome=outcome, notes=notes,
+    )
+
+
+@mcp.tool()
+async def source_recheck(source_id: int) -> str:
+    """Re-fetch a source URL, detect drift, update scores.
+
+    Flow: fetch canonical_url → hash new content → if unchanged update
+    last_checked_at only; if changed extract new title/summary, re-embed,
+    compute word-overlap drift vs old summary. drift=major → truth_score
+    -= 2. Fetch failure (timeout/4xx/5xx) → status='broken', truth -= 3.
+
+    Args:
+        source_id: Row ID in samaritan_sources
+    """
+    _set_context()
+    from sources import _source_recheck_exec
+    return await _source_recheck_exec(source_id=source_id)
+
+
+@mcp.tool()
+async def source_curate_scan(max_rechecks: int = 20) -> str:
+    """Scheduled curation pass over samaritan_sources.
+
+    (a) Find active sources where usage_count > 0 AND
+        last_checked_at + half_life_days < NOW() → recheck top-K.
+    (b) Find sources where applicability_score <= 2 AND usage_count >= 3
+        → archive (status='archived').
+
+    Designed to run daily via prospective memory. Rate-limited to prevent
+    upstream DoS and keep embed cost bounded.
+
+    Args:
+        max_rechecks: Max rechecks per pass (default 20, max 100)
+    """
+    _set_context()
+    from sources import _source_curate_scan_exec
+    return await _source_curate_scan_exec(max_rechecks=max_rechecks)
+
+
+@mcp.tool()
+async def source_verify_batch(max_verifications: int = 30) -> str:
+    """LLM-based semantic verification pass over sources with stale or missing verification.
+
+    Candidate selection:
+    - Drive sources: verified_at IS NULL OR doc_modified_at > verified_at
+      (checks Drive modifiedTime first — only re-verifies when doc actually changed)
+    - Internet sources: verified_at IS NULL OR verified_at < 30 days ago
+
+    For each candidate, reads content, cross-checks with xAI/Sonar, runs LLM assessment.
+    Writes assert_belief for each unsupported claim found (triggers cognition → interrupt → user).
+    Updates verified_at, verification_methods, truth_score, and doc_modified_at in DB.
+    No automatic doc edits — user decides what to do with flagged contradictions.
+
+    Designed to run nightly (~3am) via prospective memory trigger.
+
+    Args:
+        max_verifications: Max sources to verify per pass (default 30, max 100)
+    """
+    _set_context()
+    from sources import _source_verify_batch_exec
+    return await _source_verify_batch_exec(max_verifications=max_verifications)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Knowledge graph — typed relationships between entities
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+async def relationship_add(
+    source_type: str,
+    source_id: int,
+    target_type: str,
+    target_id: int,
+    relationship_type: str,
+    weight: float = 1.0,
+) -> str:
+    """Add a typed relationship edge between two entities in the knowledge graph.
+
+    Entity types: belief, source, memory, goal, procedure, conditioned, prospective
+    Relationship types: depends_on, contradicts, supports, derives_from, references, supersedes
+
+    Args:
+        source_type: Entity type of the source node
+        source_id: ID of the source entity
+        target_type: Entity type of the target node
+        target_id: ID of the target entity
+        relationship_type: Type of relationship
+        weight: Edge weight 0.0-1.0 (default 1.0)
+    """
+    _set_context()
+    valid_types = ('belief', 'source', 'memory', 'goal', 'procedure', 'conditioned', 'prospective')
+    valid_rels = ('depends_on', 'contradicts', 'supports', 'derives_from', 'references', 'supersedes')
+    if source_type not in valid_types or target_type not in valid_types:
+        return f"Invalid entity type. Valid: {valid_types}"
+    if relationship_type not in valid_rels:
+        return f"Invalid relationship. Valid: {valid_rels}"
+
+    import asyncio
+    from database import _connect
+
+    def _do():
+        conn = _connect()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """INSERT IGNORE INTO samaritan_relationships
+                   (source_type, source_id, target_type, target_id, relationship_type, weight, created_by)
+                   VALUES (%s, %s, %s, %s, %s, %s, 'mcp')""",
+                (source_type, source_id, target_type, target_id, relationship_type, weight)
+            )
+            conn.commit()
+            return cur.rowcount
+        finally:
+            cur.close()
+            conn.close()
+
+    rowcount = await asyncio.to_thread(_do)
+    if rowcount:
+        return f"Edge added: {source_type}:{source_id} --{relationship_type}--> {target_type}:{target_id} (w={weight})"
+    return "Edge already exists (duplicate ignored)."
+
+
+@mcp.tool()
+async def relationship_query(
+    entity_type: str,
+    entity_id: int,
+    hops: int = 1,
+    relationship_type: str = "",
+    direction: str = "both",
+) -> str:
+    """Query the knowledge graph for relationships around an entity.
+
+    Returns the N-hop neighborhood of an entity with typed edges and entity details.
+
+    Args:
+        entity_type: Entity type to start from (belief, source, memory, goal, procedure, conditioned, prospective)
+        entity_id: ID of the starting entity
+        hops: How many hops to traverse (1-3, default 1)
+        relationship_type: Filter by relationship type (empty = all)
+        direction: 'outgoing', 'incoming', or 'both' (default 'both')
+    """
+    _set_context()
+    import asyncio
+    from database import _connect
+
+    hops = max(1, min(3, hops))
+
+    def _do():
+        conn = _connect()
+        cur = conn.cursor(dictionary=True)
+        try:
+            visited = set()
+            edges = []
+            frontier = [(entity_type, entity_id)]
+
+            for hop in range(hops):
+                next_frontier = []
+                for etype, eid in frontier:
+                    key = (etype, eid)
+                    if key in visited:
+                        continue
+                    visited.add(key)
+
+                    conditions = []
+                    params = []
+                    if direction in ("outgoing", "both"):
+                        conditions.append("(source_type=%s AND source_id=%s)")
+                        params.extend([etype, eid])
+                    if direction in ("incoming", "both"):
+                        conditions.append("(target_type=%s AND target_id=%s)")
+                        params.extend([etype, eid])
+
+                    where = " OR ".join(conditions)
+                    if relationship_type:
+                        where = f"({where}) AND relationship_type=%s"
+                        params.append(relationship_type)
+
+                    cur.execute(
+                        f"SELECT source_type, source_id, target_type, target_id, "
+                        f"relationship_type, weight FROM samaritan_relationships WHERE {where}",
+                        params
+                    )
+                    for row in cur.fetchall():
+                        edge_key = (row['source_type'], row['source_id'], row['target_type'],
+                                    row['target_id'], row['relationship_type'])
+                        if edge_key not in {(e['source_type'], e['source_id'], e['target_type'],
+                                             e['target_id'], e['relationship_type']) for e in edges}:
+                            edges.append(row)
+                            next_frontier.append((row['target_type'], row['target_id']))
+                            next_frontier.append((row['source_type'], row['source_id']))
+                frontier = next_frontier
+
+            if not edges:
+                return f"No relationships found for {entity_type}:{entity_id}"
+
+            # Collect unique entity IDs to fetch labels
+            entity_ids = set()
+            for e in edges:
+                entity_ids.add((e['source_type'], e['source_id']))
+                entity_ids.add((e['target_type'], e['target_id']))
+
+            labels = {}
+            for etype, eid in entity_ids:
+                label = ""
+                try:
+                    if etype == 'belief':
+                        cur.execute("SELECT topic FROM samaritan_beliefs WHERE id=%s", (eid,))
+                    elif etype == 'source':
+                        cur.execute("SELECT COALESCE(title, source_ref) as topic FROM samaritan_sources WHERE id=%s", (eid,))
+                    elif etype == 'goal':
+                        cur.execute("SELECT title as topic FROM samaritan_goals WHERE id=%s", (eid,))
+                    elif etype == 'memory':
+                        cur.execute("SELECT topic FROM samaritan_memory_shortterm WHERE id=%s", (eid,))
+                        if not cur.rowcount:
+                            cur.execute("SELECT topic FROM samaritan_memory_longterm WHERE id=%s", (eid,))
+                    else:
+                        cur.execute("SELECT topic FROM samaritan_beliefs WHERE id=%s", (eid,))
+                    row = cur.fetchone()
+                    if row:
+                        label = str(row.get('topic', ''))[:60]
+                except Exception:
+                    pass
+                labels[(etype, eid)] = label
+
+            # Format output
+            lines = [f"Knowledge graph around {entity_type}:{entity_id} ({hops} hop{'s' if hops>1 else ''}, {len(edges)} edges):"]
+            lines.append("")
+            for e in edges:
+                src_label = labels.get((e['source_type'], e['source_id']), '')
+                tgt_label = labels.get((e['target_type'], e['target_id']), '')
+                src = f"{e['source_type']}:{e['source_id']}"
+                tgt = f"{e['target_type']}:{e['target_id']}"
+                if src_label:
+                    src += f" ({src_label})"
+                if tgt_label:
+                    tgt += f" ({tgt_label})"
+                lines.append(f"  {src} --[{e['relationship_type']} w={e['weight']}]--> {tgt}")
+
+            return "\n".join(lines)
+        finally:
+            cur.close()
+            conn.close()
+
+    return await asyncio.to_thread(_do)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # TIER 2: Data access tools
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1520,7 +2200,7 @@ async def google_drive(
     """CRUD operations on Google Drive within the authorized folder.
 
     Args:
-        operation: 'list', 'read', 'create', 'append', 'delete', 'move'
+        operation: 'list', 'read', 'create', 'append', 'delete', 'move', 'metadata'
         file_id: Required for read/delete (get from list first)
         file_name: Required for create
         content: Required for create/append
@@ -2057,29 +2737,94 @@ async def eidetic_recall(
 
 
 @mcp.tool()
-async def perplexity_search(
+async def sonar_answer(
     query: str,
-    max_results: int = 5,
+    model: str = "sonar-pro",
 ) -> str:
-    """AI-curated web search via Perplexity with ranked results and citations.
+    """Web-grounded AI answer via Perplexity Sonar with inline citations.
 
-    Use this as a FALLBACK when Claude Code's native WebSearch doesn't yield
-    good results. Perplexity provides AI-ranked, deduplicated results with
-    source quality scoring.
+    Best tool for belief verification and factual research — synthesizes
+    across multiple authoritative sources and returns a structured answer
+    with numbered citations. sonar-pro gives deeper, more comprehensive
+    results than sonar.
+
+    Use for: autonomous belief updates, fact-checking, current state queries.
+    Use xai_search instead for real-time events or X/Twitter discourse.
 
     Args:
-        query: Search query
-        max_results: Max results to return (default 5)
+        query: Question or topic to research
+        model: 'sonar-pro' (default, deeper) or 'sonar' (faster, cheaper)
     """
     _set_context()
     try:
         from tools import get_tool_executor
-        executor = get_tool_executor("perplexity_search")
+        executor = get_tool_executor("sonar_answer")
         if not executor:
-            return "perplexity_search not available (plugin not loaded)"
-        return await executor(query=query, max_results=max_results)
+            return "sonar_answer not available (plugin not loaded)"
+        return await executor(query=query, model=model)
     except Exception as e:
-        return f"perplexity_search error: {e}"
+        return f"sonar_answer error: {e}"
+
+
+@mcp.tool()
+async def perplexity_research(
+    query: str,
+    instructions: str = "",
+) -> str:
+    """Deep multi-step research via Perplexity Agent — performs multiple
+    sequential web searches and synthesizes a comprehensive report.
+
+    Use for: Symbotic monitoring, deep technical investigation, complex
+    multi-faceted questions that require following leads across sources.
+    Slower and more expensive than sonar_answer — reserve for research
+    tasks that genuinely require breadth and depth.
+
+    Args:
+        query: Research question or task
+        instructions: Optional guidance to focus the research agent
+    """
+    _set_context()
+    try:
+        from tools import get_tool_executor
+        executor = get_tool_executor("perplexity_research")
+        if not executor:
+            return "perplexity_research not available (plugin not loaded)"
+        return await executor(
+            query=query,
+            instructions=instructions or None,
+        )
+    except Exception as e:
+        return f"perplexity_research error: {e}"
+
+
+@mcp.tool()
+async def url_extract_tavily(
+    url: str,
+    query: str = "",
+) -> str:
+    """Extract web page content via Tavily, optionally focused on a query.
+
+    When query is provided, returns only the most relevant chunks matching
+    the query (up to 5 chunks). Without query, returns full page markdown.
+    Handles JavaScript-rendered pages.
+
+    Use for: pulling structured content from a specific URL after search
+    identifies it as authoritative. Better than raw WebFetch for pages
+    that require JS rendering or targeted extraction.
+
+    Args:
+        url: Full URL to extract content from
+        query: Optional focus query to return only relevant sections
+    """
+    _set_context()
+    try:
+        from tools import get_tool_executor
+        executor = get_tool_executor("url_extract")
+        if not executor:
+            return "url_extract not available (plugin not loaded)"
+        return await executor(method="tavily", url=url, query=query or "")
+    except Exception as e:
+        return f"url_extract_tavily error: {e}"
 
 
 @mcp.tool()
@@ -2088,9 +2833,9 @@ async def xai_search(
 ) -> str:
     """Web + X/Twitter search via xAI Grok with real-time results and citations.
 
-    Use this as a FALLBACK when Claude Code's native WebSearch doesn't yield
-    good results, especially for topics with significant X/Twitter discourse
-    or very recent events.
+    Best for real-time events, topics with significant X/Twitter discourse,
+    and queries where recency matters more than depth. Use sonar_answer
+    when you need synthesized, citation-backed factual answers.
 
     Args:
         query: Search query
@@ -2104,6 +2849,34 @@ async def xai_search(
         return await executor(query=query)
     except Exception as e:
         return f"xai_search error: {e}"
+
+
+@mcp.tool()
+async def google_search(
+    query: str,
+) -> str:
+    """Web search via Google (Gemini grounding) with cited sources.
+
+    Returns a direct answer synthesized from live Google Search results,
+    with source URLs. Best for factual lookups, local business addresses,
+    specific product/company details, and queries where Google's index
+    has higher coverage than Perplexity or xAI.
+
+    Use when sonar_answer or xai_search fail to find specific local/
+    business details (office addresses, store hours, niche company info).
+
+    Args:
+        query: Search query
+    """
+    _set_context()
+    try:
+        from tools import get_tool_executor
+        executor = get_tool_executor("search_google")
+        if not executor:
+            return "google_search not available (plugin not loaded)"
+        return await executor(query=query)
+    except Exception as e:
+        return f"google_search error: {e}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2175,6 +2948,64 @@ async def sms_send(
     _set_context()
     from tools import _sms_send_exec
     return await _sms_send_exec(message=message, phone=phone, name=name)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Yahoo Email — read emails via IMAP
+# ═══════════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+async def yahoo_email(
+    operation: str = "list",
+    limit: int = 10,
+    search: str = "UNSEEN",
+    uid: str = "",
+    folder: str = "INBOX",
+) -> str:
+    """Read Yahoo emails via IMAP.
+
+    Args:
+        operation: 'list' (subjects/senders) or 'read' (full email by UID)
+        limit: Max emails to return for list (default 10)
+        search: IMAP search criteria for list (default UNSEEN). Examples:
+                'ALL', 'UNSEEN', 'SINCE 09-Apr-2026', 'FROM "chase.com"'
+        uid: Email UID for read operation
+        folder: Mailbox folder (default INBOX)
+    """
+    import sys as _sys
+    _yahoo_path = os.environ.get("YAHOO_IMAP_PATH", os.path.expanduser("~/projects/yahoo-imap"))
+    if _yahoo_path not in _sys.path:
+        _sys.path.insert(0, _yahoo_path)
+    try:
+        from yahoo_imap import YahooIMAPClient
+    except ImportError as e:
+        return f"yahoo_imap not available: {e}"
+
+    try:
+        with YahooIMAPClient() as client:
+            if operation == "list":
+                emails = client.list_emails(folder=folder, limit=limit, search_criteria=search)
+                if not emails:
+                    return "No emails found."
+                lines = []
+                for em in emails:
+                    flag = "●" if not em.get("seen") else " "
+                    lines.append(f"{flag} UID={em['uid']} | {em.get('date','')} | {em.get('from','')} | {em.get('subject','')}")
+                return "\n".join(lines)
+            elif operation == "read":
+                if not uid:
+                    return "Error: uid is required for read operation"
+                result = client.read_email(uid, folder)
+                if not result:
+                    return f"Email UID {uid} not found."
+                body = (result.get("body", "") or "")[:3000]
+                attachments = result.get("attachments", [])
+                att_str = f"\nAttachments: {', '.join(str(a) for a in attachments)}" if attachments else ""
+                return f"From: {result.get('from','')}\nTo: {result.get('to','')}\nDate: {result.get('date','')}\nSubject: {result.get('subject','')}{att_str}\n\n{body}"
+            else:
+                return f"Unknown operation: {operation}. Use 'list' or 'read'."
+    except Exception as e:
+        return f"Email error: {e}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2411,6 +3242,134 @@ async def voice_relay_respond(
     return f"Response sent for message {message_id}. Voice frontend will speak it."
 
 
+# ---------------------------------------------------------------------------
+# Interrupt queue — event-driven notifications from cognition loops
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def interrupts_write(
+    topic: str,
+    content: str,
+    priority: str = "medium",
+    source: str = "unknown",
+    target_frontend: str = "any",
+) -> str:
+    """Write an interrupt to the samaritan_interrupts queue.
+
+    Interrupts are event-driven notifications from cognition loops that
+    need to reach the user outside normal conversation flow. Three tiers:
+      high    → delivered via Slack push (background loop, within 60s)
+      medium  → surfaced at next session start via load_context
+      low     → included in reflection digests only
+
+    Args:
+        topic: Short label (e.g. 'contradiction-lee-gym', 'belief-audit-routines')
+        content: Full interrupt body shown to user
+        priority: 'high' | 'medium' | 'low' (default medium)
+        source: Which handler/loop wrote this (e.g. 'contradiction', 'belief-audit')
+        target_frontend: 'any'|'slack'|'voice'|'rc'|'webfe' (default any)
+    """
+    _set_context()
+    from database import execute_insert
+    if priority not in ("high", "medium", "low"):
+        priority = "medium"
+    if target_frontend not in ("any", "slack", "voice", "rc", "webfe"):
+        target_frontend = "any"
+    t = topic.replace("'", "''")[:128]
+    c = content.replace("'", "''")
+    s = source.replace("'", "''")[:64]
+    sql = (
+        f"INSERT INTO samaritan_interrupts "
+        f"(topic, content, priority, source, target_frontend) "
+        f"VALUES ('{t}', '{c}', '{priority}', '{s}', '{target_frontend}')"
+    )
+    row_id = await execute_insert(sql)
+    return f"Interrupt written (id={row_id}): [{priority}] {topic}"
+
+
+@mcp.tool()
+async def interrupts_pending(
+    target_frontend: str = "any",
+    include_delivered_unacked: bool = True,
+) -> str:
+    """List pending interrupts for a target frontend.
+
+    By default returns BOTH undelivered interrupts AND delivered-but-unacked
+    ones, so the surfacing flow can re-show items the user hasn't explicitly
+    acknowledged. Pass include_delivered_unacked=False to get only fresh ones.
+
+    Args:
+        target_frontend: 'any'|'slack'|'voice'|'rc'|'webfe' — matches rows with
+                         this target OR target='any'
+        include_delivered_unacked: if True, also return delivered-but-not-acked rows
+    """
+    _set_context()
+    from database import execute_sql
+    if target_frontend not in ("any", "slack", "voice", "rc", "webfe"):
+        target_frontend = "any"
+    tf_clause = f"(target_frontend = '{target_frontend}' OR target_frontend = 'any')" if target_frontend != "any" else "1=1"
+    if include_delivered_unacked:
+        where = f"WHERE acknowledged_at IS NULL AND {tf_clause}"
+    else:
+        where = f"WHERE delivered_at IS NULL AND {tf_clause}"
+    sql = (
+        f"SELECT id, topic, content, priority, source, target_frontend, "
+        f"created_at, delivered_at, acknowledged_at "
+        f"FROM samaritan_interrupts {where} "
+        f"ORDER BY FIELD(priority,'high','medium','low'), created_at ASC LIMIT 50"
+    )
+    result = await execute_sql(sql)
+    return result if result.strip() else "(no pending interrupts)"
+
+
+@mcp.tool()
+async def interrupts_mark_delivered(ids: str) -> str:
+    """Mark interrupts as delivered (surfaced to frontend). Does NOT ack them —
+    the user must still explicitly ack via interrupts_ack.
+
+    Args:
+        ids: Comma-separated interrupt IDs (e.g. '1,2,3') or a single ID
+    """
+    _set_context()
+    from database import execute_sql
+    try:
+        id_list = [int(x.strip()) for x in ids.split(",") if x.strip()]
+    except ValueError:
+        return f"Invalid ids '{ids}' — must be comma-separated integers"
+    if not id_list:
+        return "No ids provided"
+    id_sql = ",".join(str(i) for i in id_list)
+    sql = (
+        f"UPDATE samaritan_interrupts SET delivered_at = CURRENT_TIMESTAMP "
+        f"WHERE id IN ({id_sql}) AND delivered_at IS NULL"
+    )
+    await execute_sql(sql)
+    return f"Marked delivered: {id_sql}"
+
+
+@mcp.tool()
+async def interrupts_ack(id: int, dismissed_reason: str = "") -> str:
+    """Acknowledge an interrupt — user has explicitly seen and addressed it.
+    Acked interrupts stop appearing in interrupts_pending.
+
+    Args:
+        id: Interrupt ID
+        dismissed_reason: Optional note about resolution (e.g. 'updated belief',
+                          'not applicable anymore', 'will handle later')
+    """
+    _set_context()
+    from database import execute_sql
+    r = dismissed_reason.replace("'", "''")[:255]
+    reason_clause = f", dismissed_reason = '{r}'" if r else ""
+    sql = (
+        f"UPDATE samaritan_interrupts "
+        f"SET acknowledged_at = CURRENT_TIMESTAMP{reason_clause} "
+        f"WHERE id = {id}"
+    )
+    await execute_sql(sql)
+    return f"Interrupt id={id} acknowledged"
+
+
 # HTTP endpoints for voice frontend to submit/retrieve relay messages
 
 async def endpoint_voice_relay_submit(request: Request) -> JSONResponse:
@@ -2529,12 +3488,50 @@ async def endpoint_voice_relay_poll(request: Request) -> JSONResponse:
         return JSONResponse({"status": "empty"})
 
     msg = relay["outbox"].popleft()
+
+    # Attach current Samaritan emotion state for TTS expression injection
+    emotion = None
+    try:
+        from database import fetch_dicts
+        import math
+        _half_lives = {
+            "hostile-anger": 120, "fear-and-overwhelm": 120,
+            "despair-and-shame": 240, "depleted-disengagement": 240,
+            "vigilant-suspicion": 180,
+            "exuberant-joy": 360, "competitive-pride": 360,
+            "compassionate-gratitude": 480, "peaceful-contentment": 480,
+            "playful-amusement": 480,
+        }
+        rows = await fetch_dicts(
+            "SELECT emotion_label, cluster, intensity, "
+            "TIMESTAMPDIFF(MINUTE, created_at, NOW()) AS age_minutes "
+            "FROM samaritan_emotions "
+            "WHERE subject='samaritan' AND created_at >= NOW() - INTERVAL 4 HOUR "
+            "ORDER BY created_at DESC LIMIT 1"
+        )
+        if rows:
+            r = rows[0]
+            age_min = float(r.get("age_minutes", 0))
+            cluster = r.get("cluster", "")
+            hl = _half_lives.get(cluster, 360)
+            raw_int = float(r.get("intensity", 0.5))
+            decayed = raw_int * math.pow(0.5, age_min / hl)
+            if decayed >= 0.1:
+                emotion = {
+                    "label": r["emotion_label"],
+                    "cluster": cluster,
+                    "intensity": round(decayed, 2),
+                }
+    except Exception:
+        pass
+
     return JSONResponse({
         "status": "ok",
         "message_id": msg["id"],
         "reply_to": msg.get("reply_to", ""),
         "text": msg["text"],
         "channel": channel,
+        "emotion": emotion,
     })
 
 
@@ -2800,6 +3797,19 @@ _THREAD_START_SCRIPT = os.path.expanduser(
     "~/projects/samaritan-work/claude-thread-start.sh"
 )
 
+# Chat sessions spawned dynamically: channel → { tmux_session, database }
+_chat_channels: Dict[str, dict] = {}
+
+# Max simultaneous dynamic chat sessions
+_MAX_CHAT_SESSIONS = 10
+
+# Idle TTL for chat sessions (seconds) — reap after this long with no activity
+_CHAT_SESSION_TTL = 3600  # 1 hour
+
+_CHAT_START_SCRIPT = os.path.expanduser(
+    "~/projects/samaritan-work/claude-chat-start.sh"
+)
+
 
 def _get_dispatch(channel: str = "default") -> dict:
     if channel not in _dispatch_channels:
@@ -2902,6 +3912,93 @@ async def _reap_idle_thread_sessions() -> None:
             _dispatch_locks.pop(channel, None)
 
 
+def _register_chat_channel(channel: str, tmux_session: str, database: str) -> None:
+    """Register a dynamic chat channel → tmux session + database mapping."""
+    _chat_channels[channel] = {"tmux_session": tmux_session, "database": database}
+    _dynamic_channels[channel] = tmux_session
+    if channel in _dispatch_channels:
+        _dispatch_channels[channel]["tmux_session"] = tmux_session
+
+
+async def _spawn_chat_session(channel: str, database: str = None) -> tuple:
+    """Spawn a new Claude Code tmux session for a dynamic chat channel.
+
+    Returns (ok: bool, tmux_session: str, message: str).
+    Enforces _MAX_CHAT_SESSIONS cap.
+    """
+    # Derive chat name and database from channel: "chat-myproject" → name "myproject"
+    chat_name = channel[5:] if channel.startswith("chat-") else channel
+    if not database:
+        database = chat_name
+    tmux_session = f"chat_{chat_name}"
+
+    # Already registered and alive?
+    if channel in _chat_channels:
+        ts = _chat_channels[channel]["tmux_session"]
+        proc = await _asyncio.create_subprocess_exec(
+            "tmux", "has-session", "-t", ts,
+            stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
+        )
+        if await proc.wait() == 0:
+            return True, ts, "already running"
+
+    # Cap check — count active chat channels
+    active = sum(
+        1 for ch in _chat_channels
+        if _dispatch_channels.get(ch, {}).get("last_submit_at", 0) > 0
+    )
+    if active >= _MAX_CHAT_SESSIONS:
+        return False, "", (
+            f"Chat session cap reached ({_MAX_CHAT_SESSIONS} active). "
+            "Close another chat first."
+        )
+
+    log.info(f"Spawning chat session: channel={channel} tmux={tmux_session} db={database}")
+    proc = await _asyncio.create_subprocess_exec(
+        "bash", _CHAT_START_SCRIPT, chat_name, database,
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=120)
+    except _asyncio.TimeoutError:
+        log.error(f"Chat session spawn timed out: {channel}")
+        return False, "", "Timed out starting Claude session"
+
+    output = stdout.decode().strip()
+
+    if output.startswith("started:"):
+        _register_chat_channel(channel, tmux_session, database)
+        log.info(f"Chat session started: {tmux_session} (db={database})")
+        return True, tmux_session, "started"
+    else:
+        log.error(f"Chat session spawn failed: {output} / {stderr.decode().strip()}")
+        return False, "", f"Failed to start Claude session: {output}"
+
+
+async def _reap_idle_chat_sessions() -> None:
+    """Kill chat sessions idle longer than _CHAT_SESSION_TTL."""
+    now = _time.time()
+    for channel in list(_chat_channels.keys()):
+        dispatch = _dispatch_channels.get(channel)
+        if not dispatch:
+            continue
+        last = dispatch.get("last_submit_at", 0)
+        if last > 0 and (now - last) > _CHAT_SESSION_TTL:
+            info = _chat_channels[channel]
+            tmux_sess = info["tmux_session"]
+            log.info(f"Reaping idle chat session: {tmux_sess} (idle {int(now-last)}s)")
+            proc = await _asyncio.create_subprocess_exec(
+                "tmux", "kill-session", "-t", tmux_sess,
+                stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
+            )
+            await proc.wait()
+            _chat_channels.pop(channel, None)
+            _dynamic_channels.pop(channel, None)
+            _dispatch_channels.pop(channel, None)
+            _dispatch_locks.pop(channel, None)
+
+
 def _format_dispatch_prompt(text: str, source: str = "voice",
                             emotion: dict = None,
                             location: dict = None,
@@ -2958,13 +4055,25 @@ async def endpoint_claude_submit(request: Request) -> JSONResponse:
     if not text:
         return JSONResponse({"error": "Missing text"}, status_code=400)
 
-    # Reap idle thread sessions opportunistically on each submit
+    # Reap idle sessions opportunistically on each submit
     _asyncio.create_task(_reap_idle_thread_sessions())
+    _asyncio.create_task(_reap_idle_chat_sessions())
+
+    # Chat channels must route to their own dedicated session — never fall back to
+    # samaritan-work. After a server restart _dynamic_channels is empty; re-discover
+    # from tmux before _get_dispatch creates a wrong fallback entry.
+    if channel.startswith("chat-") and channel not in _dynamic_channels:
+        await _discover_chat_sessions()
+        if channel not in _dynamic_channels:
+            # Session not in tmux at all — spawn on demand
+            ok, _tmux, msg = await _spawn_chat_session(channel)
+            if not ok:
+                return JSONResponse({"error": msg}, status_code=503)
 
     dispatch = _get_dispatch(channel)
     tmux_session = dispatch["tmux_session"]
 
-    # Check tmux session is alive; spawn dynamically for thread channels
+    # Check tmux session is alive; spawn dynamically for thread/chat channels
     proc = await _asyncio.create_subprocess_exec(
         "tmux", "has-session", "-t", tmux_session,
         stdout=_asyncio.subprocess.PIPE,
@@ -2977,6 +4086,12 @@ async def endpoint_claude_submit(request: Request) -> JSONResponse:
             if not ok:
                 return JSONResponse({"error": msg}, status_code=503)
             dispatch = _get_dispatch(channel)  # re-fetch with updated tmux_session
+        # For dynamic chat channels, spawn on demand
+        elif channel.startswith("chat-"):
+            ok, tmux_session, msg = await _spawn_chat_session(channel)
+            if not ok:
+                return JSONResponse({"error": msg}, status_code=503)
+            dispatch = _get_dispatch(channel)
         else:
             return JSONResponse(
                 {"error": f"tmux session '{tmux_session}' not found"},
@@ -3162,6 +4277,18 @@ async def endpoint_claude_poll(request: Request) -> JSONResponse:
 async def endpoint_claude_status(request: Request) -> JSONResponse:
     """Check if Claude Code is alive in its tmux session."""
     channel = request.query_params.get("channel", "default")
+
+    # Chat channels must have their own dedicated session — don't fall back
+    # to samaritan-work and falsely report alive.
+    if channel.startswith("chat-") and channel not in _dynamic_channels:
+        return JSONResponse({
+            "channel": channel,
+            "tmux_session": None,
+            "tmux_alive": False,
+            "claude_alive": False,
+            "enabled": False,
+        })
+
     dispatch = _get_dispatch(channel)
     tmux_session = dispatch["tmux_session"]
 
@@ -3198,6 +4325,140 @@ async def endpoint_claude_status(request: Request) -> JSONResponse:
         "claude_alive": claude_alive,
         "enabled": claude_alive,  # backward compat with frontend relay check
     })
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Chat session management (dynamic per-chat Claude Code instances)
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def endpoint_chat_start(request: Request) -> JSONResponse:
+    """Start a Claude Code chat session on demand.
+
+    Body (JSON):
+        name     : str  (chat name, e.g. 'myproject')
+        database : str  (optional, defaults to name)
+
+    Returns immediately with {"status": "starting"|"already_running"}.
+    Caller should poll /claude/status?channel=chat-<name> until claude_alive=true.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    name = payload.get("name", "").strip()
+    if not name:
+        return JSONResponse({"error": "Missing name"}, status_code=400)
+
+    database = payload.get("database", name).strip()
+    channel = f"chat-{name}"
+
+    # Fast check — already registered and alive?
+    if channel in _chat_channels:
+        ts = _chat_channels[channel]["tmux_session"]
+        proc = await _asyncio.create_subprocess_exec(
+            "tmux", "has-session", "-t", ts,
+            stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
+        )
+        if await proc.wait() == 0:
+            return JSONResponse({"status": "already_running", "channel": channel, "database": database})
+
+    # Fire off spawn in background — don't block the HTTP response
+    _asyncio.ensure_future(_spawn_chat_session(channel, database))
+    return JSONResponse({"status": "starting", "channel": channel, "database": database})
+
+
+async def _discover_chat_sessions() -> None:
+    """Scan tmux for existing chat_* sessions not yet in _chat_channels."""
+    proc = await _asyncio.create_subprocess_exec(
+        "tmux", "list-sessions", "-F", "#{session_name}",
+        stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    if proc.returncode != 0:
+        return
+    for line in stdout.decode().strip().splitlines():
+        sess = line.strip()
+        if not sess.startswith("chat_"):
+            continue
+        chat_name = sess[5:]  # strip "chat_" prefix
+        channel = f"chat-{chat_name}"
+        if channel not in _chat_channels:
+            _register_chat_channel(channel, sess, chat_name)
+            log.info(f"Discovered existing chat session: {sess} → channel={channel}")
+
+
+async def endpoint_chat_sessions(request: Request) -> JSONResponse:
+    """List active chat sessions with their status."""
+    await _discover_chat_sessions()
+    sessions = []
+    for channel, info in list(_chat_channels.items()):
+        tmux_sess = info["tmux_session"]
+        database = info["database"]
+
+        # Check if tmux session is alive
+        proc = await _asyncio.create_subprocess_exec(
+            "tmux", "has-session", "-t", tmux_sess,
+            stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
+        )
+        alive = (await proc.wait() == 0)
+
+        dispatch = _dispatch_channels.get(channel, {})
+        last_activity = dispatch.get("last_submit_at", 0)
+
+        sessions.append({
+            "channel": channel,
+            "name": channel[5:] if channel.startswith("chat-") else channel,
+            "tmux_session": tmux_sess,
+            "database": database,
+            "alive": alive,
+            "last_activity": last_activity,
+            "idle_seconds": int(_time.time() - last_activity) if last_activity > 0 else -1,
+        })
+
+    return JSONResponse({"sessions": sessions, "count": len(sessions)})
+
+
+async def endpoint_chat_delete(request: Request) -> JSONResponse:
+    """Kill a chat session's tmux session and clean up tracking state.
+
+    Body (JSON):
+        name : str  (chat name, e.g. 'myproject')
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+    name = payload.get("name", "").strip()
+    if not name:
+        return JSONResponse({"error": "Missing name"}, status_code=400)
+
+    channel = f"chat-{name}"
+    info = _chat_channels.get(channel)
+
+    if info:
+        tmux_sess = info["tmux_session"]
+        proc = await _asyncio.create_subprocess_exec(
+            "tmux", "kill-session", "-t", tmux_sess,
+            stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
+        )
+        await proc.wait()
+        _chat_channels.pop(channel, None)
+        _dynamic_channels.pop(channel, None)
+        _dispatch_channels.pop(channel, None)
+        _dispatch_locks.pop(channel, None)
+        log.info(f"Chat session deleted: {tmux_sess}")
+        return JSONResponse({"status": "deleted", "channel": channel})
+    else:
+        # Try killing tmux session by convention even if not tracked
+        tmux_sess = f"chat_{name}"
+        proc = await _asyncio.create_subprocess_exec(
+            "tmux", "kill-session", "-t", tmux_sess,
+            stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
+        )
+        await proc.wait()
+        return JSONResponse({"status": "deleted", "channel": channel, "note": "not tracked"})
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3451,6 +4712,63 @@ async def endpoint_claude_slash(request: Request) -> JSONResponse:
         })
 
 
+async def _detect_multi_topic(user_text: str, assistant_text: str) -> list[dict] | None:
+    """Detect if a conversation turn covers multiple clearly distinct topics.
+
+    Uses a cheap LLM (gpt-4o-mini) to analyze the turn. Returns None if single
+    topic or on any error. Returns a list of segment dicts if multiple distinct
+    topics are found:
+        [{"topic_hint": str, "user_frag": str, "asst_frag": str}, ...]
+
+    Only triggers when the turn is long enough to plausibly contain multiple topics.
+    Falls back gracefully to single-topic behavior on timeout or parse failure.
+    """
+    # Skip short turns — not worth the LLM call
+    if len(user_text) < 60 or len(assistant_text) < 120:
+        return None
+
+    prompt = (
+        "Analyze if this conversation turn covers MULTIPLE CLEARLY DISTINCT topics.\n"
+        "Only return multi=true when the topics are from completely different domains "
+        "(e.g. debugging code + scheduling a meeting, weather + filing a bug report).\n"
+        "Do NOT split when topics are related (same person, same codebase feature, same context).\n\n"
+        f"USER: {user_text[:400]}\n"
+        f"ASSISTANT: {assistant_text[:600]}\n\n"
+        "Return valid JSON only. No explanation.\n"
+        '- Single topic: {"multi": false}\n'
+        '- Multiple topics: {"multi": true, "segments": ['
+        '{"topic_hint": "2-3 word hint", "user_frag": "relevant user text", "asst_frag": "relevant assistant text"}'
+        ']}\n'
+        "Max 3 segments. Preserve all meaningful content across segments."
+    )
+    try:
+        import asyncio as _aio_mt
+        import json as _json_mt
+        from agents import _build_lc_llm, _content_to_str
+        from langchain_core.messages import HumanMessage as _HM
+
+        llm = _build_lc_llm("gpt4om")
+        resp = await _aio_mt.wait_for(
+            llm.ainvoke([_HM(content=prompt)]),
+            timeout=8.0,
+        )
+        raw = _content_to_str(resp.content).strip()
+        # Strip markdown fences if present
+        raw = _re.sub(r'^```(?:json)?\s*|\s*```$', '', raw, flags=_re.MULTILINE).strip()
+        data = _json_mt.loads(raw)
+        if not data.get("multi"):
+            return None
+        segments = data.get("segments") or []
+        if len(segments) < 2:
+            return None
+        # Validate each segment has the required keys
+        valid = [s for s in segments if s.get("user_frag") or s.get("asst_frag")]
+        return valid if len(valid) >= 2 else None
+    except Exception as _e:
+        log.debug(f"_detect_multi_topic: fallback to single (err={_e})")
+        return None
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Conversation logging endpoint (called by Claude Code hook)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3500,7 +4818,9 @@ async def endpoint_conv_log(request: Request) -> JSONResponse:
     session_id = payload.get("session_id", f"{_CLIENT_ID_PREFIX}-mcp")
     importance = int(payload.get("importance", 4))
 
-    _set_context()
+    # Respect per-workspace database override (from .workspace-db marker)
+    _db_override = payload.get("database", "")
+    _set_context(database=_db_override)
 
     # Shared timestamp for ST memory and location rows (same pattern as routes.py)
     from datetime import datetime as _dt, timezone as _tz
@@ -3509,24 +4829,79 @@ async def endpoint_conv_log(request: Request) -> JSONResponse:
     try:
         from memory import save_conversation_turn, _normalize_topic, load_topic_list
 
-        # Generate a topic slug server-side since Claude Code doesn't prepend <<topic>>
-        # Strategy: extract key nouns from user text, fuzzy-match against existing topics
-        topic_slug = await _generate_topic_slug(user_text, assistant_text)
-        if topic_slug:
-            # Prepend the tag so save_conversation_turn's _extract_topic_tag() finds it
-            assistant_text = f"<<{topic_slug}>>" + assistant_text
+        # Multi-topic detection: split turn into segments when clearly distinct topics found
+        import uuid as _uuid_mod
+        _segments = await _detect_multi_topic(user_text, assistant_text)
+        _all_segment_ids: list[tuple[int, int]] = []
 
-        user_id, asst_id, topic = await save_conversation_turn(
-            user_text=user_text,
-            assistant_text=assistant_text,
-            session_id=session_id,
-            importance=importance,
-            created_at=_shared_ts,
-        )
+        if _segments and len(_segments) >= 2:
+            _turn_group_id = str(_uuid_mod.uuid4())
+            log.info(
+                f"conv_log: multi-topic detected — {len(_segments)} segments "
+                f"group={_turn_group_id}"
+            )
+            _last_topic = None
+            for _seg in _segments:
+                _user_frag = (_seg.get("user_frag") or "").strip() or user_text
+                _asst_frag = (_seg.get("asst_frag") or "").strip() or assistant_text
+                _seg_slug = await _generate_topic_slug(_user_frag, _asst_frag)
+                _asst_tagged = f"<<{_seg_slug}>>" + _asst_frag if _seg_slug else _asst_frag
+                _u, _a, _t = await save_conversation_turn(
+                    user_text=_user_frag,
+                    assistant_text=_asst_tagged,
+                    session_id=session_id,
+                    importance=importance,
+                    created_at=_shared_ts,
+                    turn_group_id=_turn_group_id,
+                )
+                _all_segment_ids.append((_u, _a))
+                _last_topic = _t
+            user_id = _all_segment_ids[0][0] if _all_segment_ids else 0
+            asst_id = _all_segment_ids[-1][1] if _all_segment_ids else 0
+            topic = _last_topic
+        else:
+            # Single topic — generate slug and save as one turn
+            topic_slug = await _generate_topic_slug(user_text, assistant_text)
+            if topic_slug:
+                # Prepend the tag so save_conversation_turn's _extract_topic_tag() finds it
+                assistant_text = f"<<{topic_slug}>>" + assistant_text
+
+            user_id, asst_id, topic = await save_conversation_turn(
+                user_text=user_text,
+                assistant_text=assistant_text,
+                session_id=session_id,
+                importance=importance,
+                created_at=_shared_ts,
+            )
+            _all_segment_ids.append((user_id, asst_id))
+
         log.info(
             f"conv_log: topic={topic} user_id={user_id} asst_id={asst_id} "
             f"session={session_id}"
         )
+
+        # Tag routine domains affected by this conversation turn.
+        # Use user_text ONLY — the user is the source of truth for real-world state.
+        # Tagging on assistant_text too caused false positives when responses
+        # explained or discussed routines without any actual schedule change.
+        # Apply tags to ALL memory rows from this turn (covers multi-topic splits too).
+        _tags = _detect_affects_tags(user_text)
+        if _tags:
+            _tag_ids = [x for pair in _all_segment_ids for x in pair if x]
+            if _tag_ids:
+                from database import execute_sql as _exec_sql_tags
+                from memory import _ST as _st_tags
+                _tags_json = json.dumps(_tags).replace("'", "\\'")
+                _dur, _rec = _detect_affects_metadata(_tags)
+                _dur_sql = str(_dur) if _dur is not None else "NULL"
+                _rec_sql = f"'{_rec}'" if _rec else "NULL"
+                _id_list = ",".join(str(i) for i in _tag_ids)
+                await _exec_sql_tags(
+                    f"UPDATE {_st_tags()} SET affects_tags = '{_tags_json}', "
+                    f"effect_duration_days = {_dur_sql}, effect_recurs = {_rec_sql} "
+                    f"WHERE id IN ({_id_list})"
+                )
+                log.info(f"conv_log: affects_tags={_tags} applied to ids={_tag_ids}")
 
         # Activity hook: periodic reflection — every N real turns
         global _cogn_turn_counter
@@ -3559,6 +4934,38 @@ async def endpoint_conv_log(request: Request) -> JSONResponse:
                     log.info(f"conv_log: live emotion '{user_emotion.get('emotion_label')}' written for user_id={user_id}")
             except Exception as e:
                 log.warning(f"conv_log: emotion write failed: {e}")
+
+        # Write Samaritan self-assessed emotion if provided
+        sam_emotion = payload.get("samaritan_emotion")
+        if sam_emotion and asst_id:
+            try:
+                from emotions import _write_emotion as _write_sam_emo
+                # Map cluster to a core emotion for the 7-dimension vector
+                _cluster_to_core = {
+                    "exuberant-joy": "happy", "peaceful-contentment": "happy",
+                    "compassionate-gratitude": "happy", "competitive-pride": "happy",
+                    "playful-amusement": "happy", "depleted-disengagement": "sad",
+                    "vigilant-suspicion": "fearful", "hostile-anger": "angry",
+                    "fear-and-overwhelm": "fearful", "despair-and-shame": "sad",
+                }
+                _sam_cluster = sam_emotion.get("cluster", "")
+                _sam_item = {
+                    "memory_id": asst_id,
+                    "_memory_table": "shortterm",
+                    "core_emotion": _cluster_to_core.get(_sam_cluster, "happy"),
+                    "emotion_label": sam_emotion.get("emotion_label", ""),
+                    "intensity": sam_emotion.get("intensity", 0.5),
+                    "confidence": 0.9,
+                    "source": "inferred",
+                    "subject": "samaritan",
+                    "cluster": _sam_cluster,
+                    "context": "Samaritan self-assessed emotional state",
+                }
+                _sam_written = await _write_sam_emo(_sam_item, confidence_threshold=0.0)
+                if _sam_written:
+                    log.info(f"conv_log: samaritan emotion '{sam_emotion.get('emotion_label')}' ({_sam_cluster}) written for asst_id={asst_id}")
+            except Exception as e:
+                log.warning(f"conv_log: samaritan emotion write failed: {e}")
 
         # Extract and store InWorld voice-detected emotion from dispatch prefix
         # Format: [voice|emotion:LABEL(CONFIDENCE)|prosody:...|...]
@@ -3868,6 +5275,79 @@ async def endpoint_eidetic_save(request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+async def endpoint_google_drive(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+        result = await google_drive(
+            operation=body.get("operation", "read"),
+            file_id=body.get("file_id", ""),
+            file_name=body.get("file_name", ""),
+            content=body.get("content", ""),
+            folder_id=body.get("folder_id", ""),
+        )
+        return JSONResponse({"result": result})
+    except Exception as e:
+        log.error(f"endpoint_google_drive error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def endpoint_url_extract_tavily(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+        result = await url_extract_tavily(
+            url=body.get("url", ""),
+            query=body.get("query", ""),
+        )
+        return JSONResponse({"result": result})
+    except Exception as e:
+        log.error(f"endpoint_url_extract_tavily error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def endpoint_xai_search(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+        result = await xai_search(query=body.get("query", ""))
+        return JSONResponse({"result": result})
+    except Exception as e:
+        log.error(f"endpoint_xai_search error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def endpoint_sonar_answer(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+        result = await sonar_answer(query=body.get("query", ""), model=body.get("model", "sonar-pro"))
+        return JSONResponse({"result": result})
+    except Exception as e:
+        log.error(f"endpoint_sonar_answer error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def endpoint_google_search(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+        result = await google_search(query=body.get("query", ""))
+        return JSONResponse({"result": result})
+    except Exception as e:
+        log.error(f"endpoint_google_search error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def endpoint_llm_call(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+        result = await llm_call(
+            model=body.get("model", "reason-gemini"),
+            prompt=body.get("prompt", ""),
+            mode=body.get("mode", "text"),
+        )
+        return JSONResponse({"result": result})
+    except Exception as e:
+        log.error(f"endpoint_llm_call error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Plugin class
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3907,10 +5387,19 @@ class Plugin(BasePlugin):
         routes.append(Route("/claude/poll", endpoint_claude_poll, methods=["GET"]))
         routes.append(Route("/claude/status", endpoint_claude_status, methods=["GET"]))
         routes.append(Route("/claude/slash", endpoint_claude_slash, methods=["POST"]))
+        routes.append(Route("/chat/start", endpoint_chat_start, methods=["POST"]))
+        routes.append(Route("/chat/sessions", endpoint_chat_sessions, methods=["GET"]))
+        routes.append(Route("/chat/delete", endpoint_chat_delete, methods=["POST"]))
         routes.append(Route("/mcp/health", endpoint_mcp_health, methods=["GET"]))
         routes.append(Route("/analyze_photo", endpoint_analyze_photo, methods=["POST"]))
         routes.append(Route("/drive_upload_photo", endpoint_drive_upload_photo, methods=["POST"]))
         routes.append(Route("/eidetic_save", endpoint_eidetic_save, methods=["POST"]))
+        routes.append(Route("/google_drive", endpoint_google_drive, methods=["POST"]))
+        routes.append(Route("/url_extract_tavily", endpoint_url_extract_tavily, methods=["POST"]))
+        routes.append(Route("/xai_search", endpoint_xai_search, methods=["POST"]))
+        routes.append(Route("/sonar_answer", endpoint_sonar_answer, methods=["POST"]))
+        routes.append(Route("/google_search", endpoint_google_search, methods=["POST"]))
+        routes.append(Route("/llm_call", endpoint_llm_call, methods=["POST"]))
         return routes
 
     def get_config(self) -> dict:

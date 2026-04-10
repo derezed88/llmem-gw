@@ -36,6 +36,11 @@ XAI_PRICING = {
     "grok-4-5":                {"input": 2.00, "output": 10.00},
 }
 
+# FriendliAI pricing per 1M tokens
+FRIENDLI_PRICING = {
+    "qwen3-235b": {"input": 0.20, "output": 0.80},
+}
+
 # Tavily pricing: $0.005 per basic search, $0.01 per advanced search (Researcher plan)
 TAVILY_PRICING = {
     "basic":    0.005,
@@ -166,6 +171,31 @@ def estimate_xai_cost(model_name: str, tokens_in: int, tokens_out: int) -> float
     # Fallback: fast-reasoning pricing
     p = XAI_PRICING["grok-4-1-fast-reasoning"]
     return (tokens_in * p["input"] + tokens_out * p["output"]) / 1_000_000
+
+
+def estimate_friendli_cost(model_name: str, tokens_in: int, tokens_out: int) -> float:
+    """Estimate FriendliAI cost given model and token counts."""
+    for key in FRIENDLI_PRICING:
+        if key in model_name.lower():
+            p = FRIENDLI_PRICING[key]
+            return (tokens_in * p["input"] + tokens_out * p["output"]) / 1_000_000
+    # Fallback: qwen3-235b pricing
+    p = FRIENDLI_PRICING["qwen3-235b"]
+    return (tokens_in * p["input"] + tokens_out * p["output"]) / 1_000_000
+
+
+def _estimate_cost_for_model(cfg: dict, tokens_in: int, tokens_out: int) -> Optional[float]:
+    """Estimate cost for any model given its config dict. Returns None if unknown provider."""
+    model_id = cfg.get("model_id", "")
+    model_type = cfg.get("type", "")
+    host = cfg.get("host", "")
+    if model_type == "GEMINI":
+        return estimate_gemini_cost(model_id, tokens_in, tokens_out)
+    if model_type == "OPENAI" and ("xai" in host.lower() or "grok" in model_id.lower()):
+        return estimate_xai_cost(model_id, tokens_in, tokens_out)
+    if model_type == "OPENAI" and "friendli" in host.lower():
+        return estimate_friendli_cost(model_id, tokens_in, tokens_out)
+    return None
 
 
 def fetch_events_for_date(date) -> list:

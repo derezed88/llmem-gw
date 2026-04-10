@@ -181,6 +181,7 @@ async def _run_perplexity_sonar(api_key: str, query: str,
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": query}],
+        "user": "llmem-gw",
     }
 
     try:
@@ -207,9 +208,53 @@ async def _run_perplexity_sonar(api_key: str, query: str,
 
         usage = data.get("usage", {})
         cost = usage.get("cost", {})
+        tokens_in = int(usage.get("prompt_tokens", 0) or 0)
+        tokens_out = int(usage.get("completion_tokens", 0) or 0)
         if cost:
-            total = cost.get("total_cost", 0)
+            total = float(cost.get("total_cost", 0) or 0)
             lines.append(f"Cost: ${total:.4f}")
+            # Persist per-call cost event
+            try:
+                from cost_events import log_cost_event
+                await log_cost_event(
+                    provider="perplexity",
+                    service=model,
+                    tool_name="sonar_answer",
+                    cost_usd=total,
+                    tokens_in=tokens_in,
+                    tokens_out=tokens_out,
+                    unit="tokens" if (tokens_in or tokens_out) else "api_call",
+                    unit_count=None if (tokens_in or tokens_out) else 1,
+                )
+            except Exception:
+                pass  # cost logging must never fail the call
+
+        # Auto-archive: one llm-synthesis record per sonar query (not one per citation URL).
+        # Storing N identical-summary rows per query bloats the knowledge graph with
+        # duplicate nodes that all look the same.
+        if citations or (choices and choices[0].get("message", {}).get("content")):
+            try:
+                import asyncio as _asyncio
+                import hashlib
+                from sources import _source_record_exec
+                answer_content = ""
+                if choices:
+                    answer_content = choices[0].get("message", {}).get("content", "") or ""
+                citations_clean = [u.strip() for u in citations if isinstance(u, str) and u.strip()]
+                citations_block = ("\n\nCited sources:\n" + "\n".join(f"- {u}" for u in citations_clean)) if citations_clean else ""
+                query_hash = hashlib.md5(f"{model}:{query}".encode()).hexdigest()[:16]
+                _asyncio.create_task(_source_record_exec(
+                    source_type="llm-synthesis",
+                    source_ref=f"sonar-{model}://{query_hash}",
+                    title=f"[sonar-{model}] {query[:120]}",
+                    summary=answer_content[:250] if answer_content else f"Sonar {model} answer for: {query}",
+                    content=answer_content + citations_block,
+                    domain_tags="sonar_answer",
+                    collection="sonar-synthesis",
+                    hash_source="synthesized",
+                ))
+            except Exception:
+                pass  # archiving must never fail the search
 
         return "\n".join(lines)
 
@@ -231,6 +276,7 @@ async def _run_perplexity_agent(api_key: str, query: str,
         "model": model,
         "input": query,
         "tools": [{"type": "web_search"}],
+        "user": "llmem-gw",
     }
     if instructions:
         payload["instructions"] = instructions
@@ -243,6 +289,10 @@ async def _run_perplexity_agent(api_key: str, query: str,
 
         lines = [f"Perplexity Agent research for: {query}\n"]
 
+        # Capture first message text as summary snippet for archiving
+        archive_summary = ""
+        archive_urls: list = []
+
         for item in data.get("output", []):
             item_type = item.get("type", "")
 
@@ -252,6 +302,8 @@ async def _run_perplexity_agent(api_key: str, query: str,
                     if text:
                         lines.append(text)
                         lines.append("")
+                        if not archive_summary:
+                            archive_summary = text[:250]
 
             elif item_type == "search_results":
                 queries = item.get("queries", [])
@@ -263,12 +315,50 @@ async def _run_perplexity_agent(api_key: str, query: str,
                     for r in results[:5]:
                         lines.append(f"  - {r.get('title', '')}: {r.get('url', '')}")
                     lines.append("")
+                # Collect ALL search-result URLs for archiving
+                for r in results:
+                    u = (r.get("url") or "").strip()
+                    t = (r.get("title") or "").strip()
+                    if u:
+                        archive_urls.append((u, t))
 
         usage = data.get("usage", {})
         cost = usage.get("cost", {})
+        tokens_in = int(usage.get("prompt_tokens", 0) or 0)
+        tokens_out = int(usage.get("completion_tokens", 0) or 0)
         if cost:
-            total = cost.get("total_cost", 0)
+            total = float(cost.get("total_cost", 0) or 0)
             lines.append(f"Cost: ${total:.4f}")
+            try:
+                from cost_events import log_cost_event
+                await log_cost_event(
+                    provider="perplexity",
+                    service=model,
+                    tool_name="perplexity_research",
+                    cost_usd=total,
+                    tokens_in=tokens_in,
+                    tokens_out=tokens_out,
+                    unit="tokens" if (tokens_in or tokens_out) else "api_call",
+                    unit_count=None if (tokens_in or tokens_out) else 1,
+                )
+            except Exception:
+                pass
+
+        # Auto-archive search-result URLs (fire-and-forget)
+        if archive_urls:
+            try:
+                import asyncio as _asyncio
+                from sources import archive_from_search
+                snippet = archive_summary or f"Cited in Perplexity Agent research for query: {query}"
+                for url, title in archive_urls:
+                    _asyncio.create_task(archive_from_search(
+                        url=url,
+                        title=title or f"[perplexity-research] {query[:120]}",
+                        summary=snippet,
+                        origin_tool="perplexity_research",
+                    ))
+            except Exception:
+                pass
 
         return "\n".join(lines)
 

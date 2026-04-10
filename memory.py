@@ -333,10 +333,12 @@ async def save_memory(
     session_id: str = "",
     type: str = "context",
     created_at: str | None = None,
+    turn_group_id: str | None = None,
 ) -> int:
     """Insert a new short-term memory row. Returns new row id, or 0 if duplicate/error.
 
     *created_at*: optional MySQL datetime string to override DEFAULT CURRENT_TIMESTAMP.
+    *turn_group_id*: optional UUID linking rows from the same multi-topic turn split.
     """
     if not _mem_plugin_cfg().get("enabled", True):
         return 0
@@ -395,11 +397,24 @@ async def save_memory(
             except Exception as e:
                 log.warning(f"save_memory fuzzy-dedup check failed: {e}")
 
-    if created_at:
+    _tgid = (turn_group_id or "").replace("\\", "\\\\").replace("'", "''")[:36]
+    if created_at and _tgid:
+        sql = (
+            f"INSERT INTO {_ST()} "
+            f"(topic, content, importance, source, session_id, type, created_at, turn_group_id) "
+            f"VALUES ('{topic}', '{content}', {importance}, '{source}', '{session_id}', '{mem_type}', '{created_at}', '{_tgid}')"
+        )
+    elif created_at:
         sql = (
             f"INSERT INTO {_ST()} "
             f"(topic, content, importance, source, session_id, type, created_at) "
             f"VALUES ('{topic}', '{content}', {importance}, '{source}', '{session_id}', '{mem_type}', '{created_at}')"
+        )
+    elif _tgid:
+        sql = (
+            f"INSERT INTO {_ST()} "
+            f"(topic, content, importance, source, session_id, type, turn_group_id) "
+            f"VALUES ('{topic}', '{content}', {importance}, '{source}', '{session_id}', '{mem_type}', '{_tgid}')"
         )
     else:
         sql = (
@@ -442,7 +457,92 @@ async def save_memory(
             except Exception:
                 pass
 
+        # Schedule-impact tagging (fire-and-forget, non-blocking)
+        # Only tag if content is substantial enough to carry schedule information
+        if len(content) >= 50:
+            asyncio.create_task(_tag_affects(row_id, topic, content))
+
     return row_id
+
+
+async def _tag_affects(row_id: int, topic: str, content: str) -> None:
+    """Generate schedule-impact tags for a memory row via a cheap LLM call.
+
+    Queries active routine beliefs to build the tag vocabulary dynamically,
+    then asks Haiku to classify which routines this memory affects.
+    Updates the row with affects_tags, effect_duration_days, effect_recurs.
+    """
+    try:
+        # Build vocabulary from active routine beliefs
+        vocab_sql = (
+            "SELECT topic FROM samaritan_beliefs "
+            "WHERE status='active' AND topic REGEXP '^routine-' "
+            "ORDER BY topic LIMIT 50"
+        )
+        raw = await execute_sql(vocab_sql)
+        routine_tags = [
+            line.strip() for line in raw.strip().splitlines()[1:]
+            if line.strip() and not set(line.strip()) <= set("-+|")
+        ]
+        if not routine_tags:
+            return  # No routine beliefs yet — skip tagging
+
+        tag_list = ", ".join(routine_tags)
+        prompt = (
+            f"A memory was saved with topic '{topic}' and content:\n\n"
+            f"{content[:800]}\n\n"
+            f"Known routine tags: [{tag_list}]\n\n"
+            f"Does this memory affect any of these routines or schedules? "
+            f"If yes, return a JSON object with:\n"
+            f"  affects_tags: array of matching tag strings (subset of the known list, or a new tag if clearly needed)\n"
+            f"  effect_duration_days: how many days should this memory remain visible in schedule-impact context. "
+            f"Use 1 for single-day events (gym visit, pickup, one-time errand), 7 for weekly or multi-day effects "
+            f"(cycle, illness, travel), 30 for monthly effects, null only for permanent/indefinite changes.\n"
+            f"  effect_recurs: one of 'monthly','weekly','daily','one-time', or null\n"
+            f"If this memory does not affect any routine or schedule, return {{\"affects_tags\": []}}.\n"
+            f"Return only the JSON object, no other text."
+        )
+
+        import agents
+        result = await agents.llm_call(
+            model="summarizer-anthropic",
+            prompt=prompt,
+            mode="text",
+            sys_prompt="none",
+            history="none",
+        )
+
+        # Parse response
+        raw_json = result.strip()
+        # Strip markdown code fences if present
+        if raw_json.startswith("```"):
+            raw_json = re.sub(r"^```[a-z]*\n?", "", raw_json)
+            raw_json = re.sub(r"\n?```$", "", raw_json)
+        parsed = json.loads(raw_json)
+
+        affects = parsed.get("affects_tags") or []
+        if not affects:
+            return  # No impact — nothing to store
+
+        duration = parsed.get("effect_duration_days")
+        recurs = parsed.get("effect_recurs")
+
+        affects_json = json.dumps(affects).replace("'", "''")
+        duration_val = f"{int(duration)}" if duration is not None else "NULL"
+        recurs_val = f"'{str(recurs)[:50]}'" if recurs else "NULL"
+
+        update_sql = (
+            f"UPDATE {_ST()} SET "
+            f"affects_tags = '{affects_json}', "
+            f"effect_duration_days = {duration_val}, "
+            f"effect_recurs = {recurs_val} "
+            f"WHERE id = {row_id}"
+        )
+        await execute_sql(update_sql)
+        log.info(f"_tag_affects: tagged row {row_id} with {affects}")
+
+    except Exception as e:
+        log.warning(f"_tag_affects row {row_id} failed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -500,11 +600,11 @@ def _make_conv_topic(user_text: str) -> str:
     return f"conv-{date_str}-{slug}"
 
 
-async def _normalize_topic(topic_tag: str, threshold: float = 0.65) -> str:
+async def _normalize_topic(topic_tag: str, threshold: float = 0.75) -> str:
     """Fuzzy-match a model-generated topic tag against existing topics.
 
     Uses SequenceMatcher with word permutations to handle reordering
-    (e.g. 'kitchen-plumbing' → 'plumbing-issue').  Threshold 0.65 avoids
+    (e.g. 'kitchen-plumbing' → 'plumbing-issue').  Threshold 0.75 avoids
     false positives on shared-prefix topics (e.g. 'memory-roadmap' ≠ 'memory-toggle').
 
     Returns the best existing match, or the original tag if no close match.
@@ -546,6 +646,7 @@ async def save_conversation_turn(
     importance: int = 4,
     memory_types_enabled: bool = False,
     created_at: str | None = None,
+    turn_group_id: str | None = None,
 ) -> tuple[int, int, str | None]:
     """Save a user prompt and assistant response as two verbatim memory rows.
 
@@ -558,6 +659,8 @@ async def save_conversation_turn(
 
     When memory_types_enabled is True, also extracts <<type:X>> from the assistant
     text and stores it as the type for both rows. Falls back to 'context'.
+
+    *turn_group_id*: UUID linking rows from the same multi-topic split turn.
 
     Returns (user_row_id, assistant_row_id, topic_used).
     Row IDs of 0 mean duplicate/skipped.
@@ -580,6 +683,7 @@ async def save_conversation_turn(
         session_id=session_id,
         type=mem_type,
         created_at=created_at,
+        turn_group_id=turn_group_id,
     )
     asst_id = await save_memory(
         topic=topic,
@@ -589,6 +693,7 @@ async def save_conversation_turn(
         session_id=session_id,
         type=mem_type,
         created_at=created_at,
+        turn_group_id=turn_group_id,
     )
     return user_id, asst_id, topic
 
@@ -1022,6 +1127,16 @@ async def _summarize_chunk_to_lt(
         )
         if new_id:
             promoted += 1
+            # Propagate schedule-impact tags from ST to the new LT row
+            st_tags = r.get("affects_tags")
+            if st_tags and st_tags not in ("[]", "null", None):
+                try:
+                    tags_esc = str(st_tags).replace("\\", "\\\\").replace("'", "\\'")
+                    await execute_sql(
+                        f"UPDATE {_LT()} SET affects_tags = '{tags_esc}' WHERE id = {new_id}"
+                    )
+                except Exception as e:
+                    log.warning(f"affects_tags propagation to LT failed for id={new_id}: {e}")
 
     # Delete all rows from ST + remove from Qdrant
     deleted = 0
@@ -1507,7 +1622,8 @@ async def load_typed_context_block() -> str:
     try:
         beliefs = await fetch_dicts(
             f"SELECT id, topic, content, confidence "
-            f"FROM {_BELIEFS()} WHERE status = 'active' ORDER BY confidence DESC"
+            f"FROM {_BELIEFS()} WHERE status = 'active' AND confidence >= 7 "
+            f"ORDER BY confidence DESC LIMIT 40"
         )
         if beliefs:
             _typed_metric_read(_BELIEFS(), len(beliefs))
@@ -1595,7 +1711,7 @@ async def load_typed_context_block() -> str:
     try:
         conditioned = await fetch_dicts(
             f"SELECT id, topic, `trigger`, `reaction`, strength "
-            f"FROM {_CONDITIONED()} WHERE status = 'active' ORDER BY strength DESC"
+            f"FROM {_CONDITIONED()} WHERE status = 'active' ORDER BY strength DESC LIMIT 20"
         )
         if conditioned:
             _typed_metric_read(_CONDITIONED(), len(conditioned))
@@ -1630,7 +1746,8 @@ async def load_typed_context_block() -> str:
     try:
         prospective = await fetch_dicts(
             f"SELECT id, topic, content, due_at, importance "
-            f"FROM {_PROSPECTIVE()} WHERE status = 'pending' ORDER BY importance DESC"
+            f"FROM {_PROSPECTIVE()} WHERE status = 'pending' "
+            f"ORDER BY importance DESC, due_at ASC LIMIT 20"
         )
         if prospective:
             _typed_metric_read(_PROSPECTIVE(), len(prospective))
@@ -1884,7 +2001,7 @@ async def decay_drives() -> int:
     return updated
 
 
-async def update_drives_from_goals() -> dict:
+async def update_drives_from_goals(interval_m: int = 240) -> dict:
     """
     Examine goal completion rates and nudge drive values accordingly.
     Called at the end of each reflection cycle.
@@ -1895,22 +2012,36 @@ async def update_drives_from_goals() -> dict:
       - If zero recent completions and >3 active goals: task-completion decays faster this cycle
       - Always apply normal decay first (baseline pull)
 
+    Args:
+        interval_m: Reflection cycle length in minutes (default 240). Used to window
+                    done/blocked counts — only goals updated within this window count
+                    as "recently" completed or blocked. Prevents accumulated historical
+                    completions from permanently pinning task-completion at 1.0.
+
     Returns summary dict.
     """
     from database import fetch_dicts
     summary = {"drives_updated": 0, "goals_done": 0, "goals_blocked": 0}
 
     try:
-        goals = await fetch_dicts(
-            f"SELECT status FROM {_GOALS()}"
+        # Only count goals that transitioned to done/blocked within this reflection window.
+        # Counting all historical completions inflates done_count (e.g. 58 done goals →
+        # +0.15 nudge every cycle) which overwhelms decay and permanently pins task-completion.
+        recent = await fetch_dicts(
+            f"SELECT status FROM {_GOALS()} "
+            f"WHERE status IN ('done', 'blocked') "
+            f"AND updated_at > NOW() - INTERVAL {int(interval_m)} MINUTE"
+        )
+        active_goals = await fetch_dicts(
+            f"SELECT 1 FROM {_GOALS()} WHERE status = 'active'"
         )
     except Exception as e:
         log.debug(f"update_drives_from_goals: goals fetch failed: {e}")
         return summary
 
-    done_count    = sum(1 for g in (goals or []) if g.get("status") == "done")
-    blocked_count = sum(1 for g in (goals or []) if g.get("status") == "blocked")
-    active_count  = sum(1 for g in (goals or []) if g.get("status") == "active")
+    done_count    = sum(1 for g in (recent or []) if g.get("status") == "done")
+    blocked_count = sum(1 for g in (recent or []) if g.get("status") == "blocked")
+    active_count  = len(active_goals or [])
 
     summary["goals_done"]    = done_count
     summary["goals_blocked"] = blocked_count
@@ -2297,7 +2428,7 @@ async def load_context_block(
         semantic_st_task = asyncio.create_task(vec.search_memories(query, tier="short", collection=_coll))
         semantic_lt_task = asyncio.create_task(vec.search_memories(query, tier="long", collection=_coll))
         always_task      = asyncio.create_task(
-            load_short_term(limit=100, min_importance=always_importance)
+            load_short_term(limit=20, min_importance=always_importance)
         )
         # Always-inject by type: fetch active rows of high-priority types from ST
         if _always_types:

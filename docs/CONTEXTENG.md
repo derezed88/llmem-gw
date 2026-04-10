@@ -1,6 +1,6 @@
 # Context Engineering — llmem-gw
 
-Last updated: 2026-03-21
+Last updated: 2026-03-13
 
 This document describes every layer that contributes to the final prompt sent to an LLM, in injection order. Each layer has toggles at three scopes: **Global** (plugins-enabled.json), **Model** (llm-models.json), and **Session** (runtime state, set via `!config`/`!memory`).
 
@@ -175,33 +175,16 @@ Procedural memory from `samaritan_procedural` Qdrant collection, filtered by tas
 
 ## Layer 3a — History: Sliding Window Trim
 
-**What:** Trims conversation history so the LLM receives only the most recent messages.
+**What:** Trims conversation history to stay within token budget before sending to LLM.
 
-**When:** `_run_history_chain()` called in `routes.py` immediately before `dispatch_llm()`. Also called again after the assistant response is appended (post-response chain pass for security/judge plugins).
+**When:** `_run_history_chain()` called in `routes.py:2088` (pre-LLM).
 
-**How history reaches the LLM:** Yes — the entire (trimmed) history list is sent with every request. `dispatch_llm()` receives `session["history"]` and converts it to LangChain message objects (`HumanMessage`, `AIMessage`) via `_to_lc_messages()`. The system prompt (Layer 0) is prepended as a `SystemMessage`. The auto-enrichment block (Layer 2) is injected as an additional system message. The LLM sees: system prompt + enrichment context + full trimmed history + current user message.
-
-**What is one "unit" of history:** One message — a single `{"role": "user"|"assistant", "content": "..."}` dict. Each user turn is one message; each assistant response is one message. A conversation of 10 exchanges = 20 messages. The window size N counts individual messages, not turns, not tokens.
-
-**What happens at the limit:** `plugin_history_default.process()` applies `history[-N:]` — it keeps the last N messages and **permanently drops** the oldest ones. The trimmed list replaces `session["history"]`, so dropped messages are gone from the session (though they may persist in conv_log memory if `conv_log: true` is set on the model). When the next user message arrives, it is appended first, then the chain trims again — so the window always slides forward, dropping the oldest message to make room for the newest.
-
-**Plugin:** `plugin_history_default` — sliding window: `history[-N:]` where N = `min(agent_max_ctx, model.max_context)`.
-
-**Window size controls:**
-
-| Variable | Scope | Where configured | Default |
-|---|---|---|---|
-| `agent_max_ctx` | System-wide ceiling | `plugins-enabled.json → plugin_config.plugin_history_default.agent_max_ctx` | 200 |
-| `max_context` | Per-model preferred window | `llm-models.json` per model entry | varies |
-| **Effective N** | Per-session | `session["history_max_ctx"]` = `min(agent_max_ctx, model.max_context)` | — |
-
-The effective value is recomputed at session creation and on every `!model` switch. Runtime override: `!maxctx <N>` (persisted) or `!maxctx <N> temp` (session only).
+**Plugin:** `plugin_history_default` — truncates oldest turns until token count ≤ `agent_max_ctx`.
 
 **Toggles:**
 | Scope | Key | Effect |
 |---|---|---|
-| Global | `plugins-enabled.json → plugin_history_default.agent_max_ctx` | Message window ceiling (message count, not tokens) |
-| Model | `llm-models.json → max_context` | Per-model message window; effective window is `min()` of both |
+| Global | `plugins-enabled.json → plugin_history_default.agent_max_ctx` | Token window size |
 
 ---
 
@@ -303,7 +286,7 @@ Auto-applied when `memory_scan: false`. Removes any `memory_save()` text from th
 | `memory.enabled` | 2, 10 | `true` | Master kill switch for all memory |
 | `memory.context_injection` | 2b | `true` | Toggle memory retrieval injection |
 | `memory.post_response_scan` | 7 | `true` | Toggle inline memory_save() scanning |
-| `plugin_history_default.agent_max_ctx` | 3a | varies | History sliding window message count |
+| `plugin_history_default.agent_max_ctx` | 3a | varies | History sliding window token budget |
 
 ### Model — `llm-models.json`
 

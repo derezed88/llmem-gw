@@ -38,7 +38,14 @@ _enrich_stats = {
     "avg_ms": 0.0,        # running average of enrichment duration
     "task_completions": {},  # per-task completion counts (e.g. {"qdrant": 5, "typed": 8, ...})
     "task_timeouts": {},     # per-task timeout counts
+    "cache_hits": 0,      # times a pre-enrich cache hit skipped enrichment wait
 }
+
+# Pre-enrich cache: fired on partial transcript, consumed on submit.
+# Also serves as stale-while-revalidate for back-to-back turns.
+# {client_id: {"inject": {role, content}, "ts": monotonic}}
+_pre_enrich_cache: dict[str, dict] = {}
+_PRE_ENRICH_MAX_AGE = 60.0  # seconds — stale cache accepted up to 60s old
 
 
 def get_enrich_stats() -> dict:
@@ -1150,12 +1157,96 @@ def _memory_feature(feature: str) -> bool:
         return False
     return cfg.get(feature, True)
 
+async def pre_enrich_client(client_id: str, partial_text: str) -> None:
+    """Pre-warm the enrichment cache from a partial speech transcript.
+
+    Called when the user has spoken ≥3 words (before final arrives). By the
+    time the final transcript is submitted, the enrichment is already done and
+    cached — eliminating the gap in auto_enrich_context().
+    """
+    if not partial_text or not partial_text.strip():
+        return
+    # Don't thrash — skip if a fresh cache entry already exists (< 10s old)
+    existing = _pre_enrich_cache.get(client_id)
+    if existing and (time.monotonic() - existing["ts"]) < 10.0:
+        return
+
+    from memory import load_context_block, load_topic_list, load_temporal_context
+
+    _model_key = sessions.get(client_id, {}).get("model", "")
+    _identity_name = LLM_REGISTRY.get(_model_key, {}).get("identity_name", "")
+    _mem_types_enabled = LLM_REGISTRY.get(_model_key, {}).get("memory_types_enabled", False)
+
+    tasks: dict[str, asyncio.Task] = {}
+    tasks["qdrant"] = asyncio.create_task(load_context_block(
+        min_importance=3, query=partial_text, user_text=partial_text,
+        identity_name=_identity_name, memory_types_enabled=_mem_types_enabled,
+    ))
+    tasks["topic_list"] = asyncio.create_task(load_topic_list())
+    tasks["temporal"]   = asyncio.create_task(load_temporal_context())
+    if _mem_types_enabled:
+        from memory import load_typed_context_block, load_procedure_context_block
+        tasks["typed"]      = asyncio.create_task(load_typed_context_block())
+        tasks["procedures"] = asyncio.create_task(load_procedure_context_block(task_hint=partial_text[:200]))
+
+    done, pending = await asyncio.wait(tasks.values(), timeout=2.0)
+    for t in pending:
+        t.cancel()
+
+    task_to_name = {t: n for n, t in tasks.items()}
+    done_names   = {task_to_name[t] for t in done}
+
+    def _get(name: str):
+        if name not in done_names: return None
+        t = tasks[name]
+        try:
+            if t.exception(): return None
+        except Exception:
+            return None
+        r = t.result()
+        return r if r else None
+
+    enrichments = [_sysinfo_stamp()]
+    if _mem_types_enabled:
+        typed = _get("typed")
+        if typed: enrichments.insert(0, typed)
+        procs = _get("procedures")
+        if procs: enrichments.insert(0, procs)
+    mem = _get("qdrant")
+    if mem: enrichments.append(mem)
+    topics = _get("topic_list")
+    if topics and isinstance(topics, list):
+        enrichments.append("## Recent Topics\n" + ", ".join(topics))
+    temporal = _get("temporal")
+    if temporal: enrichments.append(temporal)
+
+    inject_content = "## Auto-retrieved context\nBase answer on this data:\n\n" + "\n\n".join(enrichments)
+    _pre_enrich_cache[client_id] = {"inject": {"role": "system", "content": inject_content}, "ts": time.monotonic()}
+    log.debug(f"pre_enrich_client: cached {len(inject_content)} chars for {client_id} (tasks={sorted(done_names)})")
+
+
 async def auto_enrich_context(messages: list[dict], client_id: str) -> list[dict]:
     if not messages: return messages
     last_user = next((m for m in reversed(messages) if m["role"] == "user"), None)
     if not last_user: return messages
 
     text = last_user.get("content", "")
+
+    # ── Pre-enrich cache check ───────────────────────────────────────────────
+    # Populated by pre_enrich_client() when the user's partial transcript hit
+    # ≥3 words. Also serves stale-while-revalidate for back-to-back turns.
+    _cached = _pre_enrich_cache.get(client_id)
+    if _cached:
+        _age = time.monotonic() - _cached["ts"]
+        if _age < _PRE_ENRICH_MAX_AGE:
+            _pre_enrich_cache.pop(client_id, None)
+            _enrich_stats["cache_hits"] += 1
+            log.debug(f"auto_enrich_context: cache hit for {client_id} (age={_age:.1f}s)")
+            # Fire background refresh so the *next* turn also gets a cache hit
+            asyncio.create_task(pre_enrich_client(client_id, text))
+            return list(messages[:-1]) + [_cached["inject"], messages[-1]]
+        else:
+            _pre_enrich_cache.pop(client_id, None)  # expired — drop
 
     # Ensure DB context is set for all SQL queries in this function
     _enrich_model = sessions.get(client_id, {}).get("model", "")
@@ -1957,6 +2048,24 @@ async def llm_call(
                         _cost = estimate_xai_cost(_model_id, _tokens_in, _tokens_out)
                         asyncio.ensure_future(log_cost_event(
                             provider="xai",
+                            service=_model_id,
+                            tool_name="llm_call",
+                            model_key=model,
+                            client_id=client_id,
+                            cost_usd=_cost,
+                            tokens_in=_tokens_in,
+                            tokens_out=_tokens_out,
+                            unit="tokens",
+                            notes="estimated" if (_tokens_in == 0 and _tokens_out == 0) else None,
+                        ))
+                    except Exception:
+                        pass
+                elif _model_type == "OPENAI" and "friendli" in cfg.get("host", "").lower():
+                    try:
+                        from cost_events import log_cost_event, estimate_friendli_cost
+                        _cost = estimate_friendli_cost(_model_id, _tokens_in, _tokens_out)
+                        asyncio.ensure_future(log_cost_event(
+                            provider="friendli",
                             service=_model_id,
                             tool_name="llm_call",
                             model_key=model,

@@ -71,6 +71,9 @@ _last_proxy_contact: float = 0.0
 # Runtime enable/disable (overrides plugin_config)
 _runtime_enabled: Optional[bool] = None
 
+# Counter for synthetic voice relay interrupt IDs (negative to distinguish from relay responses)
+_sms_interrupt_counter = 0
+
 
 def _is_enabled() -> bool:
     """Check if SMS relay is enabled (runtime override > plugin_config)."""
@@ -158,6 +161,36 @@ async def _auto_notify_sessions(phone: str, text: str) -> int:
     return 0
 
 
+async def _push_to_voice_relay(sender: str, text: str) -> bool:
+    """Push SMS notification to active voice relay outbox for TTS announcement.
+
+    Lazy-imports _relay_channels from plugin_mcp_direct to avoid circular
+    imports at load time. Only fires if at least one relay channel is enabled.
+    Negative IDs distinguish interrupt pushes from regular relay responses.
+    """
+    global _sms_interrupt_counter
+    try:
+        from plugin_mcp_direct import _relay_channels
+        active = [r for r in _relay_channels.values() if r.get("enabled")]
+        if not active:
+            return False
+        _sms_interrupt_counter -= 1
+        preview = text[:120] + ("..." if len(text) > 120 else "")
+        tts_text = f"Text from {sender}. {preview}"
+        for relay in active:
+            relay["outbox"].append({
+                "id": _sms_interrupt_counter,
+                "reply_to": "",
+                "text": tts_text,
+                "timestamp": time.time(),
+            })
+        log.info(f"SMS → voice relay TTS: {tts_text[:60]}")
+        return True
+    except Exception as e:
+        log.warning(f"SMS voice relay push failed: {e}")
+        return False
+
+
 # ---------------------------------------------------------------------------
 # HTTP endpoints
 # ---------------------------------------------------------------------------
@@ -202,10 +235,13 @@ async def endpoint_sms_inbound(request: Request) -> JSONResponse:
     # Auto-notify matching model sessions (direct push, no registration needed)
     auto_count = await _auto_notify_sessions(phone, text)
 
+    # Push to voice relay outbox for TTS announcement if a voice session is active
+    sender = await _resolve_phone_name(phone)
+    await _push_to_voice_relay(sender, text)
+
     # Also fire notifier event for explicitly subscribed sessions
     try:
         import notifier
-        sender = await _resolve_phone_name(phone)
         preview = text[:120] + ("..." if len(text) > 120 else "")
         await notifier.fire_event(
             "sms_received",

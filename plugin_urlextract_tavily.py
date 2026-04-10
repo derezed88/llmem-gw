@@ -164,6 +164,7 @@ async def _run_tavily_extract(client, url: str, query: str = "") -> str:
             return f"No content extracted from {url}."
 
         lines = []
+        archive_entries: list = []  # (url, title, summary_snippet)
         for result in results:
             lines.append(f"Source: {result['url']}")
             title = result.get("title", "")
@@ -175,6 +176,27 @@ async def _run_tavily_extract(client, url: str, query: str = "") -> str:
             raw = result.get("raw_content", "")
             compressed = _compress_markdown(raw)
             lines.append(compressed)
+            # Collect for archiving — strip leading whitespace/markdown noise from snippet
+            r_url = (result.get("url") or "").strip()
+            if r_url:
+                clean_raw = re.sub(r"\s+", " ", (raw or "")).strip()
+                summary_snippet = clean_raw[:250] if clean_raw else (query or "Tavily extraction")
+                archive_entries.append((r_url, title or "", summary_snippet))
+
+        # Auto-archive extracted URL(s) — fire-and-forget
+        if archive_entries:
+            try:
+                import asyncio as _asyncio
+                from sources import archive_from_search
+                for r_url, r_title, r_summary in archive_entries:
+                    _asyncio.create_task(archive_from_search(
+                        url=r_url,
+                        title=r_title or f"[tavily-extract] {r_url[:120]}",
+                        summary=r_summary,
+                        origin_tool="url_extract_tavily",
+                    ))
+            except Exception:
+                pass
 
         return "\n".join(lines)
 

@@ -575,7 +575,7 @@
       "memory_enabled": false
     },
     "ged-planner": {
-      "database": "default",
+      "database": "mymcp",
       "model_id": "gemini-3.1-pro-preview",
       "type": "GEMINI",
       "host": null,
@@ -595,7 +595,7 @@
       "memory_scan": false
     },
     "ged-quiz-gen": {
-      "database": "default",
+      "database": "mymcp",
       "model_id": "claude-haiku-4-5-20251001",
       "type": "OPENAI",
       "host": "https://api.anthropic.com/v1",

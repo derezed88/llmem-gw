@@ -74,7 +74,7 @@ Every plugin must have an entry in `plugin-manifest.json`:
 
 **Fields:**
 - `type` — `"data_tool"` or `"client_interface"`
-- `file` — filename relative to the llmem-gw working directory
+- `file` — filename relative to the mymcp working directory
 - `description` — shown in `python llmemctl.py list`
 - `dependencies` — pip package names (validated at startup; use `>=` for minimum version)
 - `env_vars` — environment variable names required from `.env`; validated at startup

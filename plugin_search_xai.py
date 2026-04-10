@@ -93,7 +93,10 @@ async def _run_xai_search(api_key: str, query: str, model: str = "grok-4-1-fast-
     if not api_key:
         return "xAI search client not initialized. Check XAI_API_KEY in .env."
 
-    search_result = {"text": "", "tokens_in": 0, "tokens_out": 0}
+    search_result = {
+        "text": "", "tokens_in": 0, "tokens_out": 0,
+        "archive_urls": [], "archive_summary": "",
+    }
 
     def _sync_search():
         from xai_sdk import Client
@@ -125,6 +128,7 @@ async def _run_xai_search(api_key: str, query: str, model: str = "grok-4-1-fast-
         content = response.content if hasattr(response, 'content') else ""
         if content:
             lines.append(f"Answer: {content}\n")
+            search_result["archive_summary"] = content[:250]
 
         citations = response.citations if hasattr(response, 'citations') else []
         if citations:
@@ -135,8 +139,12 @@ async def _run_xai_search(api_key: str, query: str, model: str = "grok-4-1-fast-
                     title = cite.get('title', url)
                     lines.append(f"{i}. {title}")
                     lines.append(f"   URL: {url}")
+                    if isinstance(url, str) and url.strip():
+                        search_result["archive_urls"].append((url.strip(), title if isinstance(title, str) else ""))
                 else:
                     lines.append(f"{i}. {cite}")
+                    if isinstance(cite, str) and cite.strip().startswith(("http://", "https://")):
+                        search_result["archive_urls"].append((cite.strip(), ""))
             lines.append("")
         elif not content:
             lines.append("No results found.")
@@ -164,6 +172,45 @@ async def _run_xai_search(api_key: str, query: str, model: str = "grok-4-1-fast-
             unit="tokens",
             notes="estimated" if (tokens_in == 0 and tokens_out == 0) else None,
         )
+
+        # Auto-archive cited URLs (fire-and-forget)
+        # Skip X.com/Twitter URLs — individual tweets are ephemeral, not archivable knowledge sources.
+        # Archive non-Twitter web citations normally; also archive one synthesis record for the answer.
+        if search_result["archive_urls"] or search_result["archive_summary"]:
+            try:
+                import asyncio as _asyncio
+                from sources import archive_from_search
+                snippet = search_result["archive_summary"] or f"xai_search answer for: {query}"
+
+                _SOCIAL_DOMAINS = ("x.com/", "twitter.com/", "t.co/")
+                web_urls = [
+                    (url, title) for url, title in search_result["archive_urls"]
+                    if not any(d in url for d in _SOCIAL_DOMAINS)
+                ]
+
+                for url, title in web_urls:
+                    if title and title != url:
+                        arc_title = title
+                    else:
+                        arc_title = f"[xai-search] {query[:120]}"
+                    _asyncio.create_task(archive_from_search(
+                        url=url,
+                        title=arc_title,
+                        summary=snippet,
+                        origin_tool="xai_search",
+                    ))
+
+                # Archive the synthesized answer as a single llm-synthesis source
+                if search_result["archive_summary"]:
+                    synthesis_ref = f"xai-search:{query[:200]}"
+                    _asyncio.create_task(archive_from_search(
+                        url=synthesis_ref,
+                        title=f"[xai-search] {query[:120]}",
+                        summary=snippet,
+                        origin_tool="xai_search",
+                    ))
+            except Exception:
+                pass
 
         return result
     except Exception as e:

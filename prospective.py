@@ -155,6 +155,24 @@ async def _nl_is_overdue(due_at_text: str, model_key: str) -> bool:
         llm = _build_lc_llm(model_key)
         msgs = [SystemMessage(content=system), HumanMessage(content=prompt)]
         response = await asyncio.wait_for(llm.ainvoke(msgs), timeout=timeout)
+        # Log per-call cost
+        try:
+            from cost_events import log_cost_event, _estimate_cost_for_model
+            _usage = getattr(response, "usage_metadata", None) or {}
+            _ti = _usage.get("input_tokens", 0) or 0
+            _to = _usage.get("output_tokens", 0) or 0
+            _cost = _estimate_cost_for_model(cfg, _ti, _to)
+            if _cost is not None:
+                asyncio.ensure_future(log_cost_event(
+                    provider=cfg.get("host", "unknown").split("//")[-1].split("/")[0],
+                    service=cfg.get("model_id", model_key),
+                    tool_name="cogn-prospective",
+                    model_key=model_key,
+                    client_id="cogn-prospective",
+                    cost_usd=_cost, tokens_in=_ti, tokens_out=_to, unit="tokens",
+                ))
+        except Exception:
+            pass
         raw = _content_to_str(response.content).strip()
 
         # Strip markdown fences if present
@@ -296,6 +314,21 @@ async def run_check() -> dict:
                         ))
                     except Exception:
                         pass
+
+                # Auto-create cognition step for FIRE: directives
+                raw_content = (row.get("content") or "").strip()
+                if raw_content.upper().startswith("FIRE:"):
+                    step_desc = raw_content[len("FIRE:"):].strip()
+                    if step_desc:
+                        try:
+                            from plugin_mcp_direct import _queue_cogn_step
+                            _asyncio.ensure_future(_queue_cogn_step(step_desc))
+                            log.info(
+                                f"prospective: auto-created cogn step for "
+                                f"id={row['id']} topic={row.get('topic')!r}"
+                            )
+                        except Exception as e:
+                            log.warning(f"prospective: auto-create cogn step failed: {e}")
 
                 await _mark_done(row["id"])
                 log.info(

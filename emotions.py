@@ -399,6 +399,9 @@ async def _write_emotion(item: dict, confidence_threshold: float) -> bool:
     intensity = max(0.0, min(1.0, float(item.get("intensity", 0.5))))
     context = str(item.get("context", ""))[:500].replace("'", "''")
     core_clean = str(core)[:20]
+    subject = str(item.get("subject", "user"))[:10]
+    cluster = item.get("cluster")
+    cluster_val = f"'{str(cluster)[:30]}'" if cluster else "NULL"
 
     # Build the 7-dimension vector from the core emotion
     dims = {e: 0.0 for e in CORE_EMOTIONS}
@@ -406,16 +409,16 @@ async def _write_emotion(item: dict, confidence_threshold: float) -> bool:
         dims[core_clean] = intensity
 
     col_list = [
-        "memory_table", "memory_id",
+        "memory_table", "memory_id", "subject",
         "angry", "sad", "disgusted", "happy", "surprised", "bad", "fearful",
-        "emotion_label", "intensity", "confidence", "source", "context",
+        "emotion_label", "cluster", "intensity", "confidence", "source", "context",
     ]
     val_list = [
-        f"'{mem_table}'", str(mem_id),
+        f"'{mem_table}'", str(mem_id), f"'{subject}'",
         str(dims["angry"]), str(dims["sad"]), str(dims["disgusted"]),
         str(dims["happy"]), str(dims["surprised"]), str(dims["bad"]),
         str(dims["fearful"]),
-        f"'{label}'", str(intensity), str(confidence),
+        f"'{label}'", cluster_val, str(intensity), str(confidence),
         f"'{_valid_source(item.get('source', 'inferred'))}'", f"'{context}'",
     ]
     cols = ", ".join(col_list)

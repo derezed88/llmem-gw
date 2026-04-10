@@ -57,7 +57,7 @@ macOS Messages.app ──► ~/Library/Messages/chat.db
 
 ```json
 {
-    "llmem_gw_url": "http://YOUR_SERVER_IP:8767",
+    "llmem_gw_url": "http://192.168.10.111:8767",
     "poll_interval": 2,
     "outbound_poll_interval": 3,
     "allowed_numbers": [],
@@ -68,7 +68,7 @@ macOS Messages.app ──► ~/Library/Messages/chat.db
 
 | Key | Default | Description |
 |---|---|---|
-| `llmem_gw_url` | `http://YOUR_SERVER_IP:8767` | llmem-gw base URL |
+| `llmem_gw_url` | `http://192.168.10.111:8767` | llmem-gw base URL |
 | `poll_interval` | `2` | Seconds between Messages DB polls for new incoming SMS |
 | `outbound_poll_interval` | `3` | Seconds between polls for outbound replies |
 | `allowed_numbers` | `[]` | Whitelist of phone numbers (empty = allow all) |

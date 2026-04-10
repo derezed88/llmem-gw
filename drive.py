@@ -234,6 +234,19 @@ def _drive_move_file(file_id: str, dest_folder_id: str) -> str:
     ).execute()
     return f"Moved '{f.get('name', file_id)}' to folder {dest_folder_id}"
 
+def _drive_get_metadata(file_id: str) -> str:
+    """Lightweight metadata fetch — returns name, mimeType, modifiedTime without downloading content."""
+    svc = _get_drive_service()
+    meta = svc.files().get(fileId=file_id, fields="id,name,mimeType,modifiedTime,size").execute()
+    parts = [f"id: {meta.get('id', file_id)}",
+             f"name: {meta.get('name', '?')}",
+             f"mimeType: {meta.get('mimeType', '?')}",
+             f"modifiedTime: {meta.get('modifiedTime', '?')}"]
+    if meta.get("size"):
+        parts.append(f"size: {meta['size']} bytes")
+    return "\n".join(parts)
+
+
 def _is_subfolder_of_root(folder_id: str) -> bool:
     """Check if folder_id is a direct child folder of DRIVE_FOLDER_ID via the Drive API."""
     try:
@@ -297,6 +310,9 @@ async def run_drive_op(operation: str, file_id: str | None, file_name: str | Non
         elif op == "read":
             if not file_id: return "Error: file_id required."
             return await asyncio.to_thread(_drive_read_file, file_id)
+        elif op == "metadata":
+            if not file_id: return "Error: file_id required."
+            return await asyncio.to_thread(_drive_get_metadata, file_id)
         elif op == "append":
             if not file_id: return "Error: file_id required."
             if content is None: return "Error: content required."
@@ -309,7 +325,7 @@ async def run_drive_op(operation: str, file_id: str | None, file_name: str | Non
             if not file_id: return "Error: file_id required."
             return await asyncio.to_thread(_drive_delete_file, file_id)
         else:
-            return "Error: unknown operation. Valid: list|create|read|append|delete|move"
+            return "Error: unknown operation. Valid: list|create|read|append|delete|move|metadata"
     except Exception as exc:
         log.exception("Drive op '%s' failed", op)
         return f"Drive error ({op}): {exc}"

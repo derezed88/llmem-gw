@@ -28,7 +28,7 @@ MYSQL_USER=<username>
 MYSQL_PASS=<password>
 ```
 
-Database name is `agent_mcp` on `localhost` (hardcoded default; change in `config.py` if needed).
+Database name is `mymcp` on `localhost` (hardcoded default; change in `config.py` if needed).
 
 ## Enable
 

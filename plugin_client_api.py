@@ -246,6 +246,28 @@ async def endpoint_api_delete_session(request: Request) -> JSONResponse:
     return JSONResponse({"status": "deleted", "client_id": target_id})
 
 
+async def endpoint_api_pre_enrich(request: Request) -> JSONResponse:
+    """Pre-warm the enrichment cache from a partial speech transcript.
+
+    Fire-and-forget — returns immediately. The cache will be populated within
+    the 2s voice deadline and consumed by the next auto_enrich_context() call
+    for this client_id, eliminating the token-gap before the LLM starts streaming.
+    """
+    if not _check_auth(request):
+        return _auth_error()
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    client_id = payload.get("client_id", "").strip()
+    text = payload.get("text", "").strip()
+    if not client_id or not text:
+        return JSONResponse({"error": "client_id and text required"}, status_code=400)
+    from agents import pre_enrich_client
+    asyncio.create_task(pre_enrich_client(client_id, text))
+    return JSONResponse({"status": "queued"})
+
+
 async def endpoint_api_stop(request: Request) -> JSONResponse:
     """Cancel the active LLM job for a client without starting a new one."""
     if not _check_auth(request):
@@ -297,6 +319,7 @@ class ApiClientPlugin(BasePlugin):
             Route("/api/v1/submit", endpoint_api_submit, methods=["POST"]),
             Route("/api/v1/stream/{client_id}", endpoint_api_stream, methods=["GET"]),
             Route("/api/v1/stop", endpoint_api_stop, methods=["POST"]),
+            Route("/api/v1/pre-enrich", endpoint_api_pre_enrich, methods=["POST"]),
             Route("/api/v1/sessions", endpoint_api_sessions, methods=["GET"]),
             Route("/api/v1/health", endpoint_api_health, methods=["GET"]),
             Route("/api/v1/session/{sid}", endpoint_api_delete_session, methods=["DELETE"]),

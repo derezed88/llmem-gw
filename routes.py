@@ -5489,7 +5489,7 @@ _claude_mode_channels: set = set()
 
 
 def _claude_mode_prefix(client_id: str) -> str:
-    """Extract channel prefix from client_id (e.g. 'slack-C0AE37B3PC4')."""
+    """Extract channel prefix from client_id (e.g. 'slack-CXXXXXXXXXX')."""
     parts = client_id.split("-")
     return "-".join(parts[:2]) if len(parts) >= 2 else client_id
 
@@ -5515,7 +5515,7 @@ _THREAD_START_SCRIPT = os.path.expanduser(
 def _thread_channel_for(client_id: str) -> str:
     """Derive dispatch channel from client_id.
 
-    slack-C0AE37B3PC4-1774701122.553459 → slack-thread-553459
+    slack-CXXXXXXXXXX-1774701122.553459 → slack-thread-553459
     Anything else (shell, voice, rc) → "default"
     """
     parts = (client_id or "").split("-")
@@ -5751,7 +5751,7 @@ async def _claude_relay_dispatch(client_id: str, text: str, session: dict):
             return
 
     # Derive dispatch channel from client_id thread suffix so each Slack thread
-    # gets its own tmux session. client_id = "slack-C0AE37B3PC4-1774701122.553459"
+    # gets its own tmux session. client_id = "slack-CXXXXXXXXXX-1774701122.553459"
     # → channel = "slack-thread-553459" (last 6 digits, stable + short)
     # Falls back to "default" for non-thread client_ids.
     _thread_channel = "default"

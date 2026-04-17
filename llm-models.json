@@ -221,7 +221,7 @@
       "database": "mymcp",
       "model_id": "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
       "type": "OPENAI",
-      "host": "http://192.168.10.109:11434/v1",
+      "host": "http://10.0.0.109:11434/v1",
       "max_context": 2000,
       "enabled": true,
       "description": "Qwen2.5-7B-Instruct-Q4_K_M.gguf — local email classifier (free)",

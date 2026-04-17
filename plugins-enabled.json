@@ -31,9 +31,9 @@
     "plugin_config": {
         "plugin_memory_vector_qdrant": {
             "enabled": true,
-            "qdrant_host": "192.168.10.101",
+            "qdrant_host": "10.0.0.101",
             "qdrant_port": 6333,
-            "embed_url": "http://192.168.10.101:8000/v1/embeddings",
+            "embed_url": "http://10.0.0.101:8000/v1/embeddings",
             "embed_model": "nomic-embed-text",
             "collection": "samaritan_memory",
             "proc_collection": "samaritan_procedures",

@@ -14,9 +14,12 @@ from state import current_client_id, sessions
 
 _drive_service = None
 _docs_service = None
-_verified_subfolders: set[str] = {
-    "1JUe7bjxPAuKKxCC9kV2H9eLVMUFkJStl",  # photos subfolder — pre-seeded to survive restarts
-}  # cache of folder IDs confirmed as children of DRIVE_FOLDER_ID
+_verified_subfolders: set[str] = set()
+# cache of folder IDs confirmed as children of DRIVE_FOLDER_ID
+# (pre-seed via DRIVE_PHOTOS_SUBFOLDER env var if desired)
+_photos_subfolder = os.getenv("DRIVE_PHOTOS_SUBFOLDER", "")
+if _photos_subfolder:
+    _verified_subfolders.add(_photos_subfolder)
 
 def _get_creds():
     """Load and refresh Google OAuth credentials from token file."""

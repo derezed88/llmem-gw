@@ -379,6 +379,16 @@ async def handle_llama_request_non_streaming(
     )
 
 
+OAUTH_DISCOVERY_PATHS = frozenset((
+    '.well-known/oauth-authorization-server',
+    '.well-known/oauth-authorization-server/mcp',
+    'mcp/.well-known/oauth-authorization-server',
+    '.well-known/oauth-protected-resource',
+    '.well-known/oauth-protected-resource/mcp',
+    'mcp/.well-known/oauth-protected-resource',
+))
+
+
 async def llama_proxy_handler(request: Request) -> Response:
     """
     Main llama proxy handler - processes all requests through MCP service.
@@ -387,6 +397,18 @@ async def llama_proxy_handler(request: Request) -> Response:
     path = request.path_params.get('path', '')
     method = request.method
     client_ip = request.client.host if request.client else "unknown"
+
+    # MCP clients probe OAuth discovery well-known paths per the authorization spec
+    # (2025-03-26 / 2025-06-18) before opening a session. This server doesn't require
+    # OAuth — a 404 tells the client to proceed unauthenticated. Short-circuit here so
+    # the probes don't generate INFO/WARNING log noise on every MCP connection.
+    if path in OAUTH_DISCOVERY_PATHS:
+        log.debug(f"[LLAMA] OAuth discovery probe: {method} /{path} → 404 (no auth configured)")
+        return Response(
+            content=json.dumps({"error": "no authorization server configured"}),
+            media_type='application/json',
+            status_code=404
+        )
 
     log.info(f"[LLAMA] {method} /{path} from {client_ip}")
 

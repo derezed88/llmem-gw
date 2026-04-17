@@ -115,6 +115,103 @@ async def _resolve_phone_name(phone: str) -> str:
     return result or phone
 
 
+async def _db_log_sms(direction: str, phone: str, contact_name: str,
+                      message: str, raw_payload: dict = None,
+                      source_rowid: int = None) -> int:
+    """Persist an inbound or outbound SMS to samaritan_sms. Returns new row id.
+    Uses INSERT IGNORE with source_rowid unique key — duplicate proxy replays are
+    silently dropped. Returns 0 if the row was a duplicate (skipped).
+    """
+    import json as _json
+    def _insert():
+        try:
+            import mysql.connector
+            conn = mysql.connector.connect(
+                host="localhost",
+                user=os.getenv("MYSQL_USER"),
+                password=os.getenv("MYSQL_PASS"),
+                database="mymcp",
+            )
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    """INSERT IGNORE INTO samaritan_sms
+                       (direction, phone, contact_name, message, received_at, raw_payload, source_rowid)
+                       VALUES (%s, %s, %s, %s, NOW(), %s, %s)""",
+                    (direction, phone, contact_name, message,
+                     _json.dumps(raw_payload) if raw_payload else None,
+                     source_rowid)
+                )
+                conn.commit()
+                return cur.lastrowid  # 0 if IGNORE skipped the duplicate
+            finally:
+                cur.close()
+                conn.close()
+        except Exception as e:
+            log.warning(f"SMS DB log failed: {e}")
+            return 0
+    return await asyncio.to_thread(_insert)
+
+
+async def _db_mark_delivered(sms_id: int, delivered_to: str) -> None:
+    """Set delivered_at on a samaritan_sms row."""
+    def _update():
+        try:
+            import mysql.connector
+            conn = mysql.connector.connect(
+                host="localhost",
+                user=os.getenv("MYSQL_USER"),
+                password=os.getenv("MYSQL_PASS"),
+                database="mymcp",
+            )
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    "UPDATE samaritan_sms SET delivered_at=NOW(), delivered_to=%s WHERE id=%s",
+                    (delivered_to, sms_id)
+                )
+                conn.commit()
+            finally:
+                cur.close()
+                conn.close()
+        except Exception as e:
+            log.warning(f"SMS DB mark_delivered failed: {e}")
+    await asyncio.to_thread(_update)
+
+
+async def _db_mark_acked(sms_id: int = 0) -> int:
+    """Set acked_at on one or all unacked inbound rows. Returns count updated."""
+    def _update():
+        try:
+            import mysql.connector
+            conn = mysql.connector.connect(
+                host="localhost",
+                user=os.getenv("MYSQL_USER"),
+                password=os.getenv("MYSQL_PASS"),
+                database="mymcp",
+            )
+            cur = conn.cursor()
+            try:
+                if sms_id:
+                    cur.execute(
+                        "UPDATE samaritan_sms SET acked_at=NOW() WHERE id=%s AND acked_at IS NULL",
+                        (sms_id,)
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE samaritan_sms SET acked_at=NOW() WHERE direction='inbound' AND acked_at IS NULL"
+                    )
+                conn.commit()
+                return cur.rowcount
+            finally:
+                cur.close()
+                conn.close()
+        except Exception as e:
+            log.warning(f"SMS DB mark_acked failed: {e}")
+            return 0
+    return await asyncio.to_thread(_update)
+
+
 async def _auto_notify_sessions(phone: str, text: str) -> int:
     """
     Push SMS notification to the most recently active frontend with an open
@@ -232,26 +329,57 @@ async def endpoint_sms_inbound(request: Request) -> JSONResponse:
 
     log.info(f"SMS inbound from {phone}: {text[:80]}")
 
+    # Persist to DB (source_rowid enables dedup on proxy restarts / backfill)
+    sender = await _resolve_phone_name(phone)
+    source_rowid = payload.get("source_rowid")
+    sms_db_id = await _db_log_sms('inbound', phone, sender, text, payload, source_rowid)
+
     # Auto-notify matching model sessions (direct push, no registration needed)
     auto_count = await _auto_notify_sessions(phone, text)
+    if auto_count and sms_db_id:
+        await _db_mark_delivered(sms_db_id, 'chat')
 
     # Push to voice relay outbox for TTS announcement if a voice session is active
-    sender = await _resolve_phone_name(phone)
-    await _push_to_voice_relay(sender, text)
+    voice_pushed = await _push_to_voice_relay(sender, text)
+    if voice_pushed and sms_db_id and not auto_count:
+        await _db_mark_delivered(sms_db_id, 'voice_relay')
 
-    # Also fire notifier event for explicitly subscribed sessions
+    return JSONResponse({"status": "ok", "id": _inbox_counter, "db_id": sms_db_id, "auto_notified": auto_count})
+
+
+async def endpoint_sms_sent(request: Request) -> JSONResponse:
+    """
+    Receive an iPhone-sent SMS captured from the macOS Messages DB.
+
+    Body (JSON):
+        phone       : str  — recipient phone number
+        text        : str  — message body
+        source_rowid: int  — Messages DB ROWID (used for dedup on backfill/restart)
+    """
+    if not _is_enabled():
+        return JSONResponse({"status": "disabled"}, status_code=503)
+
     try:
-        import notifier
-        preview = text[:120] + ("..." if len(text) > 120 else "")
-        await notifier.fire_event(
-            "sms_received",
-            f"SMS from {sender}",
-            f"{preview}\n  Reply: !sms reply {phone} <your message>",
-        )
-    except Exception as e:
-        log.warning(f"SMS notifier fire failed: {e}")
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
-    return JSONResponse({"status": "ok", "id": _inbox_counter, "auto_notified": auto_count})
+    phone = payload.get("phone", "").strip()
+    text = payload.get("text", "").strip()
+    source_rowid = payload.get("source_rowid")
+    if not phone or not text:
+        return JSONResponse({"error": "Missing phone or text"}, status_code=400)
+
+    contact = await _resolve_phone_name(phone)
+    sms_db_id = await _db_log_sms('outbound', phone, contact, text, payload, source_rowid)
+
+    if sms_db_id:
+        await _db_mark_delivered(sms_db_id, 'iphone')
+        log.info(f"iPhone sent SMS logged → {phone}: {text[:80]}")
+    else:
+        log.debug(f"iPhone sent SMS duplicate (source_rowid={source_rowid}), skipped")
+
+    return JSONResponse({"status": "ok", "db_id": sms_db_id, "new": bool(sms_db_id)})
 
 
 async def endpoint_sms_outbound(request: Request) -> JSONResponse:
@@ -392,7 +520,19 @@ async def cmd_sms(args: str) -> str:
         for _q in list(_outbound_subscribers):
             _q.put_nowait(msg_data)
         log.info(f"SMS reply queued → {phone}: {message[:80]} (from {client_id})")
+        # Persist outbound to DB (admin-initiated, so mark delivered immediately)
+        contact = await _resolve_phone_name(phone)
+        db_id = await _db_log_sms('outbound', phone, contact, message)
+        if db_id:
+            await _db_mark_delivered(db_id, client_id or 'unknown')
         return f"SMS reply queued → {phone} ({len(message)} chars)"
+
+    if subcmd == "ack":
+        sms_id = int(rest.strip()) if rest.strip().isdigit() else 0
+        count = await _db_mark_acked(sms_id)
+        if sms_id:
+            return f"SMS {sms_id} acknowledged ({count} row updated)"
+        return f"{count} inbound SMS(es) acknowledged"
 
     if subcmd == "history":
         count = 10
@@ -477,6 +617,7 @@ class SmsProxyPlugin(BasePlugin):
         return [
             Route("/sms/health", endpoint_sms_health, methods=["GET"]),
             Route("/sms/inbound", endpoint_sms_inbound, methods=["POST"]),
+            Route("/sms/sent", endpoint_sms_sent, methods=["POST"]),
             Route("/sms/outbound/stream", endpoint_sms_outbound_stream, methods=["GET"]),
             Route("/sms/outbound", endpoint_sms_outbound, methods=["GET"]),
             Route("/sms/ack", endpoint_sms_ack, methods=["POST"]),
@@ -492,5 +633,6 @@ class SmsProxyPlugin(BasePlugin):
             "  !sms                      — status and recent messages\n"
             "  !sms reply <phone> <msg>  — send SMS reply via macOS proxy\n"
             "  !sms history [N]          — show last N messages\n"
+            "  !sms ack [id]             — acknowledge inbound SMS (all if no id)\n"
             "  !sms enable / disable     — toggle SMS relay\n"
         )

@@ -84,6 +84,11 @@ class SlackClientPlugin(BasePlugin):
             bot_token = os.getenv("SLACK_BOT_TOKEN")
             app_token = os.getenv("SLACK_APP_TOKEN")
 
+            # Optional: fixed channel for proactive interrupt notifications.
+            # When set, _deliver_notification posts there as a new top-level
+            # message (no thread_ts) instead of replying to the active session thread.
+            self.notification_channel = os.getenv("SLACK_NOTIFICATION_CHANNEL", "")
+
             if not bot_token:
                 log.error("SLACK_BOT_TOKEN not found in .env")
                 return False
@@ -727,11 +732,21 @@ class SlackClientPlugin(BasePlugin):
         """Notifier delivery hook — post notification directly to Slack.
 
         client_id format: slack-{channel_id}-{thread_ts}
+
+        If SLACK_NOTIFICATION_CHANNEL is configured, posts there as a new
+        top-level message (no thread_ts) so notifications are always visible
+        regardless of which session thread is currently active.
+
         Returns True if the message was posted successfully.
         """
         if not self.slack_client:
             return False
-        # Parse channel and thread from client_id
+        if self.notification_channel:
+            # Post to dedicated notification channel — not threaded into
+            # whatever session happened to be last active.
+            ts = await self._send_slack_message(self.notification_channel, "", msg)
+            return ts is not None
+        # Fallback: thread into the active session (legacy behavior)
         parts = client_id.split("-", 2)
         if len(parts) < 3:
             log.warning(f"Slack notifier: can't parse client_id: {client_id}")
@@ -765,16 +780,20 @@ class SlackClientPlugin(BasePlugin):
             max_chunk_size = 3500
             first_ts: Optional[str] = None
 
+            # Only include thread_ts when non-empty — omitting it posts as a
+            # new top-level message (used for notification channel delivery).
+            thread_kwargs = {"thread_ts": thread_ts} if thread_ts else {}
+
             if len(cleaned_text) <= max_chunk_size:
                 # Close any unclosed backtick spans before sending
                 cleaned_text = self._close_open_backticks(cleaned_text)
                 resp = await self.slack_client.chat_postMessage(
                     channel=channel_id,
-                    thread_ts=thread_ts,
-                    text=cleaned_text
+                    text=cleaned_text,
+                    **thread_kwargs
                 )
                 first_ts = resp.get("ts")
-                log.info(f"Sent Slack message to {channel_id}/{thread_ts} ({len(cleaned_text)} chars)")
+                log.info(f"Sent Slack message to {channel_id}/{thread_ts or 'top-level'} ({len(cleaned_text)} chars)")
             else:
                 # Split into chunks
                 chunks = [cleaned_text[i:i+max_chunk_size] for i in range(0, len(cleaned_text), max_chunk_size)]
@@ -786,8 +805,8 @@ class SlackClientPlugin(BasePlugin):
                     chunk = self._close_open_backticks(chunk)
                     resp = await self.slack_client.chat_postMessage(
                         channel=channel_id,
-                        thread_ts=thread_ts,
-                        text=prefix + chunk
+                        text=prefix + chunk,
+                        **thread_kwargs
                     )
                     if i == 0:
                         first_ts = resp.get("ts")

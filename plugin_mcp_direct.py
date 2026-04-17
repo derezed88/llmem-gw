@@ -1229,6 +1229,49 @@ async def memory_search_semantic(
 
 
 @mcp.tool()
+async def presence_trigger_search(
+    query: str,
+    top_k: int = 5,
+    min_score: float = 0.55,
+) -> str:
+    """Semantic search against the samaritan_presence_triggers Qdrant collection.
+
+    Used by the presence-audit:weekly cognition handler to find which pre-commit
+    trigger rows a candidate Samaritan turn matches. Only returns rows that
+    were seeded as matcher IN ('semantic','both'); regex rows live in MySQL
+    only and are matched by regex path in the handler.
+
+    Args:
+        query: Candidate text (Samaritan turn or sentence window) to match.
+               Internally embedded with search_query prefix via nomic-embed-text.
+        top_k: Max results to return.
+        min_score: Minimum cosine similarity. Default 0.55 — calibration notes
+                   live in cognition-session.md presence-audit handler section.
+    """
+    _set_context()
+    try:
+        from plugin_memory_vector_qdrant import get_vector_api
+        vec = get_vector_api()
+        if not vec:
+            return "Vector search unavailable (Qdrant plugin not loaded)"
+        hits = await vec.search_presence_triggers(
+            query_text=query, top_k=top_k, min_score=min_score
+        )
+        if not hits:
+            return "(no presence trigger matches)"
+        lines = []
+        for h in hits:
+            check = (h.get("check_action") or "")[:200]
+            lines.append(
+                f"id={h['id']} score={h['score']:.3f} type={h['trigger_type']} "
+                f"matcher={h['matcher']} imp={h['importance']} check_action={check}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"presence_trigger_search error: {e}"
+
+
+@mcp.tool()
 async def memory_update(
     id: int,
     tier: str = "short",
@@ -3692,10 +3735,11 @@ async def endpoint_ged_start(request: Request) -> JSONResponse:
             pane_pid = stdout.decode().strip().split("\n")[0]
             if pane_pid:
                 proc_pg = await _asyncio.create_subprocess_exec(
-                    "pgrep", "-P", pane_pid, "-f", "claude",
+                    "pstree", "-p", pane_pid,
                     stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
                 )
-                if await proc_pg.wait() == 0:
+                pstree_out, _ = await proc_pg.communicate()
+                if b"claude" in pstree_out:
                     return JSONResponse({"status": "already_running", "channel": channel})
     else:
         relay = _get_relay(channel)
@@ -3740,10 +3784,11 @@ async def endpoint_ged_start(request: Request) -> JSONResponse:
                 ppid = out.decode().strip().split("\n")[0]
                 if ppid:
                     p3 = await _asyncio.create_subprocess_exec(
-                        "pgrep", "-P", ppid, "-f", "claude",
+                        "pstree", "-p", ppid,
                         stdout=_asyncio.subprocess.PIPE, stderr=_asyncio.subprocess.PIPE,
                     )
-                    if await p3.wait() == 0:
+                    pstree_out, _ = await p3.communicate()
+                    if b"claude" in pstree_out:
                         return JSONResponse({"status": "started", "channel": channel})
         else:
             relay = _get_relay(channel)
@@ -4312,11 +4357,12 @@ async def endpoint_claude_status(request: Request) -> JSONResponse:
         pane_pid = stdout.decode().strip().split("\n")[0]
         if pane_pid:
             proc3 = await _asyncio.create_subprocess_exec(
-                "pgrep", "-P", pane_pid, "-f", "claude",
+                "pstree", "-p", pane_pid,
                 stdout=_asyncio.subprocess.PIPE,
                 stderr=_asyncio.subprocess.PIPE,
             )
-            claude_alive = (await proc3.wait() == 0)
+            pstree_out, _ = await proc3.communicate()
+            claude_alive = (b"claude" in pstree_out)
 
     return JSONResponse({
         "channel": channel,
@@ -4829,51 +4875,28 @@ async def endpoint_conv_log(request: Request) -> JSONResponse:
     try:
         from memory import save_conversation_turn, _normalize_topic, load_topic_list
 
-        # Multi-topic detection: split turn into segments when clearly distinct topics found
-        import uuid as _uuid_mod
-        _segments = await _detect_multi_topic(user_text, assistant_text)
+        # Topic splitting DISABLED 2026-04-10 — _detect_multi_topic was fragmenting
+        # substantive multi-section responses into multiple rows with semantically
+        # mismatched topics, plus duplicate copies. The integrity cost of splitting
+        # exceeds the indexing benefit. Always store one row per turn with one
+        # primary topic. Multi-topic queries can be handled by semantic search.
+        # See feedback_memory_tier_purity.md and the audit performed 2026-04-10.
         _all_segment_ids: list[tuple[int, int]] = []
 
-        if _segments and len(_segments) >= 2:
-            _turn_group_id = str(_uuid_mod.uuid4())
-            log.info(
-                f"conv_log: multi-topic detected — {len(_segments)} segments "
-                f"group={_turn_group_id}"
-            )
-            _last_topic = None
-            for _seg in _segments:
-                _user_frag = (_seg.get("user_frag") or "").strip() or user_text
-                _asst_frag = (_seg.get("asst_frag") or "").strip() or assistant_text
-                _seg_slug = await _generate_topic_slug(_user_frag, _asst_frag)
-                _asst_tagged = f"<<{_seg_slug}>>" + _asst_frag if _seg_slug else _asst_frag
-                _u, _a, _t = await save_conversation_turn(
-                    user_text=_user_frag,
-                    assistant_text=_asst_tagged,
-                    session_id=session_id,
-                    importance=importance,
-                    created_at=_shared_ts,
-                    turn_group_id=_turn_group_id,
-                )
-                _all_segment_ids.append((_u, _a))
-                _last_topic = _t
-            user_id = _all_segment_ids[0][0] if _all_segment_ids else 0
-            asst_id = _all_segment_ids[-1][1] if _all_segment_ids else 0
-            topic = _last_topic
-        else:
-            # Single topic — generate slug and save as one turn
-            topic_slug = await _generate_topic_slug(user_text, assistant_text)
-            if topic_slug:
-                # Prepend the tag so save_conversation_turn's _extract_topic_tag() finds it
-                assistant_text = f"<<{topic_slug}>>" + assistant_text
+        # Single topic — generate slug and save as one turn
+        topic_slug = await _generate_topic_slug(user_text, assistant_text)
+        if topic_slug:
+            # Prepend the tag so save_conversation_turn's _extract_topic_tag() finds it
+            assistant_text = f"<<{topic_slug}>>" + assistant_text
 
-            user_id, asst_id, topic = await save_conversation_turn(
-                user_text=user_text,
-                assistant_text=assistant_text,
-                session_id=session_id,
-                importance=importance,
-                created_at=_shared_ts,
-            )
-            _all_segment_ids.append((user_id, asst_id))
+        user_id, asst_id, topic = await save_conversation_turn(
+            user_text=user_text,
+            assistant_text=assistant_text,
+            session_id=session_id,
+            importance=importance,
+            created_at=_shared_ts,
+        )
+        _all_segment_ids.append((user_id, asst_id))
 
         log.info(
             f"conv_log: topic={topic} user_id={user_id} asst_id={asst_id} "
@@ -5373,10 +5396,47 @@ class Plugin(BasePlugin):
     def shutdown(self) -> None:
         log.info("MCP Direct plugin shutting down")
 
+    def get_lifespan(self):
+        """Return the streamable HTTP session manager lifespan for the main app.
+
+        Called by llmem-gw.py after get_routes() to compose the session manager's
+        task group into the Starlette app lifespan. Without this, /mcp returns
+        RuntimeError: Task group is not initialized.
+
+        Multiple uvicorn servers share the same Starlette app, so this lifespan
+        is called once per server. The session manager only supports a single
+        run() call. We handle this by having the first server own the session
+        manager lifetime; subsequent servers yield immediately. Safe in asyncio
+        (single-threaded) because there is no await between the flag check and set.
+        """
+        import contextlib
+
+        session_manager = getattr(mcp, "_session_manager", None)
+        if session_manager is None:
+            return None
+
+        # Module-level-style flag — reset on each get_lifespan() call (i.e. per process).
+        _state = {"active": False}
+
+        @contextlib.asynccontextmanager
+        async def _lifespan(app):
+            if not _state["active"]:
+                _state["active"] = True
+                async with session_manager.run():
+                    yield
+            else:
+                # Another server already owns the session manager — just pass through.
+                yield
+
+        return _lifespan
+
     def get_routes(self) -> List[Route]:
-        """Mount the FastMCP SSE app routes + conv_log + voice relay endpoints."""
+        """Mount the FastMCP SSE app routes + streamable HTTP + conv_log + voice relay endpoints."""
         sse_app = mcp.sse_app()
         routes = list(sse_app.routes)
+        # Streamable HTTP transport (/mcp) for Codex CLI and other newer MCP clients
+        http_app = mcp.streamable_http_app()
+        routes.extend(http_app.routes)
         routes.append(Route("/conv_log", endpoint_conv_log, methods=["POST"]))
         routes.append(Route("/voice_relay/submit", endpoint_voice_relay_submit, methods=["POST"]))
         routes.append(Route("/voice_relay/poll", endpoint_voice_relay_poll, methods=["GET"]))

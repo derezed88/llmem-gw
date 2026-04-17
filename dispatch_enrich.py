@@ -26,17 +26,22 @@ _ROUTINE_MAX = 3            # max routines to inject even when triggered
 _MOVEMENT_THRESHOLD_M = 200 # min distance (meters) between fixes to count as movement
 _MOVEMENT_WINDOW_MIN = 15   # look back N minutes for movement detection
 _MOVEMENT_MIN_FIXES = 2     # need at least N fixes in window to assess movement
+_TRIGGER_SCAN_LINES = 5     # how many head lines of belief content to scan for TRIGGER|
+_ROUTINE_CACHE_TTL_S = 60   # compiled routine-trigger cache TTL
 
-# Routines are only injected when the user text touches a schedule-relevant topic.
-# Keeps technical/coding conversations clean of irrelevant lifestyle context.
-_ROUTINE_TRIGGER_RE = re.compile(
-    r'\b(lee|gym|pickup|pick\s*up|drop\s*off|dropoff|chinatown|nevada|'
-    r'trader\s*joe|target|tonight|this\s*evening|this\s*morning|'
-    r'appointment|grocery|groceries|power\s*wagon|challenger|'
-    r'soho|soma|pick\s*her\s*up|pick\s*him\s*up|walk\s*to|'
-    r'what\s*time.*(?:leave|go|pick|walk)|when.*(?:leave|pick|walk))\b',
-    re.IGNORECASE,
-)
+# Routine triggers are NOT hardcoded here. Each routine-* belief carries its own
+# activation pattern as a structured line `TRIGGER|regex=<pattern>` within the
+# first few lines of its content. dispatch_enrich loads routine beliefs, parses
+# their TRIGGER lines, compiles the regexes, and matches user text per-belief.
+# Adding a new routine = asserting a new belief with a TRIGGER line. No code edit.
+# Beliefs with no usable TRIGGER declaration (missing, malformed, or non-compiling)
+# are skipped entirely — they never load on dispatch.
+
+# Per-process cache: list of (topic, content, compiled_trigger_or_None) tuples +
+# unix epoch of last refresh. Small cache avoids recompiling on every dispatch
+# while still picking up belief edits within _ROUTINE_CACHE_TTL_S seconds.
+_routine_cache: list[tuple[str, str, "re.Pattern | None"]] = []
+_routine_cache_ts: float = 0.0
 
 
 async def _sql(query: str) -> str:
@@ -188,18 +193,80 @@ def _routine_relevance(text: str, topic: str, content: str) -> int:
     return len(text_words & routine_words)
 
 
-async def _load_routine_beliefs() -> list[tuple[str, str]]:
-    """Load all active routine beliefs (topic LIKE 'routine-%')."""
+def _extract_trigger_regex(content: str) -> str | None:
+    """Scan first _TRIGGER_SCAN_LINES lines for `TRIGGER|regex=<pattern>`.
+
+    Returns the raw regex string (without the `regex=` prefix) or None if no
+    TRIGGER line is present. The TRIGGER line does not have to be the first
+    line — a belief may have preamble like `verified:` or `direct:` markers
+    before it, which we skip over.
+    """
+    for line in content.splitlines()[:_TRIGGER_SCAN_LINES]:
+        line = line.strip()
+        if not line.startswith("TRIGGER|"):
+            continue
+        idx = line.find("regex=")
+        if idx == -1:
+            continue
+        pattern = line[idx + len("regex="):]
+        if pattern:
+            return pattern
+    return None
+
+
+async def _refresh_routine_cache() -> list[tuple[str, str, "re.Pattern | None"]]:
+    """Query all active routine-* beliefs, parse+compile their TRIGGER lines,
+    and cache the result for _ROUTINE_CACHE_TTL_S seconds. Returns the cached list."""
+    global _routine_cache, _routine_cache_ts
+    now = _time.monotonic()
+    if _routine_cache and (now - _routine_cache_ts) < _ROUTINE_CACHE_TTL_S:
+        return _routine_cache
     try:
         rows = await _dicts(
             "SELECT topic, content FROM mymcp.samaritan_beliefs "
             "WHERE status='active' AND topic LIKE 'routine-%' AND confidence >= 7 "
             "ORDER BY confidence DESC, topic"
         )
-        return [(r["topic"], r["content"]) for r in rows]
+        built: list[tuple[str, str, "re.Pattern | None"]] = []
+        for r in rows:
+            topic = r["topic"]
+            content = r["content"] or ""
+            pattern_str = _extract_trigger_regex(content)
+            compiled: "re.Pattern | None" = None
+            if pattern_str:
+                try:
+                    compiled = re.compile(pattern_str, re.IGNORECASE)
+                except re.error as e:
+                    log.warning(f"routine trigger compile failed for {topic!r}: {e}")
+                    compiled = None
+            built.append((topic, content, compiled))
+        _routine_cache = built
+        _routine_cache_ts = now
+        log.info(f"dispatch_enrich: routine cache refreshed ({len(built)} beliefs, "
+                 f"{sum(1 for _, _, c in built if c)} with trigger)")
+        return built
     except Exception as e:
-        log.debug(f"_load_routine_beliefs: {e}")
+        log.debug(f"_refresh_routine_cache: {e}")
+        return _routine_cache  # stale is better than empty
+
+
+async def _load_routine_beliefs(text: str) -> list[tuple[str, str]]:
+    """Return routine beliefs whose declared TRIGGER regex matches `text`.
+
+    Only beliefs with a successfully parsed and compiled TRIGGER|regex=... declaration
+    are eligible. Beliefs with no usable trigger declaration are skipped.
+    """
+    cache = await _refresh_routine_cache()
+    if not cache:
         return []
+    out: list[tuple[str, str]] = []
+    for topic, content, compiled in cache:
+        if compiled is None:
+            # No TRIGGER line — skip; routine beliefs must declare explicit triggers
+            continue
+        if compiled.search(text):
+            out.append((topic, content))
+    return out
 
 
 # ── Pattern-triggered rules ───────────────────────────────────────────────────
@@ -296,11 +363,10 @@ async def build_context_prefix(
         movement_task = asyncio.create_task(detect_movement(lat, lon))
         log_gps_async(lat, lon, acc, "dispatch")  # fire-and-forget, not awaited
 
-    # Only load routines when text is schedule/person/location relevant
-    routines_task = (
-        asyncio.create_task(_load_routine_beliefs())
-        if _ROUTINE_TRIGGER_RE.search(text) else None
-    )
+    # Routine beliefs self-select via per-belief TRIGGER regex (parsed from content).
+    # No hardcoded gate — the loader returns only matching routines, or [] when
+    # nothing matches, which is cheap.
+    routines_task = asyncio.create_task(_load_routine_beliefs(text))
     rules_task = asyncio.create_task(_run_dispatch_rules(text))
 
     all_tasks = [t for t in [gps_task, movement_task, routines_task, rules_task] if t is not None]

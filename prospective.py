@@ -304,10 +304,9 @@ async def run_check() -> dict:
                 if wrote:
                     _stats["reminders_written"] += 1
                     summary["reminders"] += 1
-                    import asyncio as _asyncio
                     try:
                         import notifier as _notifier
-                        _asyncio.ensure_future(_notifier.fire_event(
+                        asyncio.ensure_future(_notifier.fire_event(
                             "prospective_reminder",
                             f"topic={row.get('topic')!r}  due_at={row.get('due_at') or 'now'}",
                             (row.get("content") or "")[:200],
@@ -315,14 +314,16 @@ async def run_check() -> dict:
                     except Exception:
                         pass
 
-                # Auto-create cognition step for FIRE: directives
+                # Auto-create cognition step for FIRE: directives.
+                # Runs regardless of whether the reminder write succeeded —
+                # this path must not depend on reminder-injection success.
                 raw_content = (row.get("content") or "").strip()
                 if raw_content.upper().startswith("FIRE:"):
                     step_desc = raw_content[len("FIRE:"):].strip()
                     if step_desc:
                         try:
                             from plugin_mcp_direct import _queue_cogn_step
-                            _asyncio.ensure_future(_queue_cogn_step(step_desc))
+                            asyncio.ensure_future(_queue_cogn_step(step_desc))
                             log.info(
                                 f"prospective: auto-created cogn step for "
                                 f"id={row['id']} topic={row.get('topic')!r}"

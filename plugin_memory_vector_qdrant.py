@@ -29,6 +29,7 @@ Configuration (plugins-enabled.json → plugin_config.plugin_memory_vector_qdran
 """
 
 import logging
+import time
 from typing import Dict, Any, List
 
 import httpx
@@ -82,10 +83,16 @@ class QdrantVectorPlugin(BasePlugin):
     DEPENDENCIES   = ["qdrant-client>=1.7", "httpx>=0.24"]
     ENV_VARS: list = []
 
+    # Retry backoff: wait at least this many seconds between reconnect attempts
+    _RECONNECT_BACKOFF = 30
+    _RECONNECT_MAX_BACKOFF = 300  # cap at 5 minutes
+
     def __init__(self):
         self.enabled      = False
         self._cfg: dict   = {}
         self._qc: QdrantClient | None = None
+        self._last_connect_attempt: float = 0.0
+        self._backoff: float = self._RECONNECT_BACKOFF
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -105,16 +112,31 @@ class QdrantVectorPlugin(BasePlugin):
             "min_score":             config.get("min_score",             0.45),
             "min_importance_always": config.get("min_importance_always", 8),
         }
+        # Always mark enabled and set instance — Qdrant connection is lazy
+        self.enabled = True
+        _INSTANCE = self
+        # Attempt initial connection (non-fatal if NUC11 is down)
+        self._try_connect()
+        return True
+
+    def _try_connect(self) -> bool:
+        """Attempt to connect to Qdrant. Returns True if connected."""
+        now = time.monotonic()
+        if self._qc is not None:
+            return True
+        if now - self._last_connect_attempt < self._backoff:
+            return False
+        self._last_connect_attempt = now
         try:
-            self._qc = QdrantClient(
+            qc = QdrantClient(
                 host=self._cfg["qdrant_host"],
                 port=self._cfg["qdrant_port"],
                 timeout=10,
             )
-            # Ensure collection exists
-            existing = [c.name for c in self._qc.get_collections().collections]
+            # Verify connectivity by listing collections
+            existing = [c.name for c in qc.get_collections().collections]
             if self._cfg["collection"] not in existing:
-                self._qc.create_collection(
+                qc.create_collection(
                     collection_name=self._cfg["collection"],
                     vectors_config=VectorParams(
                         size=self._cfg["vector_dims"],
@@ -124,12 +146,30 @@ class QdrantVectorPlugin(BasePlugin):
                 log.info(f"Created Qdrant collection '{self._cfg['collection']}'")
             else:
                 log.info(f"Qdrant collection '{self._cfg['collection']}' ready")
-            self.enabled = True
-            _INSTANCE = self
+            self._qc = qc
+            self._backoff = self._RECONNECT_BACKOFF  # reset backoff on success
+            log.info("QdrantVectorPlugin connected to %s:%s",
+                     self._cfg["qdrant_host"], self._cfg["qdrant_port"])
             return True
         except Exception as e:
-            log.warning(f"QdrantVectorPlugin init failed: {e}")
+            # Increase backoff (capped) for next attempt
+            self._backoff = min(self._backoff * 2, self._RECONNECT_MAX_BACKOFF)
+            log.warning("QdrantVectorPlugin connect failed (retry in %.0fs): %s",
+                        self._backoff, e)
             return False
+
+    def _connected(self) -> bool:
+        """Check if connected, attempt reconnect if not. Use before any Qdrant op."""
+        if self._qc is not None:
+            return True
+        return self._try_connect()
+
+    def _handle_connection_error(self, e: Exception) -> None:
+        """If the error looks like a connection failure, drop _qc so next call reconnects."""
+        err_str = str(e).lower()
+        if any(kw in err_str for kw in ("connect", "refused", "timeout", "unreachable", "reset")):
+            log.warning("Connection to Qdrant lost, will reconnect on next call: %s", e)
+            self._qc = None
 
     def shutdown(self) -> None:
         global _INSTANCE
@@ -166,6 +206,8 @@ class QdrantVectorPlugin(BasePlugin):
 
     def _ensure_collection(self, collection: str) -> None:
         """Create the Qdrant collection if it does not already exist."""
+        if not self._connected():
+            return
         try:
             existing = [c.name for c in self._qc.get_collections().collections]
             if collection not in existing:
@@ -178,6 +220,7 @@ class QdrantVectorPlugin(BasePlugin):
                 )
                 log.info(f"Created Qdrant collection '{collection}'")
         except Exception as e:
+            self._handle_connection_error(e)
             log.warning(f"_ensure_collection({collection!r}) failed: {e}")
 
     def proc_collection(self) -> str:
@@ -186,6 +229,8 @@ class QdrantVectorPlugin(BasePlugin):
 
     def _ensure_proc_collection(self) -> None:
         """Create the procedures Qdrant collection with task_type payload index if needed."""
+        if not self._connected():
+            return
         coll = self.proc_collection()
         try:
             existing = [c.name for c in self._qc.get_collections().collections]
@@ -214,6 +259,8 @@ class QdrantVectorPlugin(BasePlugin):
 
     def ensure_collections(self, collection: str, proc_collection: str) -> list[str]:
         """Ensure both memory and procedures collections exist. Returns list of created names."""
+        if not self._connected():
+            return []
         created = []
         for coll, with_proc_index in [(collection, False), (proc_collection, True)]:
             try:
@@ -244,6 +291,8 @@ class QdrantVectorPlugin(BasePlugin):
 
     def delete_collections(self, collection: str, proc_collection: str) -> list[str]:
         """Delete both memory and procedures Qdrant collections. Returns list of deleted names."""
+        if not self._connected():
+            return []
         deleted = []
         for coll in (collection, proc_collection):
             try:
@@ -258,6 +307,8 @@ class QdrantVectorPlugin(BasePlugin):
 
     async def set_payload(self, row_id: int, payload: dict, collection: str | None = None) -> None:
         """Update payload fields on an existing Qdrant point without re-embedding."""
+        if not self._connected():
+            return
         coll = self._resolve_collection(collection)
         try:
             self._qc.set_payload(
@@ -266,6 +317,7 @@ class QdrantVectorPlugin(BasePlugin):
                 points=[row_id],
             )
         except Exception as e:
+            self._handle_connection_error(e)
             log.warning(f"set_payload failed (id={row_id}): {e}")
 
     async def upsert_memory(
@@ -278,6 +330,9 @@ class QdrantVectorPlugin(BasePlugin):
         collection: str | None = None,
     ) -> None:
         """Embed content and upsert a point into Qdrant using MySQL row_id as point ID."""
+        if not self._connected():
+            log.debug(f"upsert_memory skipped (id={row_id}): Qdrant not connected")
+            return
         coll = self._resolve_collection(collection)
         try:
             vector = await self.embed(content, prefix="search_document")
@@ -297,10 +352,13 @@ class QdrantVectorPlugin(BasePlugin):
             )
             log.debug(f"upsert_memory: id={row_id} topic={topic!r} tier={tier}")
         except Exception as e:
+            self._handle_connection_error(e)
             log.warning(f"upsert_memory failed (id={row_id}): {e}")
 
     async def delete_memory(self, row_id: int, collection: str | None = None) -> None:
         """Remove a point from Qdrant by MySQL row_id."""
+        if not self._connected():
+            return
         coll = self._resolve_collection(collection)
         try:
             self._qc.delete(
@@ -308,10 +366,13 @@ class QdrantVectorPlugin(BasePlugin):
                 points_selector=[row_id],
             )
         except Exception as e:
+            self._handle_connection_error(e)
             log.warning(f"delete_memory failed (id={row_id}): {e}")
 
     async def update_tier(self, row_id: int, new_tier: str, collection: str | None = None) -> None:
         """Update the tier payload field when a row ages short→long."""
+        if not self._connected():
+            return
         coll = self._resolve_collection(collection)
         try:
             self._qc.set_payload(
@@ -320,6 +381,7 @@ class QdrantVectorPlugin(BasePlugin):
                 points=[row_id],
             )
         except Exception as e:
+            self._handle_connection_error(e)
             log.warning(f"update_tier failed (id={row_id}): {e}")
 
     # ------------------------------------------------------------------
@@ -343,6 +405,8 @@ class QdrantVectorPlugin(BasePlugin):
             top_k = self._cfg["top_k"]
         if min_score is None:
             min_score = self._cfg["min_score"]
+        if not self._connected():
+            return []
         try:
             vector = await self.embed(query_text, prefix="search_query")
             response = self._qc.query_points(
@@ -366,7 +430,52 @@ class QdrantVectorPlugin(BasePlugin):
                 for r in response.points
             ]
         except Exception as e:
+            self._handle_connection_error(e)
             log.warning(f"search_memories failed: {e}")
+            return []
+
+    async def search_presence_triggers(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        min_score: float = 0.55,
+        collection: str = "samaritan_presence_triggers",
+    ) -> list[dict]:
+        """
+        Semantic search against the presence trigger collection.
+
+        Unlike search_memories, this does NOT filter by a tier payload — points
+        in samaritan_presence_triggers have no tier field. Returns full trigger
+        payload so the audit handler has enough context to decide whether the
+        match warrants a pre-commit check.
+        """
+        if not self._connected():
+            return []
+        try:
+            vector = await self.embed(query_text, prefix="search_query")
+            response = self._qc.query_points(
+                collection_name=collection,
+                query=vector,
+                limit=top_k,
+                score_threshold=min_score,
+                with_payload=True,
+            )
+            return [
+                {
+                    "id":              r.id,
+                    "trigger_type":    r.payload.get("trigger_type", ""),
+                    "trigger_pattern": r.payload.get("trigger_pattern", ""),
+                    "check_action":    r.payload.get("check_action", ""),
+                    "rationale":       r.payload.get("rationale", ""),
+                    "matcher":         r.payload.get("matcher", ""),
+                    "importance":      r.payload.get("importance", 5),
+                    "score":           round(r.score, 4),
+                }
+                for r in response.points
+            ]
+        except Exception as e:
+            self._handle_connection_error(e)
+            log.warning(f"search_presence_triggers failed: {e}")
             return []
 
     # ------------------------------------------------------------------
@@ -402,6 +511,8 @@ class QdrantVectorPlugin(BasePlugin):
 
     def get_all_point_ids(self, collection: str | None = None) -> set[int]:
         """Return all point IDs currently in Qdrant (scrolls all pages)."""
+        if not self._connected():
+            return set()
         coll = self._resolve_collection(collection)
         ids: set[int] = set()
         offset = None
@@ -437,17 +548,22 @@ class QdrantVectorPlugin(BasePlugin):
         stats: dict = {"qdrant": {}, "embed": {}}
 
         # ── Qdrant collection info ────────────────────────────────────────
-        try:
-            info = self._qc.get_collection(coll)
-            stats["qdrant"] = {
-                "status":                str(info.status.value if hasattr(info.status, "value") else info.status),
-                "points_count":          info.points_count or 0,
-                "indexed_vectors_count": info.indexed_vectors_count or 0,
-                "segments_count":        info.segments_count or 0,
-                "optimizer_status":      str(info.optimizer_status.ok if hasattr(info.optimizer_status, "ok") else info.optimizer_status),
-            }
-        except Exception as e:
-            stats["qdrant"]["error"] = str(e)
+        if not self._connected():
+            stats["qdrant"]["error"] = "not connected (will retry)"
+            # Still check embed health below
+        else:
+            try:
+                info = self._qc.get_collection(coll)
+                stats["qdrant"] = {
+                    "status":                str(info.status.value if hasattr(info.status, "value") else info.status),
+                    "points_count":          info.points_count or 0,
+                    "indexed_vectors_count": info.indexed_vectors_count or 0,
+                    "segments_count":        info.segments_count or 0,
+                    "optimizer_status":      str(info.optimizer_status.ok if hasattr(info.optimizer_status, "ok") else info.optimizer_status),
+                }
+            except Exception as e:
+                self._handle_connection_error(e)
+                stats["qdrant"]["error"] = str(e)
 
         # ── Embedding server health + metrics ─────────────────────────────
         base = self._cfg["embed_url"].rsplit("/v1/", 1)[0]

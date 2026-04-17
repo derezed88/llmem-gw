@@ -110,7 +110,28 @@ async def run_agent(host: str = "0.0.0.0"):
         path = getattr(route, 'path', '')
         return (1 if '{' in path else 0, path)
     all_routes.sort(key=_route_specificity)
-    app = Starlette(routes=all_routes)
+
+    # Collect plugin lifespans (e.g. streamable HTTP session manager task group).
+    # Plugins that need ASGI lifecycle management implement get_lifespan().
+    import contextlib
+    plugin_lifespans = []
+    for plugin_name, plugin in plugins.items():
+        if callable(getattr(plugin, 'get_lifespan', None)):
+            lf = plugin.get_lifespan()
+            if lf is not None:
+                plugin_lifespans.append(lf)
+                log.info(f"  + {plugin_name}: lifespan registered")
+
+    if plugin_lifespans:
+        @contextlib.asynccontextmanager
+        async def _composed_lifespan(app):
+            async with contextlib.AsyncExitStack() as stack:
+                for lf in plugin_lifespans:
+                    await stack.enter_async_context(lf(app))
+                yield
+        app = Starlette(routes=all_routes, lifespan=_composed_lifespan)
+    else:
+        app = Starlette(routes=all_routes)
 
     # Determine which servers to run
     servers_to_run = []

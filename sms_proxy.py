@@ -310,19 +310,17 @@ class SmsProxy:
             try:
                 messages = get_recent_messages(self.last_rowid, self.db_copy_path)
                 for msg in messages:
-                    self.last_rowid = max(self.last_rowid, msg["rowid"])
                     phone = msg["phone"]
                     text = msg["text"]
 
                     if not self._is_allowed(phone):
                         log.debug(f"Blocked message from {phone}")
-                        continue
-                    if not self._is_recent(msg["date"]):
+                    elif not self._is_recent(msg["date"]):
                         log.debug(f"Skipping old message (rowid {msg['rowid']})")
-                        continue
-
-                    log.info(f"New SMS from {phone}: {text[:80]}...")
-                    await self.client.post_inbound(phone, text)
+                    else:
+                        log.info(f"New SMS from {phone}: {text[:80]}...")
+                        await self.client.post_inbound(phone, text)
+                    self.last_rowid = max(self.last_rowid, msg["rowid"])
 
             except sqlite3.OperationalError as e:
                 log.warning(f"DB read error (will retry): {e}")

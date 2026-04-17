@@ -30,7 +30,7 @@
         "email_important"
       ],
       "quiet_minutes": 0,
-      "client_id_prefix": "slack-C0AE37B3PC4-"
+      "client_id_prefix": "slack-CXXXXXXXXXX-"
     }
   ]
 }
